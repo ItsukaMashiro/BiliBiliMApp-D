@@ -82,6 +82,10 @@ jobs:
         run: |
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
           test -d "$APP_PATH"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName BiliBiliMAppD" "$APP_PATH/Info.plist"
+          IPA_BUNDLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP_PATH/Info.plist")"
+          echo "Final CFBundleName: $IPA_BUNDLE_NAME"
+          test "$IPA_BUNDLE_NAME" = "BiliBiliMAppD"
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
           pushd "$RUNNER_TEMP/ipa"
