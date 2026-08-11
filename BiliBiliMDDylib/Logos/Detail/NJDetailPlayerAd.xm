@@ -146,8 +146,15 @@ static void NJRegisterPiPDanmakuView(id view) {
     if (![view isKindOfClass:UIView.class]) {
         return;
     }
+    BOOL isNewView = NO;
     @synchronized (NJPiPDanmakuViews()) {
-        [NJPiPDanmakuViews() addObject:view];
+        if (![NJPiPDanmakuViews() containsObject:view]) {
+            [NJPiPDanmakuViews() addObject:view];
+            isNewView = YES;
+        }
+    }
+    if (isNewView) {
+        NSLog(@"[NJPiPDanmaku] registered %@ (%p)", NSStringFromClass([view class]), view);
     }
 }
 
@@ -223,6 +230,9 @@ static UIView *NJFindPiPDanmakuView(UIView *sourceView) {
         }
         CGRect viewRect = [view convertRect:view.bounds toView:view.window];
         CGFloat score = NJIntersectionArea(sourceRect, viewRect);
+        if ([NSStringFromClass(view.class) containsString:@"DanmakuVoutView"]) {
+            score *= 1.25;
+        }
         if (score > bestScore) {
             bestScore = score;
             bestView = view;
@@ -330,6 +340,15 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
     }
     self.presenting = YES;
     NJPiPDanmakuHostView *hostView = self.contentViewController.hostView;
+
+    UIView *latestDanmakuView = NJFindPiPDanmakuView(self.sourceView);
+    if (latestDanmakuView) {
+        self.danmakuView = latestDanmakuView;
+    }
+    NSLog(@"[NJPiPDanmaku] will start, source=%@ video=%@ danmaku=%@",
+          NSStringFromClass(self.sourceView.class),
+          NSStringFromClass(self.videoView.class),
+          NSStringFromClass(self.danmakuView.class));
 
     if (self.videoView && self.videoView.superview) {
         self.videoOriginalSuperview = self.videoView.superview;
@@ -477,10 +496,10 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(CALayer *videoLayer) API_AVAILAB
     }
     UIView *videoView = NJViewWithBackingLayer(videoLayer);
     UIView *sourceView = videoView ?: NJSourceViewForLayer(videoLayer);
-    UIView *danmakuView = NJFindPiPDanmakuView(sourceView);
-    if (!sourceView || !sourceView.window || !danmakuView) {
+    if (!sourceView) {
         return nil;
     }
+    UIView *danmakuView = NJFindPiPDanmakuView(sourceView);
 
     NJPiPDanmakuState *state = [[NJPiPDanmakuState alloc] init];
     state.videoLayer = videoLayer;
@@ -507,6 +526,11 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(CALayer *videoLayer) API_AVAILAB
     }
     state.delegateProxy = [[NJPiPDanmakuDelegateProxy alloc] init];
     state.delegateProxy.state = state;
+    NSLog(@"[NJPiPDanmaku] prepared controller, source=%@ video=%@ initialDanmaku=%@ window=%@",
+          NSStringFromClass(sourceView.class),
+          NSStringFromClass(videoView.class),
+          NSStringFromClass(danmakuView.class),
+          sourceView.window);
     return state;
 }
 
@@ -524,6 +548,18 @@ static BOOL NJPiPDanmakuCreatingController = NO;
     UIView *view = %orig;
     NJRegisterPiPDanmakuView(view);
     return view;
+}
+
+%end
+
+@interface BBPlayerDanmakuVoutView : UIView
+@end
+
+%hook BBPlayerDanmakuVoutView
+
+- (void)didMoveToWindow {
+    %orig;
+    NJRegisterPiPDanmakuView(self);
 }
 
 %end
