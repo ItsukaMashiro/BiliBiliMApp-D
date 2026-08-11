@@ -27,7 +27,7 @@ jobs:
 
     steps:
       - name: Check out source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Select Xcode 16.4
         run: |
@@ -81,10 +81,15 @@ jobs:
 
       - name: Package unsigned IPA
         run: |
-          chmod +x LatestBuild/createIPA.command
-          LatestBuild/createIPA.command
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
+          test -d "$APP_PATH"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
+          ditto -c -k --sequesterRsrc --keepParent \
+            "$RUNNER_TEMP/ipa/Payload" \
+            "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa"
           mkdir -p artifacts
-          cp LatestBuild/Target.ipa artifacts/BiliBiliMApp-D-unsigned.ipa
+          cp "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" artifacts/BiliBiliMApp-D-unsigned.ipa
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
