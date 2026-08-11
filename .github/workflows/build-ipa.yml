@@ -1,0 +1,95 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - "agent/**"
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MONKEYDEV_COMMIT: c37b5cc5e9a4184d80eb18fb9ae8c48bb8689442
+  THEOS_COMMIT: 5280bd038207e14f8bd76f5417aa2fe641c03228
+  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/bili-universal_8.89.0.app.zip
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install build dependencies
+        run: |
+          brew install ldid
+
+          git clone https://github.com/AloneMonkey/MonkeyDev.git "$RUNNER_TEMP/MonkeyDev"
+          git -C "$RUNNER_TEMP/MonkeyDev" checkout "$MONKEYDEV_COMMIT"
+
+          git clone https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          git -C "$RUNNER_TEMP/theos" checkout "$THEOS_COMMIT"
+          git -C "$RUNNER_TEMP/theos" submodule update --init --recursive --depth 1
+
+          sudo mkdir -p /opt
+          sudo mv "$RUNNER_TEMP/MonkeyDev" /opt/MonkeyDev
+          sudo mv "$RUNNER_TEMP/theos" /opt/theos
+          sudo chmod -R a+rX /opt/MonkeyDev /opt/theos
+          echo "/opt/MonkeyDev/bin" >> "$GITHUB_PATH"
+          echo "/opt/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Download target app
+        run: |
+          mkdir -p BiliBiliMD/TargetApp
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/bili-universal.app.zip" \
+            "$TARGET_APP_URL"
+          ditto -x -k "$RUNNER_TEMP/bili-universal.app.zip" BiliBiliMD/TargetApp
+          rm -rf BiliBiliMD/TargetApp/__MACOSX
+          xattr -cr BiliBiliMD/TargetApp
+          test -d BiliBiliMD/TargetApp/bili-universal.app
+
+      - name: Build injected app
+        run: |
+          xcodebuild \
+            -project BiliBiliMD.xcodeproj \
+            -scheme BiliBiliMD \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            MONKEYDEV_INSERT_DYLIB=YES \
+            MONKEYDEV_ADD_SUBSTRATE=YES \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          chmod +x LatestBuild/createIPA.command
+          LatestBuild/createIPA.command
+          mkdir -p artifacts
+          cp LatestBuild/Target.ipa artifacts/BiliBiliMApp-D-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliBiliMApp-D-unsigned
+          path: artifacts/BiliBiliMApp-D-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
