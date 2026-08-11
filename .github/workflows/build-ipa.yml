@@ -18,6 +18,8 @@ env:
   MONKEYDEV_COMMIT: c37b5cc5e9a4184d80eb18fb9ae8c48bb8689442
   THEOS_COMMIT: 5280bd038207e14f8bd76f5417aa2fe641c03228
   TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/bili-universal_8.89.0.app.zip
+  UPSTREAM_IPA_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/BiliBiliMApp_8.89.0.v3.1.0.ipa
+  ELLEKIT_SHA256: ca7aae6dd4c5591bb93510076f0f73d6e688e12e09cab37e91203fb12343b6ee
 
 jobs:
   build:
@@ -59,8 +61,22 @@ jobs:
             "$TARGET_APP_URL"
           ditto -x -k "$RUNNER_TEMP/bili-universal.app.zip" BiliBiliMD/TargetApp
           rm -rf BiliBiliMD/TargetApp/__MACOSX
+
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/upstream.ipa" \
+            "$UPSTREAM_IPA_URL"
+          unzip -p "$RUNNER_TEMP/upstream.ipa" \
+            'Payload/*.app/Frameworks/libellekit.dylib' \
+            > "$RUNNER_TEMP/libellekit.dylib"
+          test -s "$RUNNER_TEMP/libellekit.dylib"
+          echo "$ELLEKIT_SHA256  $RUNNER_TEMP/libellekit.dylib" | shasum -a 256 --check
+          install -m 0755 \
+            "$RUNNER_TEMP/libellekit.dylib" \
+            BiliBiliMD/TargetApp/bili-universal.app/Frameworks/libellekit.dylib
+
           xattr -cr BiliBiliMD/TargetApp
           test -d BiliBiliMD/TargetApp/bili-universal.app
+          test -s BiliBiliMD/TargetApp/bili-universal.app/Frameworks/libellekit.dylib
 
       - name: Build injected app
         run: |
@@ -86,6 +102,10 @@ jobs:
           IPA_BUNDLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP_PATH/Info.plist")"
           echo "Final CFBundleName: $IPA_BUNDLE_NAME"
           test "$IPA_BUNDLE_NAME" = "BiliBiliMAppD"
+          test -s "$APP_PATH/Frameworks/libellekit.dylib"
+          lipo -archs "$APP_PATH/Frameworks/libellekit.dylib" | grep -qw arm64
+          otool -L "$APP_PATH/Frameworks/BilibiliVideoTools.dylib" \
+            | grep -F '@executable_path/Frameworks/libellekit.dylib'
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
           pushd "$RUNNER_TEMP/ipa"
