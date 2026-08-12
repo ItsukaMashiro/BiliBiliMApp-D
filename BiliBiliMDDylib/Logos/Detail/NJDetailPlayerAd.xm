@@ -124,11 +124,25 @@
 #import <AVFoundation/AVFoundation.h>
 #import <AVKit/AVKit.h>
 #import <objc/runtime.h>
+#import <os/log.h>
 #import "NJCommonDefine.h"
 
 // MARK: - Picture in Picture danmaku
 
 static const void *NJPiPDanmakuStateKey = &NJPiPDanmakuStateKey;
+static os_log_t NJPiPDanmakuLog(void) {
+    static os_log_t log;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        log = os_log_create("com.njbilibili.pip", "danmaku");
+    });
+    return log;
+}
+
+static const char *NJPiPClassName(id object) {
+    return object ? NSStringFromClass([object class]).UTF8String : "(nil)";
+}
+
 static NSHashTable<UIView *> *NJPiPDanmakuViews(void) {
     static NSHashTable<UIView *> *views;
     static dispatch_once_t onceToken;
@@ -154,7 +168,9 @@ static void NJRegisterPiPDanmakuView(id view) {
         }
     }
     if (isNewView) {
-        NSLog(@"[NJPiPDanmaku] registered %@ (%p)", NSStringFromClass([view class]), view);
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                         "[NJPiPDanmaku] registered class=%{public}s view=%p",
+                         NJPiPClassName(view), view);
     }
 }
 
@@ -219,7 +235,9 @@ static UIView *NJFindPiPDanmakuView(UIView *sourceView) {
     }
     CGRect sourceRect = [sourceView convertRect:sourceView.bounds toView:sourceView.window];
     UIView *bestView = nil;
+    UIView *bestVoutView = nil;
     CGFloat bestScore = 0;
+    CGFloat bestVoutScore = 0;
     NSArray<UIView *> *views;
     @synchronized (NJPiPDanmakuViews()) {
         views = NJPiPDanmakuViews().allObjects;
@@ -231,12 +249,18 @@ static UIView *NJFindPiPDanmakuView(UIView *sourceView) {
         CGRect viewRect = [view convertRect:view.bounds toView:view.window];
         CGFloat score = NJIntersectionArea(sourceRect, viewRect);
         if ([NSStringFromClass(view.class) containsString:@"DanmakuVoutView"]) {
-            score *= 1.25;
+            if (score > bestVoutScore) {
+                bestVoutScore = score;
+                bestVoutView = view;
+            }
         }
         if (score > bestScore) {
             bestScore = score;
             bestView = view;
         }
+    }
+    if (bestVoutScore > 1) {
+        return bestVoutView;
     }
     return bestScore > 1 ? bestView : nil;
 }
@@ -255,8 +279,7 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 }
 
 @interface NJPiPDanmakuHostView : UIView
-@property (nonatomic, strong, nullable) UIView *videoView;
-@property (nonatomic, strong, nullable) CALayer *videoLayer;
+@property (nonatomic, strong, nullable) AVPlayerLayer *videoLayer;
 @property (nonatomic, strong, nullable) UIView *danmakuView;
 @end
 
@@ -266,9 +289,6 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
     [super layoutSubviews];
     [CATransaction begin];
     [CATransaction setDisableActions:YES];
-    if (self.videoView.superview == self) {
-        self.videoView.frame = self.bounds;
-    }
     if (self.videoLayer.superlayer == self.layer) {
         self.videoLayer.frame = self.bounds;
     }
@@ -304,19 +324,13 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 @interface NJPiPDanmakuState : NSObject
 @property (nonatomic, weak) AVPictureInPictureController *controller;
-@property (nonatomic, strong) CALayer *videoLayer;
+@property (nonatomic, strong) AVPlayerLayer *videoLayer;
 @property (nonatomic, strong, nullable) UIView *videoView;
 @property (nonatomic, strong) UIView *sourceView;
-@property (nonatomic, strong, nullable) UIView *placeholderView;
+@property (nonatomic, strong, nullable) AVPlayerLayer *pictureInPictureVideoLayer;
 @property (nonatomic, strong, nullable) UIView *danmakuView;
 @property (nonatomic, strong) NJPiPDanmakuContentViewController *contentViewController;
 @property (nonatomic, strong) NJPiPDanmakuDelegateProxy *delegateProxy;
-@property (nonatomic, weak, nullable) UIView *videoOriginalSuperview;
-@property (nonatomic, weak, nullable) CALayer *videoOriginalSuperlayer;
-@property (nonatomic, assign) NSUInteger videoOriginalIndex;
-@property (nonatomic, assign) CGRect videoOriginalFrame;
-@property (nonatomic, assign) BOOL videoTranslatesAutoresizingMaskIntoConstraints;
-@property (nonatomic, copy) NSArray<NSLayoutConstraint *> *videoConstraints;
 @property (nonatomic, weak, nullable) UIView *danmakuOriginalSuperview;
 @property (nonatomic, assign) NSUInteger danmakuOriginalIndex;
 @property (nonatomic, assign) CGRect danmakuOriginalFrame;
@@ -345,33 +359,36 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
     if (latestDanmakuView) {
         self.danmakuView = latestDanmakuView;
     }
-    NSLog(@"[NJPiPDanmaku] will start, source=%@ video=%@ danmaku=%@",
-          NSStringFromClass(self.sourceView.class),
-          NSStringFromClass(self.videoView.class),
-          NSStringFromClass(self.danmakuView.class));
+    AVPlayer *player = self.videoLayer.player;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] willStart source=%{public}s video=%{public}s danmaku=%{public}s player=%p item=%p originalSuperlayer=%p",
+                     NJPiPClassName(self.sourceView),
+                     NJPiPClassName(self.videoView),
+                     NJPiPClassName(self.danmakuView),
+                     player,
+                     player.currentItem,
+                     self.videoLayer.superlayer);
 
-    if (self.videoView && self.videoView.superview) {
-        self.videoOriginalSuperview = self.videoView.superview;
-        self.videoOriginalIndex = [self.videoOriginalSuperview.subviews indexOfObject:self.videoView];
-        self.videoOriginalFrame = self.videoView.frame;
-        self.videoTranslatesAutoresizingMaskIntoConstraints = self.videoView.translatesAutoresizingMaskIntoConstraints;
-        self.videoConstraints = NJConstraintsForView(self.videoView, self.videoOriginalSuperview);
-        [NSLayoutConstraint deactivateConstraints:self.videoConstraints];
-        [self.videoView removeFromSuperview];
-        self.videoView.translatesAutoresizingMaskIntoConstraints = YES;
-        [hostView insertSubview:self.videoView atIndex:0];
-        hostView.videoView = self.videoView;
-    } else if (self.videoLayer.superlayer) {
-        self.videoOriginalSuperlayer = self.videoLayer.superlayer;
-        self.videoOriginalIndex = [self.videoOriginalSuperlayer.sublayers indexOfObject:self.videoLayer];
-        self.videoOriginalFrame = self.videoLayer.frame;
-        [self.videoLayer removeFromSuperlayer];
-        [hostView.layer insertSublayer:self.videoLayer atIndex:0];
-        hostView.videoLayer = self.videoLayer;
+    // Keep Bilibili's original view and AVPlayerLayer attached. Removing either one
+    // invalidates its video output pipeline. A second presentation layer uses the
+    // same AVPlayer, so this adds no second player, network stream, or CPU frame copy.
+    if (player) {
+        AVPlayerLayer *pictureInPictureVideoLayer = [AVPlayerLayer playerLayerWithPlayer:player];
+        pictureInPictureVideoLayer.videoGravity = self.videoLayer.videoGravity;
+        pictureInPictureVideoLayer.frame = hostView.bounds;
+        [hostView.layer insertSublayer:pictureInPictureVideoLayer atIndex:0];
+        hostView.videoLayer = pictureInPictureVideoLayer;
+        self.pictureInPictureVideoLayer = pictureInPictureVideoLayer;
+    } else {
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                         "[NJPiPDanmaku] willStart has no AVPlayer; leaving original renderer untouched");
     }
 
-    BOOL danmakuMovesWithVideo = self.videoView && [self.danmakuView isDescendantOfView:self.videoView];
-    if (self.danmakuView && !danmakuMovesWithVideo && self.danmakuView.superview) {
+    BOOL danmakuContainsVideo = self.danmakuView &&
+        (self.danmakuView == self.sourceView ||
+         [self.sourceView isDescendantOfView:self.danmakuView] ||
+         (self.videoView && [self.videoView isDescendantOfView:self.danmakuView]));
+    if (self.danmakuView && !danmakuContainsVideo && self.danmakuView.superview) {
         self.danmakuOriginalSuperview = self.danmakuView.superview;
         self.danmakuOriginalIndex = [self.danmakuOriginalSuperview.subviews indexOfObject:self.danmakuView];
         self.danmakuOriginalFrame = self.danmakuView.frame;
@@ -382,6 +399,13 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
         self.danmakuView.translatesAutoresizingMaskIntoConstraints = YES;
         [hostView addSubview:self.danmakuView];
         hostView.danmakuView = self.danmakuView;
+    } else if (danmakuContainsVideo) {
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                         "[NJPiPDanmaku] refusing to move danmaku container because it contains the video source class=%{public}s",
+                         NJPiPClassName(self.danmakuView));
+    } else {
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                         "[NJPiPDanmaku] no movable danmaku view found");
     }
     [hostView setNeedsLayout];
     [hostView layoutIfNeeded];
@@ -389,25 +413,17 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 - (void)restoreContent {
     if (!self.isPresenting) {
-        [self.placeholderView removeFromSuperview];
-        self.placeholderView = nil;
         return;
     }
     self.presenting = NO;
     NJPiPDanmakuHostView *hostView = self.contentViewController.hostView;
 
-    if (self.videoView && self.videoOriginalSuperview) {
-        [self.videoView removeFromSuperview];
-        NSUInteger index = MIN(self.videoOriginalIndex, self.videoOriginalSuperview.subviews.count);
-        [self.videoOriginalSuperview insertSubview:self.videoView atIndex:index];
-        self.videoView.translatesAutoresizingMaskIntoConstraints = self.videoTranslatesAutoresizingMaskIntoConstraints;
-        self.videoView.frame = self.videoOriginalFrame;
-        [NSLayoutConstraint activateConstraints:self.videoConstraints];
-    } else if (self.videoOriginalSuperlayer) {
-        [self.videoLayer removeFromSuperlayer];
-        unsigned int index = (unsigned int)MIN(self.videoOriginalIndex, self.videoOriginalSuperlayer.sublayers.count);
-        [self.videoOriginalSuperlayer insertSublayer:self.videoLayer atIndex:index];
-        self.videoLayer.frame = self.videoOriginalFrame;
+    if (self.pictureInPictureVideoLayer) {
+        // Disconnect before removal so the untouched original AVPlayerLayer becomes
+        // the player's only presentation target again.
+        self.pictureInPictureVideoLayer.player = nil;
+        [self.pictureInPictureVideoLayer removeFromSuperlayer];
+        self.pictureInPictureVideoLayer = nil;
     }
 
     if (self.danmakuView && self.danmakuOriginalSuperview) {
@@ -419,13 +435,14 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
         [NSLayoutConstraint activateConstraints:self.danmakuConstraints];
     }
 
-    hostView.videoView = nil;
     hostView.videoLayer = nil;
     hostView.danmakuView = nil;
-    [self.placeholderView removeFromSuperview];
-    self.placeholderView = nil;
-    [self.videoOriginalSuperview setNeedsLayout];
     [self.danmakuOriginalSuperview setNeedsLayout];
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] restored original hierarchy originalVideoSuperlayer=%p player=%p item=%p",
+                     self.videoLayer.superlayer,
+                     self.videoLayer.player,
+                     self.videoLayer.player.currentItem);
 }
 
 @end
@@ -451,6 +468,12 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 }
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] didStart active=%d possible=%d pipLayerReady=%d danmakuAttached=%d",
+                     controller.pictureInPictureActive,
+                     controller.pictureInPicturePossible,
+                     self.state.pictureInPictureVideoLayer.readyForDisplay,
+                     self.state.danmakuView.superview == self.state.contentViewController.hostView);
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStartPictureInPicture:controller];
     }
@@ -458,6 +481,11 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)controller
  failedToStartPictureInPictureWithError:(NSError *)error {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] failedToStart domain=%{public}s code=%ld description=%{public}s",
+                     error.domain.UTF8String,
+                     (long)error.code,
+                     error.localizedDescription.UTF8String);
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller failedToStartPictureInPictureWithError:error];
@@ -465,12 +493,17 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 }
 
 - (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] willStop active=%d possible=%d",
+                     controller.pictureInPictureActive,
+                     controller.pictureInPicturePossible);
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerWillStopPictureInPicture:controller];
     }
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT, "[NJPiPDanmaku] didStop");
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -490,8 +523,10 @@ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandl
 
 @end
 
-static NJPiPDanmakuState *NJMakePiPDanmakuState(CALayer *videoLayer) API_AVAILABLE(ios(15.0)) {
-    if (!NJPiPDanmakuEnabled() || !videoLayer) {
+static NJPiPDanmakuState *NJMakePiPDanmakuState(AVPlayerLayer *videoLayer) API_AVAILABLE(ios(15.0)) {
+    if (!NJPiPDanmakuEnabled() ||
+        ![videoLayer isKindOfClass:AVPlayerLayer.class] ||
+        !videoLayer.player) {
         return nil;
     }
     UIView *videoView = NJViewWithBackingLayer(videoLayer);
@@ -512,25 +547,17 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(CALayer *videoLayer) API_AVAILAB
     }
     state.contentViewController.preferredContentSize = contentSize;
 
-    if (videoView.superview) {
-        UIView *placeholder = [[UIView alloc] initWithFrame:videoView.frame];
-        placeholder.backgroundColor = UIColor.clearColor;
-        placeholder.userInteractionEnabled = NO;
-        placeholder.autoresizingMask = videoView.autoresizingMask;
-        NSUInteger index = [videoView.superview.subviews indexOfObject:videoView];
-        [videoView.superview insertSubview:placeholder atIndex:index];
-        state.placeholderView = placeholder;
-        state.sourceView = placeholder;
-    } else {
-        state.sourceView = sourceView;
-    }
+    state.sourceView = sourceView;
     state.delegateProxy = [[NJPiPDanmakuDelegateProxy alloc] init];
     state.delegateProxy.state = state;
-    NSLog(@"[NJPiPDanmaku] prepared controller, source=%@ video=%@ initialDanmaku=%@ window=%@",
-          NSStringFromClass(sourceView.class),
-          NSStringFromClass(videoView.class),
-          NSStringFromClass(danmakuView.class),
-          sourceView.window);
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] prepared source=%{public}s video=%{public}s initialDanmaku=%{public}s window=%p player=%p item=%p",
+                     NJPiPClassName(sourceView),
+                     NJPiPClassName(videoView),
+                     NJPiPClassName(danmakuView),
+                     sourceView.window,
+                     videoLayer.player,
+                     videoLayer.player.currentItem);
     return state;
 }
 
@@ -597,7 +624,9 @@ static BOOL NJPiPDanmakuCreatingController = NO;
 - (instancetype)initWithContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
     if (@available(iOS 15.0, *)) {
         if (!NJPiPDanmakuCreatingController) {
-            CALayer *videoLayer = contentSource.playerLayer ?: contentSource.sampleBufferDisplayLayer;
+            // The low-overhead compositor requires an AVPlayer. Preserve Bilibili's
+            // native controller for sample-buffer sources rather than copying frames.
+            AVPlayerLayer *videoLayer = contentSource.playerLayer;
             NJPiPDanmakuState *state = NJMakePiPDanmakuState(videoLayer);
             if (state) {
                 AVPictureInPictureControllerContentSource *source =
