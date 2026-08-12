@@ -763,9 +763,346 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(AVPlayerLayer *videoLayer) API_A
     return state;
 }
 
-%group App
+// The player-layer source Bilibili creates first is only a transition object: its
+// AVPlayer has no currentItem.  Converting that object to a video-call PiP source
+// makes AVKit validate an empty renderer and abort the transition.  Wait until
+// Bilibili supplies its real AVSampleBufferDisplayLayer, keep that source attached,
+// and mirror the already-decoded CMSampleBuffers into the video-call controller.
 
-static BOOL NJPiPDanmakuCreatingController = NO;
+static const void *NJPiPMirrorStateKey = &NJPiPMirrorStateKey;
+static const void *NJPiPMirrorStateBoxKey = &NJPiPMirrorStateBoxKey;
+static __thread NSUInteger NJPiPMirrorEnqueueDepth = 0;
+
+@interface NJPiPSampleBufferView : UIView
+@property (nonatomic, readonly) AVSampleBufferDisplayLayer *sampleBufferDisplayLayer;
+@end
+
+@implementation NJPiPSampleBufferView
+
++ (Class)layerClass {
+    return AVSampleBufferDisplayLayer.class;
+}
+
+- (AVSampleBufferDisplayLayer *)sampleBufferDisplayLayer {
+    return (AVSampleBufferDisplayLayer *)self.layer;
+}
+
+@end
+
+
+@class NJPiPMirrorState;
+
+@interface NJPiPMirrorStateBox : NSObject
+@property (nonatomic, weak) NJPiPMirrorState *state;
+@end
+
+@implementation NJPiPMirrorStateBox
+@end
+
+
+@interface NJPiPMirrorDelegateProxy : NSObject <AVPictureInPictureControllerDelegate>
+@property (nonatomic, weak) id<AVPictureInPictureControllerDelegate> downstream;
+@property (nonatomic, weak) NJPiPMirrorState *state;
+@end
+
+
+@interface NJPiPMirrorState : NSObject <NJPiPDanmakuPresentationState>
+@property (nonatomic, weak) AVPictureInPictureController *controller;
+@property (nonatomic, strong) AVSampleBufferDisplayLayer *sourceDisplayLayer;
+@property (nonatomic, weak) UIView *sourceView;
+@property (nonatomic, strong, nullable) id sourceVideoRenderer;
+@property (nonatomic, strong) NJPiPSampleBufferView *mirrorView;
+@property (nonatomic, strong, nullable) id mirrorVideoRenderer;
+@property (nonatomic, strong) NJPiPDanmakuContentViewController *contentViewController;
+@property (nonatomic, strong) AVPictureInPictureControllerContentSource *customContentSource;
+@property (nonatomic, strong) NJPiPMirrorDelegateProxy *delegateProxy;
+@property (nonatomic, strong, nullable) UIView *danmakuView;
+@property (nonatomic, weak, nullable) UIView *danmakuOriginalSuperview;
+@property (nonatomic, assign) NSUInteger danmakuOriginalIndex;
+@property (nonatomic, assign) CGRect danmakuOriginalFrame;
+@property (nonatomic, assign) BOOL danmakuTranslatesAutoresizingMaskIntoConstraints;
+@property (nonatomic, copy) NSArray<NSLayoutConstraint *> *danmakuConstraints;
+@property (atomic, assign, getter=isPresenting) BOOL presenting;
+@property (atomic, assign) NSUInteger mirroredFrameCount;
+- (void)enqueueMirroredSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+- (void)invalidate;
+@end
+
+static id NJPiPSampleBufferRenderer(AVSampleBufferDisplayLayer *layer) {
+    if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"sampleBufferRenderer")]) {
+        return nil;
+    }
+    @try {
+        return [layer valueForKey:@"sampleBufferRenderer"];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static void NJAssociatePiPMirrorObject(id object, NJPiPMirrorState *state) {
+    if (!object) {
+        return;
+    }
+    NJPiPMirrorStateBox *box = [[NJPiPMirrorStateBox alloc] init];
+    box.state = state;
+    objc_setAssociatedObject(object,
+                             NJPiPMirrorStateBoxKey,
+                             box,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+}
+
+static NJPiPMirrorState *NJPiPMirrorStateForObject(id object) {
+    NJPiPMirrorStateBox *box = objc_getAssociatedObject(object, NJPiPMirrorStateBoxKey);
+    return box.state;
+}
+
+static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
+    if (!object) {
+        return;
+    }
+    NJPiPMirrorStateBox *box = objc_getAssociatedObject(object, NJPiPMirrorStateBoxKey);
+    if (box.state == state) {
+        objc_setAssociatedObject(object,
+                                 NJPiPMirrorStateBoxKey,
+                                 nil,
+                                 OBJC_ASSOCIATION_ASSIGN);
+    }
+}
+
+@implementation NJPiPMirrorState
+
+- (void)moveContentIntoPictureInPicture {
+    if (self.isPresenting) {
+        return;
+    }
+    self.presenting = YES;
+
+    UIView *sourceView = self.sourceView;
+    UIView *latestDanmakuView = NJFindPiPDanmakuView(sourceView);
+    if (latestDanmakuView) {
+        self.danmakuView = latestDanmakuView;
+    }
+
+    BOOL danmakuContainsVideo = self.danmakuView &&
+        (self.danmakuView == sourceView ||
+         [sourceView isDescendantOfView:self.danmakuView]);
+    NJPiPDanmakuHostView *hostView = self.contentViewController.hostView;
+    if (self.danmakuView && !danmakuContainsVideo && self.danmakuView.superview) {
+        self.danmakuOriginalSuperview = self.danmakuView.superview;
+        self.danmakuOriginalIndex = [self.danmakuOriginalSuperview.subviews indexOfObject:self.danmakuView];
+        self.danmakuOriginalFrame = self.danmakuView.frame;
+        self.danmakuTranslatesAutoresizingMaskIntoConstraints =
+            self.danmakuView.translatesAutoresizingMaskIntoConstraints;
+        self.danmakuConstraints = NJConstraintsForView(self.danmakuView,
+                                                       self.danmakuOriginalSuperview);
+        [NSLayoutConstraint deactivateConstraints:self.danmakuConstraints];
+        [self.danmakuView removeFromSuperview];
+        self.danmakuView.translatesAutoresizingMaskIntoConstraints = YES;
+        [hostView addSubview:self.danmakuView];
+        hostView.danmakuView = self.danmakuView;
+    }
+
+    [hostView setNeedsLayout];
+    [hostView layoutIfNeeded];
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] presenting sample mirror source=%{public}s layer=%p danmaku=%{public}s attached=%d",
+                     NJPiPClassName(sourceView),
+                     self.sourceDisplayLayer,
+                     NJPiPClassName(self.danmakuView),
+                     self.danmakuView.superview == hostView);
+}
+
+- (void)enqueueMirroredSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    if (!self.isPresenting || !sampleBuffer) {
+        return;
+    }
+    AVSampleBufferDisplayLayer *mirrorLayer = self.mirrorView.sampleBufferDisplayLayer;
+    if (mirrorLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
+        [mirrorLayer flushAndRemoveImage];
+    }
+    [mirrorLayer enqueueSampleBuffer:sampleBuffer];
+    self.mirroredFrameCount += 1;
+    if (self.mirroredFrameCount == 1) {
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                         "[NJPiPDanmaku] first sample mirrored pts=%.3f ready=%d",
+                         CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                         mirrorLayer.readyForDisplay);
+    }
+}
+
+- (void)restoreContent {
+    if (!self.isPresenting && !self.danmakuOriginalSuperview) {
+        return;
+    }
+    self.presenting = NO;
+    NJPiPDanmakuHostView *hostView = self.contentViewController.hostView;
+    if (self.danmakuView && self.danmakuOriginalSuperview) {
+        [self.danmakuView removeFromSuperview];
+        NSUInteger index = MIN(self.danmakuOriginalIndex,
+                               self.danmakuOriginalSuperview.subviews.count);
+        [self.danmakuOriginalSuperview insertSubview:self.danmakuView atIndex:index];
+        self.danmakuView.translatesAutoresizingMaskIntoConstraints =
+            self.danmakuTranslatesAutoresizingMaskIntoConstraints;
+        self.danmakuView.frame = self.danmakuOriginalFrame;
+        [NSLayoutConstraint activateConstraints:self.danmakuConstraints];
+        [self.danmakuOriginalSuperview setNeedsLayout];
+    }
+    hostView.danmakuView = nil;
+    self.danmakuOriginalSuperview = nil;
+    self.danmakuConstraints = @[];
+    [self.mirrorView.sampleBufferDisplayLayer flushAndRemoveImage];
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] restored danmaku hierarchy mirroredFrames=%lu",
+                     (unsigned long)self.mirroredFrameCount);
+    self.mirroredFrameCount = 0;
+}
+
+- (void)invalidate {
+    [self restoreContent];
+    NJRemovePiPMirrorAssociation(self.sourceDisplayLayer, self);
+    NJRemovePiPMirrorAssociation(self.sourceVideoRenderer, self);
+}
+
+- (void)dealloc {
+    [self invalidate];
+}
+
+@end
+
+
+@implementation NJPiPMirrorDelegateProxy
+
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] || [self.downstream respondsToSelector:selector];
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    if ([self.downstream respondsToSelector:selector]) {
+        return self.downstream;
+    }
+    return [super forwardingTargetForSelector:selector];
+}
+
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
+    [self.state moveContentIntoPictureInPicture];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerWillStartPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] didStart mirror active=%d possible=%d ready=%d frames=%lu",
+                     controller.pictureInPictureActive,
+                     controller.pictureInPicturePossible,
+                     self.state.mirrorView.sampleBufferDisplayLayer.readyForDisplay,
+                     (unsigned long)self.state.mirroredFrameCount);
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerDidStartPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+ failedToStartPictureInPictureWithError:(NSError *)error {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] failed mirror start domain=%{public}s code=%ld description=%{public}s",
+                     error.domain.UTF8String,
+                     (long)error.code,
+                     error.localizedDescription.UTF8String);
+    [self.state restoreContent];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureController:controller
+                 failedToStartPictureInPictureWithError:error];
+    }
+}
+
+- (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerWillStopPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    [self.state restoreContent];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    [self.state restoreContent];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureController:controller
+restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
+    } else {
+        completionHandler(YES);
+    }
+}
+
+@end
+
+static NJPiPMirrorState *NJMakePiPMirrorState(
+    AVPictureInPictureControllerContentSource *contentSource) API_AVAILABLE(ios(15.0)) {
+    if (!NJPiPDanmakuEnabled()) {
+        return nil;
+    }
+    AVSampleBufferDisplayLayer *sourceLayer = contentSource.sampleBufferDisplayLayer;
+    if (![sourceLayer isKindOfClass:AVSampleBufferDisplayLayer.class]) {
+        return nil;
+    }
+    UIView *sourceView = NJViewWithBackingLayer(sourceLayer) ?: NJSourceViewForLayer(sourceLayer);
+    if (!sourceView || !sourceView.window) {
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                         "[NJPiPDanmaku] preserve native source: sample layer has no visible source view layer=%p",
+                         sourceLayer);
+        return nil;
+    }
+
+    NJPiPMirrorState *state = [[NJPiPMirrorState alloc] init];
+    state.sourceDisplayLayer = sourceLayer;
+    state.sourceView = sourceView;
+    state.sourceVideoRenderer = NJPiPSampleBufferRenderer(sourceLayer);
+    state.contentViewController = [[NJPiPDanmakuContentViewController alloc] init];
+    state.contentViewController.presentationState = state;
+
+    CGSize contentSize = sourceLayer.bounds.size;
+    if (contentSize.width < 1 || contentSize.height < 1) {
+        contentSize = sourceView.bounds.size;
+    }
+    if (contentSize.width < 1 || contentSize.height < 1) {
+        contentSize = CGSizeMake(640, 360);
+    }
+    state.contentViewController.preferredContentSize = contentSize;
+
+    NJPiPDanmakuHostView *hostView = state.contentViewController.hostView;
+    state.mirrorView = [[NJPiPSampleBufferView alloc] initWithFrame:hostView.bounds];
+    state.mirrorView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    state.mirrorView.sampleBufferDisplayLayer.videoGravity =
+        sourceLayer.videoGravity ?: AVLayerVideoGravityResizeAspect;
+    state.mirrorView.sampleBufferDisplayLayer.controlTimebase = sourceLayer.controlTimebase;
+    [hostView addSubview:state.mirrorView];
+    hostView.videoView = state.mirrorView;
+    state.mirrorVideoRenderer = NJPiPSampleBufferRenderer(state.mirrorView.sampleBufferDisplayLayer);
+
+    state.customContentSource = [[AVPictureInPictureControllerContentSource alloc]
+        initWithActiveVideoCallSourceView:sourceView
+        contentViewController:state.contentViewController];
+    state.delegateProxy = [[NJPiPMirrorDelegateProxy alloc] init];
+    state.delegateProxy.state = state;
+    NJAssociatePiPMirrorObject(sourceLayer, state);
+    NJAssociatePiPMirrorObject(state.sourceVideoRenderer, state);
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] prepared real sample source=%{public}s layer=%p renderer=%p size=%.0fx%.0f",
+                     NJPiPClassName(sourceView),
+                     sourceLayer,
+                     state.sourceVideoRenderer,
+                     contentSize.width,
+                     contentSize.height);
+    return state;
+}
+
+%group App
 
 @interface BBPlayerDanmakuService : NSObject
 - (UIView *)view;
@@ -793,78 +1130,113 @@ static BOOL NJPiPDanmakuCreatingController = NO;
 
 %end
 
+// Bilibili 8.89 can enqueue through either the display layer compatibility API
+// or its iOS 17+ renderer.  A thread-local depth guard ensures one mirror enqueue
+// when AVSampleBufferDisplayLayer forwards internally to AVSampleBufferVideoRenderer.
+%hook AVSampleBufferDisplayLayer
+
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    NJPiPMirrorState *state = NJPiPMirrorStateForObject(self);
+    if (!state || NJPiPMirrorEnqueueDepth > 0) {
+        %orig;
+        return;
+    }
+    NJPiPMirrorEnqueueDepth += 1;
+    %orig;
+    NJPiPMirrorEnqueueDepth -= 1;
+    [state enqueueMirroredSampleBuffer:sampleBuffer];
+}
+
+%end
+
+@interface AVSampleBufferVideoRenderer (NJPiPMirroring)
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer;
+@end
+
+%hook AVSampleBufferVideoRenderer
+
+- (void)enqueueSampleBuffer:(CMSampleBufferRef)sampleBuffer {
+    NJPiPMirrorState *state = NJPiPMirrorStateForObject(self);
+    if (!state || NJPiPMirrorEnqueueDepth > 0) {
+        %orig;
+        return;
+    }
+    NJPiPMirrorEnqueueDepth += 1;
+    %orig;
+    NJPiPMirrorEnqueueDepth -= 1;
+    [state enqueueMirroredSampleBuffer:sampleBuffer];
+}
+
+%end
+
 %hook AVPictureInPictureController
 
 - (instancetype)initWithPlayerLayer:(AVPlayerLayer *)playerLayer {
-    if (@available(iOS 15.0, *)) {
-        if (!NJPiPDanmakuCreatingController) {
-            NJPiPDanmakuState *state = NJMakePiPDanmakuState(playerLayer);
-            if (state) {
-                AVPictureInPictureControllerContentSource *source =
-                    [[AVPictureInPictureControllerContentSource alloc]
-                     initWithActiveVideoCallSourceView:state.activeVideoCallSourceView ?: state.sourceView
-                     contentViewController:state.contentViewController];
-                state.customContentSource = source;
-                NJPiPDanmakuCreatingController = YES;
-                AVPictureInPictureController *controller = [self initWithContentSource:source];
-                NJPiPDanmakuCreatingController = NO;
-                if (controller) {
-                    state.controller = controller;
-                    objc_setAssociatedObject(controller,
-                                             NJPiPDanmakuStateKey,
-                                             state,
-                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    controller.delegate = state.delegateProxy;
-                    return controller;
-                }
-                [state restoreContent];
-            }
-        }
-    }
+    // This is a nil-currentItem transition source in Bilibili.  Leaving it native
+    // is essential: the app replaces it with a sample-buffer source when PiP starts.
     return %orig;
 }
 
 - (instancetype)initWithContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
     if (@available(iOS 15.0, *)) {
-        if (!NJPiPDanmakuCreatingController) {
-            // The low-overhead compositor requires an AVPlayer. Preserve Bilibili's
-            // native controller for sample-buffer sources rather than copying frames.
-            AVPlayerLayer *videoLayer = contentSource.playerLayer;
-            NJPiPDanmakuState *state = NJMakePiPDanmakuState(videoLayer);
-            if (state) {
-                AVPictureInPictureControllerContentSource *source =
-                    [[AVPictureInPictureControllerContentSource alloc]
-                     initWithActiveVideoCallSourceView:state.activeVideoCallSourceView ?: state.sourceView
-                     contentViewController:state.contentViewController];
-                state.customContentSource = source;
-                NJPiPDanmakuCreatingController = YES;
-                AVPictureInPictureController *controller = [self initWithContentSource:source];
-                NJPiPDanmakuCreatingController = NO;
-                if (controller) {
-                    state.controller = controller;
-                    objc_setAssociatedObject(controller,
-                                             NJPiPDanmakuStateKey,
-                                             state,
-                                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                    controller.delegate = state.delegateProxy;
-                    return controller;
-                }
-                [state restoreContent];
+        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource);
+        if (state) {
+            AVPictureInPictureController *controller = %orig(state.customContentSource);
+            if (controller) {
+                state.controller = controller;
+                objc_setAssociatedObject(controller,
+                                         NJPiPMirrorStateKey,
+                                         state,
+                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+                controller.delegate = state.delegateProxy;
+                return controller;
             }
+            [state invalidate];
+            return nil;
         }
     }
     return %orig;
 }
 
 - (void)setContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
-    NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
-    if (state && [state adoptContentSourceDuringPictureInPicture:contentSource]) {
+    NJPiPMirrorState *oldState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
+    if (contentSource == oldState.customContentSource) {
+        %orig;
         return;
     }
+
+    id<AVPictureInPictureControllerDelegate> downstream = self.delegate;
+    [oldState invalidate];
+    objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
+
+    if (@available(iOS 15.0, *)) {
+        NJPiPMirrorState *newState = NJMakePiPMirrorState(contentSource);
+        if (newState) {
+            newState.controller = self;
+            newState.delegateProxy.downstream = downstream;
+            objc_setAssociatedObject(self,
+                                     NJPiPMirrorStateKey,
+                                     newState,
+                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            %orig(newState.customContentSource);
+            self.delegate = newState.delegateProxy;
+            return;
+        }
+    }
+    // nil, player-layer, or an unrecognized source remains completely native.
     %orig;
+    if (oldState && downstream) {
+        self.delegate = downstream;
+    }
 }
 
 - (void)setDelegate:(id<AVPictureInPictureControllerDelegate>)delegate {
+    NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
+    if (mirrorState && delegate != mirrorState.delegateProxy) {
+        mirrorState.delegateProxy.downstream = delegate;
+        %orig(mirrorState.delegateProxy);
+        return;
+    }
     NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
     if (state && delegate != state.delegateProxy) {
         state.delegateProxy.downstream = delegate;
@@ -876,6 +1248,10 @@ static BOOL NJPiPDanmakuCreatingController = NO;
 
 - (id<AVPictureInPictureControllerDelegate>)delegate {
     id<AVPictureInPictureControllerDelegate> delegate = %orig;
+    NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
+    if (mirrorState && delegate == mirrorState.delegateProxy && mirrorState.delegateProxy.downstream) {
+        return mirrorState.delegateProxy.downstream;
+    }
     NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
     if (state && delegate == state.delegateProxy && state.delegateProxy.downstream) {
         return state.delegateProxy.downstream;
@@ -884,6 +1260,9 @@ static BOOL NJPiPDanmakuCreatingController = NO;
 }
 
 - (void)dealloc {
+    NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
+    [mirrorState invalidate];
+    objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
     NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
     [state restoreContent];
     objc_setAssociatedObject(self, NJPiPDanmakuStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
