@@ -59,8 +59,11 @@ jobs:
           curl --fail --location --retry 3 \
             --output "$RUNNER_TEMP/bili-universal.app.zip" \
             "$TARGET_APP_URL"
-          ditto -x -k "$RUNNER_TEMP/bili-universal.app.zip" BiliBiliMD/TargetApp
-          rm -rf BiliBiliMD/TargetApp/__MACOSX
+          # MonkeyDev's pack.sh copies the first .app it finds into TargetApp.
+          # Keeping the source app inside TargetApp makes that copy recursive and
+          # leaves a complete nested .app in the final bundle.
+          ditto -x -k "$RUNNER_TEMP/bili-universal.app.zip" BiliBiliMD
+          rm -rf BiliBiliMD/__MACOSX
 
           curl --fail --location --retry 3 \
             --output "$RUNNER_TEMP/upstream.ipa" \
@@ -72,11 +75,11 @@ jobs:
           echo "$ELLEKIT_SHA256  $RUNNER_TEMP/libellekit.dylib" | shasum -a 256 --check
           install -m 0755 \
             "$RUNNER_TEMP/libellekit.dylib" \
-            BiliBiliMD/TargetApp/bili-universal.app/Frameworks/libellekit.dylib
+            BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
-          xattr -cr BiliBiliMD/TargetApp
-          test -d BiliBiliMD/TargetApp/bili-universal.app
-          test -s BiliBiliMD/TargetApp/bili-universal.app/Frameworks/libellekit.dylib
+          xattr -cr BiliBiliMD/bili-universal.app
+          test -d BiliBiliMD/bili-universal.app
+          test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
       - name: Build injected app
         run: |
@@ -106,11 +109,25 @@ jobs:
           lipo -archs "$APP_PATH/Frameworks/libellekit.dylib" | grep -qw arm64
           otool -L "$APP_PATH/Frameworks/BilibiliVideoTools.dylib" \
             | grep -F '@executable_path/Frameworks/libellekit.dylib'
+          NESTED_APP=""
+          for CANDIDATE in "$APP_PATH"/*.app; do
+            if [[ -d "$CANDIDATE" ]]; then
+              NESTED_APP="$CANDIDATE"
+              break
+            fi
+          done
+          if [[ -n "$NESTED_APP" ]]; then
+            echo "Unexpected nested app bundle: $NESTED_APP" >&2
+            exit 1
+          fi
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
           pushd "$RUNNER_TEMP/ipa"
           zip -qry "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" Payload
           popd
+          IPA_SIZE_BYTES="$(stat -f '%z' "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa")"
+          echo "Unsigned IPA size: $IPA_SIZE_BYTES bytes"
+          test "$IPA_SIZE_BYTES" -lt $((350 * 1024 * 1024))
           mkdir -p artifacts
           cp "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" artifacts/BiliBiliMApp-D-unsigned.ipa
 
