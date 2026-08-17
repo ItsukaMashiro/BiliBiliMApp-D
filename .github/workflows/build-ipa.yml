@@ -101,6 +101,19 @@ jobs:
         run: |
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
           test -d "$APP_PATH"
+          APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          test -n "$APP_EXECUTABLE"
+          test -s "$APP_PATH/$APP_EXECUTABLE"
+
+          # MonkeyDev's BSD cp invocation can leave the source bundle as a child
+          # even after its contents have been copied into the built app. The outer
+          # executable check above makes it safe to remove only that exact duplicate.
+          DUPLICATE_SOURCE_APP="$APP_PATH/bili-universal.app"
+          if [[ -d "$DUPLICATE_SOURCE_APP" ]]; then
+            echo "Removing duplicate source bundle: $DUPLICATE_SOURCE_APP"
+            rm -rf "$DUPLICATE_SOURCE_APP"
+          fi
+
           /usr/libexec/PlistBuddy -c "Set :CFBundleName BiliBiliMAppD" "$APP_PATH/Info.plist"
           IPA_BUNDLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP_PATH/Info.plist")"
           echo "Final CFBundleName: $IPA_BUNDLE_NAME"
