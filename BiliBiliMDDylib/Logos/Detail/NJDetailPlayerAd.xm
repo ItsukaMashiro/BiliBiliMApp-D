@@ -771,6 +771,7 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(AVPlayerLayer *videoLayer) API_A
 
 static const void *NJPiPMirrorStateKey = &NJPiPMirrorStateKey;
 static const void *NJPiPMirrorStateBoxKey = &NJPiPMirrorStateBoxKey;
+static const void *NJPiPFallbackPlayerLayerKey = &NJPiPFallbackPlayerLayerKey;
 static __thread NSUInteger NJPiPMirrorEnqueueDepth = 0;
 
 @interface NJPiPSampleBufferView : UIView
@@ -809,7 +810,8 @@ static __thread NSUInteger NJPiPMirrorEnqueueDepth = 0;
 @interface NJPiPMirrorState : NSObject <NJPiPDanmakuPresentationState>
 @property (nonatomic, weak) AVPictureInPictureController *controller;
 @property (nonatomic, strong) AVSampleBufferDisplayLayer *sourceDisplayLayer;
-@property (nonatomic, weak) UIView *sourceView;
+@property (nonatomic, strong) UIView *sourceView;
+@property (nonatomic, strong) UIView *activeVideoCallSourceView;
 @property (nonatomic, strong, nullable) id sourceVideoRenderer;
 @property (nonatomic, strong) NJPiPSampleBufferView *mirrorView;
 @property (nonatomic, strong, nullable) id mirrorVideoRenderer;
@@ -961,6 +963,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     [self restoreContent];
     NJRemovePiPMirrorAssociation(self.sourceDisplayLayer, self);
     NJRemovePiPMirrorAssociation(self.sourceVideoRenderer, self);
+    [self.activeVideoCallSourceView removeFromSuperview];
 }
 
 - (void)dealloc {
@@ -1043,7 +1046,8 @@ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandl
 @end
 
 static NJPiPMirrorState *NJMakePiPMirrorState(
-    AVPictureInPictureControllerContentSource *contentSource) API_AVAILABLE(ios(15.0)) {
+    AVPictureInPictureControllerContentSource *contentSource,
+    UIView *fallbackSourceView) API_AVAILABLE(ios(15.0)) {
     if (!NJPiPDanmakuEnabled()) {
         return nil;
     }
@@ -1051,11 +1055,17 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     if (![sourceLayer isKindOfClass:AVSampleBufferDisplayLayer.class]) {
         return nil;
     }
-    UIView *sourceView = NJViewWithBackingLayer(sourceLayer) ?: NJSourceViewForLayer(sourceLayer);
+    UIView *directSourceView = NJViewWithBackingLayer(sourceLayer) ?: NJSourceViewForLayer(sourceLayer);
+    UIView *sourceView = directSourceView;
+    if ((!sourceView || !sourceView.window) && fallbackSourceView.window) {
+        sourceView = fallbackSourceView;
+    }
     if (!sourceView || !sourceView.window) {
         os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
-                         "[NJPiPDanmaku] preserve native source: sample layer has no visible source view layer=%p",
-                         sourceLayer);
+                         "[NJPiPDanmaku] preserve native source: sample layer and fallback have no visible source view layer=%p fallback=%{public}s window=%p",
+                         sourceLayer,
+                         NJPiPClassName(fallbackSourceView),
+                         fallbackSourceView.window);
         return nil;
     }
 
@@ -1063,6 +1073,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.sourceDisplayLayer = sourceLayer;
     state.sourceView = sourceView;
     state.sourceVideoRenderer = NJPiPSampleBufferRenderer(sourceLayer);
+    state.danmakuView = NJFindPiPDanmakuView(sourceView);
     state.contentViewController = [[NJPiPDanmakuContentViewController alloc] init];
     state.contentViewController.presentationState = state;
 
@@ -1085,18 +1096,34 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     hostView.videoView = state.mirrorView;
     state.mirrorVideoRenderer = NJPiPSampleBufferRenderer(state.mirrorView.sampleBufferDisplayLayer);
 
+    CGRect activeSourceFrame = [sourceView convertRect:sourceView.bounds toView:sourceView.window];
+    UIView *activeSourceView = [[UIView alloc] initWithFrame:activeSourceFrame];
+    activeSourceView.backgroundColor = UIColor.clearColor;
+    activeSourceView.userInteractionEnabled = NO;
+    activeSourceView.accessibilityElementsHidden = YES;
+    activeSourceView.opaque = NO;
+    [sourceView.window addSubview:activeSourceView];
+    state.activeVideoCallSourceView = activeSourceView;
+
     state.customContentSource = [[AVPictureInPictureControllerContentSource alloc]
-        initWithActiveVideoCallSourceView:sourceView
+        initWithActiveVideoCallSourceView:activeSourceView
         contentViewController:state.contentViewController];
     state.delegateProxy = [[NJPiPMirrorDelegateProxy alloc] init];
     state.delegateProxy.state = state;
     NJAssociatePiPMirrorObject(sourceLayer, state);
     NJAssociatePiPMirrorObject(state.sourceVideoRenderer, state);
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
-                     "[NJPiPDanmaku] prepared real sample source=%{public}s layer=%p renderer=%p size=%.0fx%.0f",
+                     "[NJPiPDanmaku] prepared real sample source=%{public}s direct=%{public}s fallback=%{public}s layer=%p renderer=%p danmaku=%{public}s frame=(%.1f,%.1f %.1fx%.1f) size=%.0fx%.0f",
                      NJPiPClassName(sourceView),
+                     NJPiPClassName(directSourceView),
+                     NJPiPClassName(fallbackSourceView),
                      sourceLayer,
                      state.sourceVideoRenderer,
+                     NJPiPClassName(state.danmakuView),
+                     activeSourceFrame.origin.x,
+                     activeSourceFrame.origin.y,
+                     activeSourceFrame.size.width,
+                     activeSourceFrame.size.height,
                      contentSize.width,
                      contentSize.height);
     return state;
@@ -1174,12 +1201,32 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (instancetype)initWithPlayerLayer:(AVPlayerLayer *)playerLayer {
     // This is a nil-currentItem transition source in Bilibili.  Leaving it native
     // is essential: the app replaces it with a sample-buffer source when PiP starts.
-    return %orig;
+    AVPictureInPictureController *controller = %orig;
+    if (controller && NJPiPDanmakuEnabled() && [playerLayer isKindOfClass:AVPlayerLayer.class]) {
+        objc_setAssociatedObject(controller,
+                                 NJPiPFallbackPlayerLayerKey,
+                                 playerLayer,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+        UIView *sourceView = NJViewWithBackingLayer(playerLayer) ?: NJSourceViewForLayer(playerLayer);
+        CGRect sourceFrame = sourceView ? sourceView.frame : CGRectZero;
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                         "[NJPiPDanmaku] remembered native player source=%{public}s view=%p window=%p frame=(%.1f,%.1f %.1fx%.1f) player=%p item=%p",
+                         NJPiPClassName(sourceView),
+                         sourceView,
+                         sourceView.window,
+                         sourceFrame.origin.x,
+                         sourceFrame.origin.y,
+                         sourceFrame.size.width,
+                         sourceFrame.size.height,
+                         playerLayer.player,
+                         playerLayer.player.currentItem);
+    }
+    return controller;
 }
 
 - (instancetype)initWithContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
     if (@available(iOS 15.0, *)) {
-        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource);
+        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil);
         if (state) {
             AVPictureInPictureController *controller = %orig(state.customContentSource);
             if (controller) {
@@ -1210,7 +1257,12 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
 
     if (@available(iOS 15.0, *)) {
-        NJPiPMirrorState *newState = NJMakePiPMirrorState(contentSource);
+        AVPlayerLayer *fallbackPlayerLayer = objc_getAssociatedObject(self,
+                                                                       NJPiPFallbackPlayerLayerKey);
+        UIView *fallbackSourceView = NJViewWithBackingLayer(fallbackPlayerLayer) ?:
+                                     NJSourceViewForLayer(fallbackPlayerLayer);
+        NJPiPMirrorState *newState = NJMakePiPMirrorState(contentSource,
+                                                          fallbackSourceView);
         if (newState) {
             newState.controller = self;
             newState.delegateProxy.downstream = downstream;
@@ -1266,6 +1318,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
     [state restoreContent];
     objc_setAssociatedObject(self, NJPiPDanmakuStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(self, NJPiPFallbackPlayerLayerKey, nil, OBJC_ASSOCIATION_ASSIGN);
     %orig;
 }
 
