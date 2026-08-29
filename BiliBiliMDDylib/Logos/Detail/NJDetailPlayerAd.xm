@@ -943,7 +943,16 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
             [referenceSourceView convertRect:referenceSourceView.bounds
                                       toView:referenceSourceView.window];
     }
-    UIView *latestDanmakuView = NJFindPiPDanmakuView(sourceView);
+    // Keep the foreground renderer captured when the sample-buffer content source
+    // was created.  The transparent active-video-call anchor intentionally has no
+    // player descendants, so searching beneath it always returns nil.
+    UIView *latestDanmakuView = self.danmakuView;
+    if (!latestDanmakuView || !latestDanmakuView.superview) {
+        latestDanmakuView = NJFindPiPDanmakuView(referenceSourceView);
+        if (!latestDanmakuView) {
+            latestDanmakuView = NJFindVisiblePiPDanmakuView();
+        }
+    }
     if (latestDanmakuView) {
         self.danmakuView = latestDanmakuView;
     }
@@ -969,7 +978,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
 
     [hostView setNeedsLayout];
     [hostView layoutIfNeeded];
-    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] presenting sample mirror source=%{public}s layer=%p danmaku=%{public}s attached=%d",
                      NJPiPClassName(sourceView),
                      self.sourceDisplayLayer,
@@ -988,7 +997,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     [mirrorLayer enqueueSampleBuffer:sampleBuffer];
     self.mirroredFrameCount += 1;
     if (self.mirroredFrameCount == 1) {
-        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+        os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                          "[NJPiPDanmaku] first sample mirrored pts=%.3f ready=%d",
                          CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
                          mirrorLayer.readyForDisplay);
@@ -1016,7 +1025,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     self.danmakuOriginalSuperview = nil;
     self.danmakuConstraints = @[];
     [self.mirrorView.sampleBufferDisplayLayer flushAndRemoveImage];
-    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] restored danmaku hierarchy mirroredFrames=%lu",
                      (unsigned long)self.mirroredFrameCount);
     self.mirroredFrameCount = 0;
@@ -1057,7 +1066,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
 }
 
 - (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
-    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] didStart mirror active=%d possible=%d ready=%d frames=%lu",
                      controller.pictureInPictureActive,
                      controller.pictureInPicturePossible,
@@ -1118,14 +1127,18 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     if (![sourceLayer isKindOfClass:AVSampleBufferDisplayLayer.class]) {
         return nil;
     }
+    // The sample-buffer source and the danmaku renderer are siblings in Bilibili's
+    // player hierarchy.  In the normal case the source view is still attached, so
+    // do not make finding the renderer conditional on the source lookup failing:
+    // the old condition accidentally searched the freshly-created transparent
+    // anchor instead, which can never contain Bilibili's danmaku view.
+    UIView *visibleDanmakuView = NJFindVisiblePiPDanmakuView();
     UIView *directSourceView = NJViewWithBackingLayer(sourceLayer) ?: NJSourceViewForLayer(sourceLayer);
     UIView *referenceSourceView = directSourceView;
     if ((!referenceSourceView || !referenceSourceView.window) && fallbackSourceView.window) {
         referenceSourceView = fallbackSourceView;
     }
-    UIView *visibleDanmakuView = nil;
     if (!referenceSourceView || !referenceSourceView.window) {
-        visibleDanmakuView = NJFindVisiblePiPDanmakuView();
         referenceSourceView = visibleDanmakuView;
     }
     if (!referenceSourceView || !referenceSourceView.window) {
@@ -1156,7 +1169,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.referenceSourceView = referenceSourceView;
     state.activeVideoCallSourceView = activeSourceView;
     state.sourceVideoRenderer = NJPiPSampleBufferRenderer(sourceLayer);
-    state.danmakuView = visibleDanmakuView ?: NJFindPiPDanmakuView(activeSourceView);
+    // Keep the frontmost real renderer.  The anchor intentionally has no player
+    // subviews, so looking below it would always yield nil.
+    state.danmakuView = visibleDanmakuView ?: NJFindPiPDanmakuView(referenceSourceView);
     state.contentViewController = [[NJPiPDanmakuContentViewController alloc] init];
     state.contentViewController.presentationState = state;
 
@@ -1186,7 +1201,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.delegateProxy.state = state;
     NJAssociatePiPMirrorObject(sourceLayer, state);
     NJAssociatePiPMirrorObject(state.sourceVideoRenderer, state);
-    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] prepared real sample anchor=%p reference=%{public}s direct=%{public}s fallback=%{public}s layer=%p renderer=%p danmaku=%{public}s frame=(%.1f,%.1f %.1fx%.1f) size=%.0fx%.0f",
                      activeSourceView,
                      NJPiPClassName(referenceSourceView),
