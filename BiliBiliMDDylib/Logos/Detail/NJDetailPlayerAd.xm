@@ -1455,6 +1455,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // This is a nil-currentItem transition source in Bilibili.  Leaving it native
     // is essential: the app replaces it with a sample-buffer source when PiP starts.
     AVPictureInPictureController *controller = %orig;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] controller player-layer init class=%{public}s controller=%p enabled=%d",
+                     NJPiPClassName(controller), controller, NJPiPDanmakuEnabled());
     if (controller && NJPiPDanmakuEnabled() && [playerLayer isKindOfClass:AVPlayerLayer.class]) {
         NJTrackPiPController(controller);
         objc_setAssociatedObject(controller,
@@ -1501,6 +1504,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 }
 
 - (instancetype)initWithContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] controller content-source init class=%{public}s source=%{public}s enabled=%d",
+                     NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
     if (@available(iOS 15.0, *)) {
         NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil, nil, nil);
         if (state) {
@@ -1525,6 +1531,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 }
 
 - (void)setContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] controller set source class=%{public}s source=%{public}s enabled=%d",
+                     NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
     NJPiPMirrorState *oldState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (contentSource == oldState.customContentSource) {
         %orig;
@@ -1817,6 +1826,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 %end
 
 %ctor {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] module loaded master=%d pip=%d",
+                     NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
     if (NJ_MASTER_SWITCH_VALUE) {
         %init(App);
     }
