@@ -156,6 +156,18 @@ static BOOL NJPiPDanmakuEnabled(void) {
     return NJ_MASTER_SWITCH_VALUE && NJ_PIP_DANMAKU_VALUE;
 }
 
+// Keep only a weak reference: the player owns this view.  This gives the PiP
+// controller a stable foreground reference without retaining an old player
+// hierarchy after the user changes videos.
+static __weak UIView *NJPiPLastAttachedDanmakuView;
+static void NJPrewarmTrackedPiPControllersWithSourceView(UIView *sourceView);
+
+static void NJRememberAttachedPiPDanmakuView(UIView *view) {
+    if (view.window && !view.hidden && view.alpha >= 0.01 && !CGRectIsEmpty(view.bounds)) {
+        NJPiPLastAttachedDanmakuView = view;
+    }
+}
+
 static void NJRegisterPiPDanmakuView(id view) {
     if (![view isKindOfClass:UIView.class]) {
         return;
@@ -171,6 +183,11 @@ static void NJRegisterPiPDanmakuView(id view) {
         os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
                          "[NJPiPDanmaku] registered class=%{public}s view=%p",
                          NJPiPClassName(view), view);
+    }
+    UIView *danmakuView = (UIView *)view;
+    if (danmakuView.window) {
+        NJRememberAttachedPiPDanmakuView(danmakuView);
+        NJPrewarmTrackedPiPControllersWithSourceView(danmakuView);
     }
 }
 
@@ -349,6 +366,15 @@ static UIView *NJFindVisiblePiPDanmakuView(void) {
                          (unsigned long)candidateViews.count);
     }
     return selectedView;
+}
+
+static UIView *NJPiPPreferredPrewarmSourceView(void) {
+    UIView *rememberedView = NJPiPLastAttachedDanmakuView;
+    if (rememberedView.window && !rememberedView.hidden &&
+        rememberedView.alpha >= 0.01 && !CGRectIsEmpty(rememberedView.bounds)) {
+        return rememberedView;
+    }
+    return NJFindVisiblePiPDanmakuView();
 }
 
 static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView *superview) {
@@ -841,7 +867,10 @@ static void NJPrewarmPiPMirrorInput(AVPictureInPictureController *controller,
     if (!controller || !NJPiPDanmakuEnabled()) {
         return;
     }
-    UIView *danmakuView = NJFindVisiblePiPDanmakuView();
+    UIView *danmakuView = NJPiPPreferredPrewarmSourceView();
+    if (!danmakuView && NJIsPiPDanmakuRenderingView(fallbackSourceView)) {
+        danmakuView = fallbackSourceView;
+    }
     UIView *referenceView = fallbackSourceView;
     if (!referenceView.window) {
         referenceView = danmakuView;
@@ -891,20 +920,29 @@ static NSHashTable<AVPictureInPictureController *> *NJPiPTrackedControllers(void
     return controllers;
 }
 
-static void NJPrewarmTrackedPiPControllers(void) {
+static void NJPrewarmTrackedPiPControllersWithSourceView(UIView *sourceView) {
     NSHashTable<AVPictureInPictureController *> *controllers = NJPiPTrackedControllers();
     NSArray<AVPictureInPictureController *> *snapshot;
     @synchronized (controllers) {
         snapshot = controllers.allObjects;
     }
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
-                     "[NJPiPDanmaku] app will resign active; prewarming controllers=%lu",
-                     (unsigned long)snapshot.count);
+                     "[NJPiPDanmaku] prewarming controllers=%lu source=%{public}s attached=%d",
+                     (unsigned long)snapshot.count,
+                     NJPiPClassName(sourceView),
+                     sourceView.window != nil);
     for (AVPictureInPictureController *controller in snapshot) {
         UIView *fallbackSourceView = objc_getAssociatedObject(controller,
                                                                NJPiPFallbackSourceViewKey);
+        if (!fallbackSourceView.window) {
+            fallbackSourceView = sourceView.window ? sourceView : NJPiPPreferredPrewarmSourceView();
+        }
         NJPrewarmPiPMirrorInput(controller, fallbackSourceView);
     }
+}
+
+static void NJPrewarmTrackedPiPControllers(void) {
+    NJPrewarmTrackedPiPControllersWithSourceView(nil);
 }
 
 static void NJInstallPiPPrewarmObserver(void) {
@@ -918,6 +956,8 @@ static void NJInstallPiPPrewarmObserver(void) {
                 // UIKit delivers this notification while the app's player views
                 // are still attached to their window, before automatic PiP makes
                 // Bilibili replace its content source.
+                os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                                 "[NJPiPDanmaku] app will resign active");
                 NJPrewarmTrackedPiPControllers();
             }];
     });
@@ -932,6 +972,10 @@ static void NJTrackPiPController(AVPictureInPictureController *controller) {
     @synchronized (controllers) {
         [controllers addObject:controller];
     }
+    // The controller and the danmaku view are constructed independently by
+    // Bilibili.  If the view is already attached, make the AVKit anchor now;
+    // waiting for the background notification is too late on iOS 26.
+    NJPrewarmPiPMirrorInput(controller, NJPiPPreferredPrewarmSourceView());
 }
 
 @interface NJPiPSampleBufferView : UIView
@@ -1358,6 +1402,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)didMoveToWindow {
     %orig;
     NJRegisterPiPDanmakuView(self);
+    if (self.window) {
+        NJRememberAttachedPiPDanmakuView(self);
+        NJPrewarmTrackedPiPControllersWithSourceView(self);
+    }
 }
 
 %end
