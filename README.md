@@ -33,6 +33,7 @@
 - ⏩ 新增 **3 倍速播放功能**（仅限 `8.41.0`、`8.76.0` 版本）
 - 修改默认播放速度
 - 修改关注页的默认版块
+- 🪟 实验性支持普通视频在系统画中画中显示弹幕（iOS 15+）
 
 ---
 
@@ -112,6 +113,12 @@ BiliBiliMApp/BiliBiliMD/TargetApp
 1. 使用 `Xcode` 打开工程
 2. 选择真机设备
 3. 编译并运行即可
+
+### 使用 GitHub Actions 构建
+
+仓库提供 `Build unsigned IPA` 工作流，可在 GitHub 的 Actions 页面手动运行。构建完成后，从该次任务的 Artifacts 下载 `BiliBiliMApp-D-unsigned`，再使用 SideStore、Sideloadly 或其他工具重签安装。
+
+工作流生成的是未签名 IPA，不需要把 Apple ID、证书或描述文件上传到仓库。
 
 ---
 

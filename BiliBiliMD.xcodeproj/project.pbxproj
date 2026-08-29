@@ -1926,7 +1926,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "/opt/MonkeyDev/bin/md --xcbp-logos\n";
+			shellScript = "touch \"${SRCROOT}/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm\"\n/opt/MonkeyDev/bin/md --xcbp-logos\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
@@ -2171,6 +2171,10 @@
 					"$(MonkeyDevPath)/Frameworks/libsubstrate.dylib",
 					"-lcycript",
 					"-framework",
+					AVFoundation,
+					"-framework",
+					AVKit,
+					"-framework",
 					LookinServer,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -2241,6 +2245,10 @@
 					"$(inherited)",
 					"-weak_library",
 					"$(MonkeyDevPath)/Frameworks/libsubstrate.dylib",
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AVKit,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "BiliBiliMDDylib/Logos/Tool/BiliBiliTweak-Bridging-Header.h";
