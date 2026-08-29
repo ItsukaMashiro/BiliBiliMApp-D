@@ -827,7 +827,60 @@ static const void *NJPiPMirrorStateKey = &NJPiPMirrorStateKey;
 static const void *NJPiPMirrorStateBoxKey = &NJPiPMirrorStateBoxKey;
 static const void *NJPiPFallbackPlayerLayerKey = &NJPiPFallbackPlayerLayerKey;
 static const void *NJPiPFallbackSourceViewKey = &NJPiPFallbackSourceViewKey;
+static const void *NJPiPPrewarmedAnchorViewKey = &NJPiPPrewarmedAnchorViewKey;
+static const void *NJPiPPrewarmedDanmakuViewKey = &NJPiPPrewarmedDanmakuViewKey;
 static __thread NSUInteger NJPiPMirrorEnqueueDepth = 0;
+
+// Bilibili replaces its native player-layer source with the real sample-buffer
+// source after the app has begun moving to the background.  At that point all
+// player views report window == nil, which is too late to create the active
+// video-call source AVKit requires.  Keep a transparent sibling in the real
+// window while the app is still foregrounded and reuse it for that replacement.
+static void NJPrewarmPiPMirrorInput(AVPictureInPictureController *controller,
+                                    UIView *fallbackSourceView) {
+    if (!controller || !NJPiPDanmakuEnabled()) {
+        return;
+    }
+    UIView *danmakuView = NJFindVisiblePiPDanmakuView();
+    UIView *referenceView = fallbackSourceView;
+    if (!referenceView.window) {
+        referenceView = danmakuView;
+    }
+    UIWindow *window = referenceView.window;
+    if (!window) {
+        return;
+    }
+
+    UIView *anchorView = objc_getAssociatedObject(controller, NJPiPPrewarmedAnchorViewKey);
+    if (!anchorView || anchorView.window != window) {
+        [anchorView removeFromSuperview];
+        CGRect frame = [referenceView convertRect:referenceView.bounds toView:window];
+        anchorView = [[UIView alloc] initWithFrame:frame];
+        anchorView.backgroundColor = UIColor.clearColor;
+        anchorView.userInteractionEnabled = NO;
+        anchorView.accessibilityElementsHidden = YES;
+        anchorView.opaque = NO;
+        [window addSubview:anchorView];
+        objc_setAssociatedObject(controller,
+                                 NJPiPPrewarmedAnchorViewKey,
+                                 anchorView,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } else {
+        anchorView.frame = [referenceView convertRect:referenceView.bounds toView:window];
+    }
+    if (danmakuView) {
+        objc_setAssociatedObject(controller,
+                                 NJPiPPrewarmedDanmakuViewKey,
+                                 danmakuView,
+                                 OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    }
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] prewarmed anchor=%p window=%p source=%{public}s danmaku=%{public}s",
+                     anchorView,
+                     window,
+                     NJPiPClassName(referenceView),
+                     NJPiPClassName(danmakuView));
+}
 
 @interface NJPiPSampleBufferView : UIView
 @property (nonatomic, readonly) AVSampleBufferDisplayLayer *sampleBufferDisplayLayer;
@@ -1119,7 +1172,9 @@ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandl
 
 static NJPiPMirrorState *NJMakePiPMirrorState(
     AVPictureInPictureControllerContentSource *contentSource,
-    UIView *fallbackSourceView) API_AVAILABLE(ios(15.0)) {
+    UIView *fallbackSourceView,
+    UIView *prewarmedAnchorView,
+    UIView *prewarmedDanmakuView) API_AVAILABLE(ios(15.0)) {
     if (!NJPiPDanmakuEnabled()) {
         return nil;
     }
@@ -1138,6 +1193,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     if ((!referenceSourceView || !referenceSourceView.window) && fallbackSourceView.window) {
         referenceSourceView = fallbackSourceView;
     }
+    if ((!referenceSourceView || !referenceSourceView.window) && prewarmedAnchorView.window) {
+        referenceSourceView = prewarmedAnchorView;
+    }
     if (!referenceSourceView || !referenceSourceView.window) {
         referenceSourceView = visibleDanmakuView;
     }
@@ -1152,12 +1210,17 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
     CGRect activeSourceFrame = [referenceSourceView convertRect:referenceSourceView.bounds
                                                           toView:referenceSourceView.window];
-    UIView *activeSourceView = [[UIView alloc] initWithFrame:activeSourceFrame];
-    activeSourceView.backgroundColor = UIColor.clearColor;
-    activeSourceView.userInteractionEnabled = NO;
-    activeSourceView.accessibilityElementsHidden = YES;
-    activeSourceView.opaque = NO;
-    [referenceSourceView.window addSubview:activeSourceView];
+    UIView *activeSourceView = prewarmedAnchorView;
+    if (!activeSourceView || activeSourceView.window != referenceSourceView.window) {
+        activeSourceView = [[UIView alloc] initWithFrame:activeSourceFrame];
+        activeSourceView.backgroundColor = UIColor.clearColor;
+        activeSourceView.userInteractionEnabled = NO;
+        activeSourceView.accessibilityElementsHidden = YES;
+        activeSourceView.opaque = NO;
+        [referenceSourceView.window addSubview:activeSourceView];
+    } else {
+        activeSourceView.frame = activeSourceFrame;
+    }
 
     NJPiPMirrorState *state = [[NJPiPMirrorState alloc] init];
     state.sourceDisplayLayer = sourceLayer;
@@ -1171,7 +1234,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.sourceVideoRenderer = NJPiPSampleBufferRenderer(sourceLayer);
     // Keep the frontmost real renderer.  The anchor intentionally has no player
     // subviews, so looking below it would always yield nil.
-    state.danmakuView = visibleDanmakuView ?: NJFindPiPDanmakuView(referenceSourceView);
+    state.danmakuView = visibleDanmakuView ?: prewarmedDanmakuView ?: NJFindPiPDanmakuView(referenceSourceView);
     state.contentViewController = [[NJPiPDanmakuContentViewController alloc] init];
     state.contentViewController.presentationState = state;
 
@@ -1306,6 +1369,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                                      NJPiPFallbackSourceViewKey,
                                      sourceView,
                                      OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+            NJPrewarmPiPMirrorInput(controller, sourceView);
         }
         CGRect sourceFrame = sourceView ? sourceView.frame : CGRectZero;
         os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
@@ -1323,9 +1387,21 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     return controller;
 }
 
+- (void)startPictureInPicture {
+    UIView *fallbackSourceView = objc_getAssociatedObject(self, NJPiPFallbackSourceViewKey);
+    if (!fallbackSourceView.window) {
+        AVPlayerLayer *fallbackPlayerLayer = objc_getAssociatedObject(self,
+                                                                       NJPiPFallbackPlayerLayerKey);
+        fallbackSourceView = NJViewWithBackingLayer(fallbackPlayerLayer) ?:
+                             NJSourceViewForLayer(fallbackPlayerLayer);
+    }
+    NJPrewarmPiPMirrorInput(self, fallbackSourceView);
+    %orig;
+}
+
 - (instancetype)initWithContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
     if (@available(iOS 15.0, *)) {
-        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil);
+        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil, nil, nil);
         if (state) {
             AVPictureInPictureController *controller = %orig(state.customContentSource);
             if (controller) {
@@ -1367,8 +1443,14 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
         if (!fallbackSourceView.window) {
             fallbackSourceView = NJFindVisiblePiPDanmakuView();
         }
+        UIView *prewarmedAnchorView = objc_getAssociatedObject(self,
+                                                                NJPiPPrewarmedAnchorViewKey);
+        UIView *prewarmedDanmakuView = objc_getAssociatedObject(self,
+                                                                 NJPiPPrewarmedDanmakuViewKey);
         NJPiPMirrorState *newState = NJMakePiPMirrorState(contentSource,
-                                                          fallbackSourceView);
+                                                          fallbackSourceView,
+                                                          prewarmedAnchorView,
+                                                          prewarmedDanmakuView);
         if (newState) {
             newState.controller = self;
             newState.delegateProxy.downstream = downstream;
@@ -1426,6 +1508,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     objc_setAssociatedObject(self, NJPiPDanmakuStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
     objc_setAssociatedObject(self, NJPiPFallbackPlayerLayerKey, nil, OBJC_ASSOCIATION_ASSIGN);
     objc_setAssociatedObject(self, NJPiPFallbackSourceViewKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    UIView *prewarmedAnchorView = objc_getAssociatedObject(self, NJPiPPrewarmedAnchorViewKey);
+    [prewarmedAnchorView removeFromSuperview];
+    objc_setAssociatedObject(self, NJPiPPrewarmedAnchorViewKey, nil, OBJC_ASSOCIATION_ASSIGN);
+    objc_setAssociatedObject(self, NJPiPPrewarmedDanmakuViewKey, nil, OBJC_ASSOCIATION_ASSIGN);
     %orig;
 }
 
