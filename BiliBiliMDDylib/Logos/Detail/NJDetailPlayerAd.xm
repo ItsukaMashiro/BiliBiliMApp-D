@@ -882,6 +882,58 @@ static void NJPrewarmPiPMirrorInput(AVPictureInPictureController *controller,
                      NJPiPClassName(danmakuView));
 }
 
+static NSHashTable<AVPictureInPictureController *> *NJPiPTrackedControllers(void) {
+    static NSHashTable<AVPictureInPictureController *> *controllers;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        controllers = [NSHashTable weakObjectsHashTable];
+    });
+    return controllers;
+}
+
+static void NJPrewarmTrackedPiPControllers(void) {
+    NSHashTable<AVPictureInPictureController *> *controllers = NJPiPTrackedControllers();
+    NSArray<AVPictureInPictureController *> *snapshot;
+    @synchronized (controllers) {
+        snapshot = controllers.allObjects;
+    }
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPDanmaku] app will resign active; prewarming controllers=%lu",
+                     (unsigned long)snapshot.count);
+    for (AVPictureInPictureController *controller in snapshot) {
+        UIView *fallbackSourceView = objc_getAssociatedObject(controller,
+                                                               NJPiPFallbackSourceViewKey);
+        NJPrewarmPiPMirrorInput(controller, fallbackSourceView);
+    }
+}
+
+static void NJInstallPiPPrewarmObserver(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        [[NSNotificationCenter defaultCenter]
+            addObserverForName:UIApplicationWillResignActiveNotification
+            object:nil
+            queue:NSOperationQueue.mainQueue
+            usingBlock:^(__unused NSNotification *notification) {
+                // UIKit delivers this notification while the app's player views
+                // are still attached to their window, before automatic PiP makes
+                // Bilibili replace its content source.
+                NJPrewarmTrackedPiPControllers();
+            }];
+    });
+}
+
+static void NJTrackPiPController(AVPictureInPictureController *controller) {
+    if (!controller || !NJPiPDanmakuEnabled()) {
+        return;
+    }
+    NJInstallPiPPrewarmObserver();
+    NSHashTable<AVPictureInPictureController *> *controllers = NJPiPTrackedControllers();
+    @synchronized (controllers) {
+        [controllers addObject:controller];
+    }
+}
+
 @interface NJPiPSampleBufferView : UIView
 @property (nonatomic, readonly) AVSampleBufferDisplayLayer *sampleBufferDisplayLayer;
 @end
@@ -1356,6 +1408,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // is essential: the app replaces it with a sample-buffer source when PiP starts.
     AVPictureInPictureController *controller = %orig;
     if (controller && NJPiPDanmakuEnabled() && [playerLayer isKindOfClass:AVPlayerLayer.class]) {
+        NJTrackPiPController(controller);
         objc_setAssociatedObject(controller,
                                  NJPiPFallbackPlayerLayerKey,
                                  playerLayer,
@@ -1405,6 +1458,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
         if (state) {
             AVPictureInPictureController *controller = %orig(state.customContentSource);
             if (controller) {
+                NJTrackPiPController(controller);
                 state.controller = controller;
                 objc_setAssociatedObject(controller,
                                          NJPiPMirrorStateKey,
@@ -1417,7 +1471,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
             return nil;
         }
     }
-    return %orig;
+    AVPictureInPictureController *controller = %orig;
+    NJTrackPiPController(controller);
+    return controller;
 }
 
 - (void)setContentSource:(AVPictureInPictureControllerContentSource *)contentSource {
