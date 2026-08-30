@@ -81,6 +81,12 @@ NS_ASSUME_NONNULL_BEGIN
 #define NJ_VERTICAL_SCREEN_MODE_VALUE ([NJ_SETTING_CACHE containsObjectForKey:NJ_VERTICAL_SCREEN_MODE_KEY] && \
 [(NSNumber *)[NJ_SETTING_CACHE objectForKey:NJ_VERTICAL_SCREEN_MODE_KEY] boolValue])
 
+/// 画中画弹幕
+#define NJ_PIP_DANMAKU_KEY @"NJ_PIP_DANMAKU_KEY"
+/// 画中画弹幕的值
+#define NJ_PIP_DANMAKU_VALUE (![NJ_SETTING_CACHE containsObjectForKey:NJ_PIP_DANMAKU_KEY] || \
+[(NSNumber *)[NJ_SETTING_CACHE objectForKey:NJ_PIP_DANMAKU_KEY] boolValue])
+
 /// --------------------- 设置页面 ---------------------
 
 /// --------------------- 单例 ---------------------

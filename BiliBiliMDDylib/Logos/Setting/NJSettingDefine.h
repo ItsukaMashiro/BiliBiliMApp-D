@@ -35,6 +35,8 @@
 #define NJ_AUTO_RECEIVE_COUPON_BIZ_ID @"autoReceiveCoupon"
 // 竖屏模式
 #define NJ_VERTICAL_SCREEN_MODE_BIZ_ID @"verticalScreenMode"
+// 画中画弹幕
+#define NJ_PIP_DANMAKU_BIZ_ID @"pipDanmaku"
 // 分享数据
 #define NJ_SHARE_DATA_BIZ_ID @"shareData"
 // 版本

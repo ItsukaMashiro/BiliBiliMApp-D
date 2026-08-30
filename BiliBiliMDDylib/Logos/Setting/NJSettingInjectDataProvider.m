@@ -44,9 +44,13 @@
                                                             title:@"自动领取大会员福利"
                                                                   on:NJ_AUTO_RECEIVE_COUPON_VALUE saveKey:NJ_AUTO_RECEIVE_COUPON_KEY]];
     [datas addObject:[[NJSettingSwitchViewModel alloc] initWithBizId:NJ_VERTICAL_SCREEN_MODE_BIZ_ID
-                                                           cellId:NJ_SWITCH_CELL_ID
-                                                            title:@"竖屏模式"
-                                                                  on:NJ_VERTICAL_SCREEN_MODE_VALUE saveKey:NJ_VERTICAL_SCREEN_MODE_KEY]];
+                                                            cellId:NJ_SWITCH_CELL_ID
+                                                             title:@"竖屏模式"
+                                                                   on:NJ_VERTICAL_SCREEN_MODE_VALUE saveKey:NJ_VERTICAL_SCREEN_MODE_KEY]];
+    [datas addObject:[[NJSettingSwitchViewModel alloc] initWithBizId:NJ_PIP_DANMAKU_BIZ_ID
+                                                            cellId:NJ_SWITCH_CELL_ID
+                                                             title:@"画中画弹幕"
+                                                                   on:NJ_PIP_DANMAKU_VALUE saveKey:NJ_PIP_DANMAKU_KEY]];
     [datas addObject:[[NJSettingSkullViewModel alloc] initWithBizId:NJ_SHARE_DATA_BIZ_ID
                                                              cellId:NJ_COMMON_CELL_ID
                                                               title:@"分享数据"]];

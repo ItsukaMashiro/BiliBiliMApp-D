@@ -339,6 +339,9 @@
 		BFB4F2E12F03FB1C004F7292 /* libroot.a in Frameworks */ = {isa = PBXBuildFile; fileRef = BFB4F2E02F03FB1C004F7292 /* libroot.a */; };
 		BFDA21812E65CD7300E3249E /* fishhook.h in Headers */ = {isa = PBXBuildFile; fileRef = BFDA217F2E65CD7300E3249E /* fishhook.h */; };
 		BFDA21822E65CD7300E3249E /* fishhook.c in Sources */ = {isa = PBXBuildFile; fileRef = BFDA21802E65CD7300E3249E /* fishhook.c */; };
+		BF9A73D22F9469AB008EB74C /* NJPipDanmakuManager.h in Headers */ = {isa = PBXBuildFile; fileRef = BF9A73CD2F9469AB008EB74C /* NJPipDanmakuManager.h */; };
+		BF9A73D32F9469AB008EB74C /* NJPipDanmakuManager.m in Sources */ = {isa = PBXBuildFile; fileRef = BF9A73CE2F9469AB008EB74C /* NJPipDanmakuManager.m */; };
+		BF9A73D42F9469AB008EB74C /* NJPipDanmaku.mm in Sources */ = {isa = PBXBuildFile; fileRef = BF9A73D02F9469AB008EB74C /* NJPipDanmaku.mm */; };
 /* End PBXBuildFile section */
 
 /* Begin PBXContainerItemProxy section */
@@ -722,6 +725,10 @@
 		BFB4F2E02F03FB1C004F7292 /* libroot.a */ = {isa = PBXFileReference; lastKnownFileType = archive.ar; name = libroot.a; path = ../../../../../../../opt/theos/vendor/lib/libroot.a; sourceTree = "<group>"; };
 		BFDA217F2E65CD7300E3249E /* fishhook.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = fishhook.h; sourceTree = "<group>"; };
 		BFDA21802E65CD7300E3249E /* fishhook.c */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.c; path = fishhook.c; sourceTree = "<group>"; };
+		BF9A73CD2F9469AB008EB74C /* NJPipDanmakuManager.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = NJPipDanmakuManager.h; sourceTree = "<group>"; };
+		BF9A73CE2F9469AB008EB74C /* NJPipDanmakuManager.m */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.objc; path = NJPipDanmakuManager.m; sourceTree = "<group>"; };
+		BF9A73CF2F9469AB008EB74C /* NJPipDanmaku.xm */ = {isa = PBXFileReference; lastKnownFileType = text; path = NJPipDanmaku.xm; sourceTree = "<group>"; };
+		BF9A73D02F9469AB008EB74C /* NJPipDanmaku.mm */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.cpp.objcpp; path = NJPipDanmaku.mm; sourceTree = "<group>"; };
 /* End PBXFileReference section */
 
 /* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
@@ -985,9 +992,10 @@
 		BF9A71762F9469AB008EB74C /* Detail */ = {
 			isa = PBXGroup;
 			children = (
-				BF9A71542F9469AB008EB74C /* PlaybackRate */,
-				BF9A716D2F9469AB008EB74C /* VerticalMode */,
-				BF9A716E2F9469AB008EB74C /* NJDetailAd.mm */,
+			BF9A71542F9469AB008EB74C /* PlaybackRate */,
+			BF9A716D2F9469AB008EB74C /* VerticalMode */,
+			BF9A73D12F9469AB008EB74C /* PiPDanmaku */,
+			BF9A716E2F9469AB008EB74C /* NJDetailAd.mm */,
 				BF9A716F2F9469AB008EB74C /* NJDetailAd.xm */,
 				BF9A71702F9469AB008EB74C /* NJDetailPlayerAd.mm */,
 				BF9A71712F9469AB008EB74C /* NJDetailPlayerAd.xm */,
@@ -1600,6 +1608,17 @@
 			path = Logos;
 			sourceTree = "<group>";
 		};
+		BF9A73D12F9469AB008EB74C /* PiPDanmaku */ = {
+			isa = PBXGroup;
+			children = (
+				BF9A73CD2F9469AB008EB74C /* NJPipDanmakuManager.h */,
+				BF9A73CE2F9469AB008EB74C /* NJPipDanmakuManager.m */,
+				BF9A73CF2F9469AB008EB74C /* NJPipDanmaku.xm */,
+				BF9A73D02F9469AB008EB74C /* NJPipDanmaku.mm */,
+			);
+			path = PiPDanmaku;
+			sourceTree = "<group>";
+		};
 /* End PBXGroup section */
 
 /* Begin PBXHeadersBuildPhase section */
@@ -1777,6 +1796,7 @@
 				BFDA21812E65CD7300E3249E /* fishhook.h in Headers */,
 				BF0D034C2DEDA95900115365 /* OCSelectorTrampolines.h in Headers */,
 				BF0D03482DEDA95900115365 /* OCMethodTrace.h in Headers */,
+				BF9A73D22F9469AB008EB74C /* NJPipDanmakuManager.h in Headers */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2095,6 +2115,8 @@
 				BF0D03542DEDA95900115365 /* LLDBTools.mm in Sources */,
 				BF0D03462DEDA95900115365 /* a2a3-selectortramps-x86_64.s in Sources */,
 				BF0D03372DEDA95900115365 /* MDMethodTrace.m in Sources */,
+				BF9A73D32F9469AB008EB74C /* NJPipDanmakuManager.m in Sources */,
+				BF9A73D42F9469AB008EB74C /* NJPipDanmaku.mm in Sources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 		};
@@ -2171,6 +2193,10 @@
 					"$(MonkeyDevPath)/Frameworks/libsubstrate.dylib",
 					"-lcycript",
 					"-framework",
+					AVFoundation,
+					"-framework",
+					AVKit,
+					"-framework",
 					LookinServer,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
@@ -2241,6 +2267,10 @@
 					"$(inherited)",
 					"-weak_library",
 					"$(MonkeyDevPath)/Frameworks/libsubstrate.dylib",
+					"-framework",
+					AVFoundation,
+					"-framework",
+					AVKit,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "BiliBiliMDDylib/Logos/Tool/BiliBiliTweak-Bridging-Header.h";
