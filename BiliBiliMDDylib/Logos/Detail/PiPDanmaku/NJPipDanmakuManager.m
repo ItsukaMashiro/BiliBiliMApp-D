@@ -72,7 +72,7 @@ NJ_SINGLETON_M(Manager)
                                                     selector:@selector(checkPipWindow)
                                                     userInfo:nil
                                                      repeats:YES];
-        [NSRunLoop mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+        [[NSRunLoop mainRunLoop] addTimer:self.timer forMode:NSRunLoopCommonModes];
         NSLog(@"%@:画中画弹幕监听已启动", nj_logPrefix);
     });
 }
@@ -149,7 +149,8 @@ NJ_SINGLETON_M(Manager)
     [danmakuView removeFromSuperview];
     [pipWindow addSubview:danmakuView];
     // 对齐画中画窗口内的视频区域
-    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromCoordinateSpace:videoLayer.coordinateSpace];
+    UIView *videoView = [self viewForLayer:videoLayer];
+    CGRect videoFrame = [pipWindow convertRect:(videoView ? videoView.bounds : pipWindow.bounds) fromView:videoView];
     danmakuView.frame = videoFrame;
     danmakuView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     danmakuView.backgroundColor = [UIColor clearColor];
@@ -228,7 +229,8 @@ NJ_SINGLETON_M(Manager)
     if (!videoLayer) {
         return;
     }
-    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromCoordinateSpace:videoLayer.coordinateSpace];
+    UIView *videoView = [self viewForLayer:videoLayer];
+    CGRect videoFrame = [pipWindow convertRect:(videoView ? videoView.bounds : pipWindow.bounds) fromView:videoView];
     if (!CGRectIsEmpty(videoFrame)) {
         danmakuView.frame = videoFrame;
         [danmakuView layoutIfNeeded];
@@ -319,6 +321,18 @@ NJ_SINGLETON_M(Manager)
     CGRect siblingFrame = [sibling convertRect:sibling.bounds toView:videoView.superview];
     CGRect videoFrame = [videoView convertRect:videoView.bounds toView:videoView.superview];
     return CGRectIntersectsRect(siblingFrame, videoFrame);
+}
+
+/// 查找 layer 所属的 UIView（沿 superlayer 向上查找 delegate）
+- (UIView *)viewForLayer:(CALayer *)layer {
+    CALayer *current = layer;
+    while (current) {
+        if ([current.delegate isKindOfClass:UIView.class]) {
+            return (UIView *)current.delegate;
+        }
+        current = current.superlayer;
+    }
+    return nil;
 }
 
 #pragma mark - 查找视频视图 / 视频层
