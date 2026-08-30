@@ -1,0 +1,153 @@
+name: Build unsigned IPA
+
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-ipa-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  MONKEYDEV_COMMIT: c37b5cc5e9a4184d80eb18fb9ae8c48bb8689442
+  THEOS_COMMIT: 5280bd038207e14f8bd76f5417aa2fe641c03228
+  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/bili-universal_8.89.0.app.zip
+  UPSTREAM_IPA_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/BiliBiliMApp_8.89.0.v3.1.0.ipa
+  ELLEKIT_SHA256: ca7aae6dd4c5591bb93510076f0f73d6e688e12e09cab37e91203fb12343b6ee
+
+jobs:
+  build:
+    runs-on: macos-15-intel
+    timeout-minutes: 45
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v5
+
+      - name: Select Xcode 16.4
+        run: |
+          sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
+          xcodebuild -version
+
+      - name: Install build dependencies
+        run: |
+          brew install ldid
+
+          git clone https://github.com/AloneMonkey/MonkeyDev.git "$RUNNER_TEMP/MonkeyDev"
+          git -C "$RUNNER_TEMP/MonkeyDev" checkout "$MONKEYDEV_COMMIT"
+
+          git clone https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          git -C "$RUNNER_TEMP/theos" checkout "$THEOS_COMMIT"
+          git -C "$RUNNER_TEMP/theos" submodule update --init --recursive --depth 1
+
+          sudo mkdir -p /opt
+          sudo mv "$RUNNER_TEMP/MonkeyDev" /opt/MonkeyDev
+          sudo mv "$RUNNER_TEMP/theos" /opt/theos
+          sudo chmod -R a+rX /opt/MonkeyDev /opt/theos
+          echo "/opt/MonkeyDev/bin" >> "$GITHUB_PATH"
+          echo "/opt/theos/bin" >> "$GITHUB_PATH"
+
+      - name: Download target app
+        run: |
+          mkdir -p BiliBiliMD/TargetApp
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/bili-universal.app.zip" \
+            "$TARGET_APP_URL"
+          # MonkeyDev's pack.sh copies the first .app it finds into TargetApp.
+          # Keeping the source app inside TargetApp makes that copy recursive and
+          # leaves a complete nested .app in the final bundle.
+          ditto -x -k "$RUNNER_TEMP/bili-universal.app.zip" BiliBiliMD
+          rm -rf BiliBiliMD/__MACOSX
+
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/upstream.ipa" \
+            "$UPSTREAM_IPA_URL"
+          unzip -p "$RUNNER_TEMP/upstream.ipa" \
+            'Payload/*.app/Frameworks/libellekit.dylib' \
+            > "$RUNNER_TEMP/libellekit.dylib"
+          test -s "$RUNNER_TEMP/libellekit.dylib"
+          echo "$ELLEKIT_SHA256  $RUNNER_TEMP/libellekit.dylib" | shasum -a 256 --check
+          install -m 0755 \
+            "$RUNNER_TEMP/libellekit.dylib" \
+            BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
+
+          xattr -cr BiliBiliMD/bili-universal.app
+          test -d BiliBiliMD/bili-universal.app
+          test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
+
+      - name: Build injected app
+        run: |
+          xcodebuild \
+            -project BiliBiliMD.xcodeproj \
+            -scheme BiliBiliMD \
+            -configuration Release \
+            -sdk iphoneos \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" \
+            MONKEYDEV_INSERT_DYLIB=YES \
+            MONKEYDEV_ADD_SUBSTRATE=YES \
+            build
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
+          test -d "$APP_PATH"
+          APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          test -n "$APP_EXECUTABLE"
+          test -s "$APP_PATH/$APP_EXECUTABLE"
+
+          # MonkeyDev's BSD cp invocation can leave the source bundle as a child
+          # even after its contents have been copied into the built app. The outer
+          # executable check above makes it safe to remove only that exact duplicate.
+          DUPLICATE_SOURCE_APP="$APP_PATH/bili-universal.app"
+          if [[ -d "$DUPLICATE_SOURCE_APP" ]]; then
+            echo "Removing duplicate source bundle: $DUPLICATE_SOURCE_APP"
+            rm -rf "$DUPLICATE_SOURCE_APP"
+          fi
+
+          /usr/libexec/PlistBuddy -c "Set :CFBundleName BiliBiliMAppD" "$APP_PATH/Info.plist"
+          IPA_BUNDLE_NAME="$(/usr/libexec/PlistBuddy -c "Print :CFBundleName" "$APP_PATH/Info.plist")"
+          echo "Final CFBundleName: $IPA_BUNDLE_NAME"
+          test "$IPA_BUNDLE_NAME" = "BiliBiliMAppD"
+          test -s "$APP_PATH/Frameworks/libellekit.dylib"
+          lipo -archs "$APP_PATH/Frameworks/libellekit.dylib" | grep -qw arm64
+          otool -L "$APP_PATH/Frameworks/BilibiliVideoTools.dylib" \
+            | grep -F '@executable_path/Frameworks/libellekit.dylib'
+          NESTED_APP=""
+          for CANDIDATE in "$APP_PATH"/*.app; do
+            if [[ -d "$CANDIDATE" ]]; then
+              NESTED_APP="$CANDIDATE"
+              break
+            fi
+          done
+          if [[ -n "$NESTED_APP" ]]; then
+            echo "Unexpected nested app bundle: $NESTED_APP" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
+          pushd "$RUNNER_TEMP/ipa"
+          zip -qry "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" Payload
+          popd
+          IPA_SIZE_BYTES="$(stat -f '%z' "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa")"
+          echo "Unsigned IPA size: $IPA_SIZE_BYTES bytes"
+          test "$IPA_SIZE_BYTES" -lt $((350 * 1024 * 1024))
+          mkdir -p artifacts
+          cp "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" artifacts/BiliBiliMApp-D-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: BiliBiliMApp-D-unsigned
+          path: artifacts/BiliBiliMApp-D-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 7
