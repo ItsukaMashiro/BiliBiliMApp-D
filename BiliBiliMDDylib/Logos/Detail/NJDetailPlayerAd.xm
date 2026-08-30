@@ -1381,15 +1381,198 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 %group App
 
 @interface BBPlayerDanmakuService : NSObject
+- (instancetype)initWithContext:(id)context;
+- (void)serviceOnStart;
+- (void)serviceOnStop;
+- (void)loadDMViewWithContextExtra:(id)contextExtra completeBlock:(id)completeBlock;
 - (UIView *)view;
+- (double)currentTime;
+- (double)playbackRate;
 @end
 
 %hook BBPlayerDanmakuService
 
+- (instancetype)initWithContext:(id)context {
+    id result = %orig;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] DanmakuService init self=%p result=%p context=%p contextClass=%{public}s thread=%{public}s",
+                     self, result, context, NJPiPClassName(context), NSThread.currentThread.description.UTF8String);
+    return result;
+}
+
+- (void)serviceOnStart {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] DanmakuService start self=%p view=%p time=%.3f rate=%.3f",
+                     self, [self view], [self currentTime], [self playbackRate]);
+    %orig;
+}
+
+- (void)serviceOnStop {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] DanmakuService stop self=%p view=%p time=%.3f",
+                     self, [self view], [self currentTime]);
+    %orig;
+}
+
+- (void)loadDMViewWithContextExtra:(id)contextExtra completeBlock:(id)completeBlock {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] DanmakuService loadDMView self=%p extra=%p extraClass=%{public}s completion=%p",
+                     self, contextExtra, NJPiPClassName(contextExtra), completeBlock);
+    %orig;
+}
+
 - (UIView *)view {
     UIView *view = %orig;
     NJRegisterPiPDanmakuView(view);
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] DanmakuService view self=%p view=%p class=%{public}s window=%p hidden=%d alpha=%.2f frame=(%.1f,%.1f %.1fx%.1f)",
+                     self,
+                     view,
+                     NJPiPClassName(view),
+                     view.window,
+                     view.hidden,
+                     view.alpha,
+                     view.frame.origin.x,
+                     view.frame.origin.y,
+                     view.frame.size.width,
+                     view.frame.size.height);
     return view;
+}
+
+%end
+
+@interface BBSBPiPManager : NSObject
+- (BOOL)needsBindingPlayerContainer;
+- (void)prepareToStart;
+- (void)stopPreparing;
+- (void)start;
+- (void)stop;
+- (void)stopWithReason:(NSInteger)reason;
+- (NSInteger)pictureInPictureStatus;
+- (void)setPictureInPictureStatus:(NSInteger)status;
+- (void)bindGraftData:(id)graftData shareId:(id)shareId dataSource:(id)dataSource completion:(id)completion;
+- (void)bindGraftData:(id)graftData ugcDataSourceAdapter:(id)adapter completion:(id)completion;
+@end
+
+%hook BBSBPiPManager
+
+- (instancetype)init {
+    id result = %orig;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager init self=%p result=%p class=%{public}s",
+                     self, result, NJPiPClassName(result));
+    return result;
+}
+
+- (BOOL)needsBindingPlayerContainer {
+    BOOL result = %orig;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager needsBinding self=%p result=%d status=%ld",
+                     self, result, (long)[self pictureInPictureStatus]);
+    return result;
+}
+
+- (void)bindGraftData:(id)graftData shareId:(id)shareId dataSource:(id)dataSource completion:(id)completion {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager bind shared self=%p graft=%p(%{public}s) share=%p source=%p(%{public}s) completion=%p",
+                     self, graftData, NJPiPClassName(graftData), shareId,
+                     dataSource, NJPiPClassName(dataSource), completion);
+    %orig;
+}
+
+- (void)bindGraftData:(id)graftData ugcDataSourceAdapter:(id)adapter completion:(id)completion {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager bind UGC self=%p graft=%p(%{public}s) adapter=%p(%{public}s) completion=%p",
+                     self, graftData, NJPiPClassName(graftData),
+                     adapter, NJPiPClassName(adapter), completion);
+    %orig;
+}
+
+- (void)prepareToStart {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager prepare self=%p status=%ld needsBinding=%d",
+                     self, (long)[self pictureInPictureStatus], [self needsBindingPlayerContainer]);
+    %orig;
+}
+
+- (void)stopPreparing {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager stopPreparing self=%p status=%ld",
+                     self, (long)[self pictureInPictureStatus]);
+    %orig;
+}
+
+- (void)start {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager start self=%p status=%ld",
+                     self, (long)[self pictureInPictureStatus]);
+    %orig;
+}
+
+- (void)stop {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager stop self=%p status=%ld",
+                     self, (long)[self pictureInPictureStatus]);
+    %orig;
+}
+
+- (void)stopWithReason:(NSInteger)reason {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager stopWithReason self=%p reason=%ld status=%ld",
+                     self, (long)reason, (long)[self pictureInPictureStatus]);
+    %orig;
+}
+
+- (void)setPictureInPictureStatus:(NSInteger)status {
+    NSInteger oldStatus = [self pictureInPictureStatus];
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager status self=%p old=%ld new=%ld",
+                     self, (long)oldStatus, (long)status);
+    %orig;
+}
+
+- (void)dealloc {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] SBManager dealloc self=%p status=%ld",
+                     self, (long)[self pictureInPictureStatus]);
+    %orig;
+}
+
+%end
+
+@interface _TtC18BBPictureInPicture15PlayerContainer : NSObject
+- (void)director_didPrepared;
+- (void)director_didComplete;
+@end
+
+%hook _TtC18BBPictureInPicture15PlayerContainer
+
+- (instancetype)init {
+    id result = %orig;
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] PlayerContainer init self=%p result=%p class=%{public}s",
+                     self, result, NJPiPClassName(result));
+    return result;
+}
+
+- (void)director_didPrepared {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] PlayerContainer prepared self=%p thread=%{public}s",
+                     self, NSThread.currentThread.description.UTF8String);
+    %orig;
+}
+
+- (void)director_didComplete {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] PlayerContainer complete self=%p",
+                     self);
+    %orig;
+}
+
+- (void)dealloc {
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                     "[NJPiPTrace] PlayerContainer dealloc self=%p", self);
+    %orig;
 }
 
 %end
