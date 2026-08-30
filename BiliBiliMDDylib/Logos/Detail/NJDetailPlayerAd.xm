@@ -1405,6 +1405,21 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      "[NJPiPTrace] DanmakuService start self=%p view=%p time=%.3f rate=%.3f",
                      self, [self view], [self currentTime], [self playbackRate]);
     %orig;
+
+    // The service creates its renderer asynchronously.  Reading `view` before
+    // serviceOnStart/loadDMView returns consistently produces nil on 8.76, so
+    // sample the public accessor after the current run loop and during the
+    // short loading window.  The hooked getter performs registration/prewarm.
+    for (NSNumber *delay in @[@0.0, @0.2, @0.8]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIView *view = [self view];
+            os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                             "[NJPiPTrace] DanmakuService delayed view self=%p delay=%.1f view=%p class=%{public}s window=%p",
+                             self, delay.doubleValue, view, NJPiPClassName(view), view.window);
+        });
+    }
 }
 
 - (void)serviceOnStop {
@@ -1419,11 +1434,27 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      "[NJPiPTrace] DanmakuService loadDMView self=%p extra=%p extraClass=%{public}s completion=%p",
                      self, contextExtra, NJPiPClassName(contextExtra), completeBlock);
     %orig;
+
+    for (NSNumber *delay in @[@0.0, @0.2, @0.8]) {
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW,
+                                     (int64_t)(delay.doubleValue * NSEC_PER_SEC)),
+                       dispatch_get_main_queue(), ^{
+            UIView *view = [self view];
+            os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
+                             "[NJPiPTrace] DanmakuService post-load view self=%p delay=%.1f view=%p class=%{public}s window=%p",
+                             self, delay.doubleValue, view, NJPiPClassName(view), view.window);
+        });
+    }
 }
 
 - (UIView *)view {
     UIView *view = %orig;
     NJRegisterPiPDanmakuView(view);
+    if (view.window && !view.hidden && view.alpha >= 0.01 &&
+        !CGRectIsEmpty(view.bounds)) {
+        NJRememberAttachedPiPDanmakuView(view);
+        NJPrewarmTrackedPiPControllersWithSourceView(view);
+    }
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] DanmakuService view self=%p view=%p class=%{public}s window=%p hidden=%d alpha=%.2f frame=(%.1f,%.1f %.1fx%.1f)",
                      self,
