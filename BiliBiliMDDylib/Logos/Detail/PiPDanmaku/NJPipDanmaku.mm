@@ -33,6 +33,6 @@ __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 #line 7 "E:/opencodeworkspace/BiliBiliMApp/BiliBiliMDDylib/Logos/Detail/PiPDanmaku/NJPipDanmaku.xm"
 static __attribute__((constructor)) void _logosLocalCtor_6b1a2c3d(int __unused argc, char __unused **argv, char __unused **envp) {
     if (NJ_MASTER_SWITCH_VALUE) {
-        [[NJPipDanmakuManager sharedInstance] startObserving];
+        [[NJPipDanmakuManager sharedManager] startObserving];
     }
 }

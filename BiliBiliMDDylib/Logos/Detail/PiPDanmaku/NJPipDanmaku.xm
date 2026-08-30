@@ -6,6 +6,6 @@
 
 %ctor {
     if (NJ_MASTER_SWITCH_VALUE) {
-        [[NJPipDanmakuManager sharedInstance] startObserving];
+        [[NJPipDanmakuManager sharedManager] startObserving];
     }
 }
