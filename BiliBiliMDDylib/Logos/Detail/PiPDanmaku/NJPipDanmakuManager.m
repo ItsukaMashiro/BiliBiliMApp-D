@@ -7,6 +7,7 @@
 
 #import "NJPipDanmakuManager.h"
 #import <AVFoundation/AVFoundation.h>
+#import <QuartzCore/QuartzCore.h>
 
 /// 画中画窗口检查间隔
 #define NJ_PIP_DANMAKU_CHECK_INTERVAL 0.25
@@ -71,7 +72,7 @@ NJ_SINGLETON_M(Manager)
                                                     selector:@selector(checkPipWindow)
                                                     userInfo:nil
                                                      repeats:YES];
-        [RunLoop mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
+        [NSRunLoop mainRunLoop addTimer:self.timer forMode:NSRunLoopCommonModes];
         NSLog(@"%@:画中画弹幕监听已启动", nj_logPrefix);
     });
 }
@@ -148,13 +149,13 @@ NJ_SINGLETON_M(Manager)
     [danmakuView removeFromSuperview];
     [pipWindow addSubview:danmakuView];
     // 对齐画中画窗口内的视频区域
-    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromLayer:videoLayer];
+    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromCoordinateSpace:videoLayer.coordinateSpace];
     danmakuView.frame = videoFrame;
     danmakuView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     danmakuView.backgroundColor = [UIColor clearColor];
     danmakuView.userInteractionEnabled = NO;
     [danmakuView setNeedsLayout];
-    [danmakuView layoutSublayersIfNeeded];
+    [danmakuView layoutIfNeeded];
     NSLog(@"%@:画中画弹幕已激活，弹幕视图 %@-%p", nj_logPrefix, NSStringFromClass([danmakuView class]), danmakuView);
 }
 
@@ -227,10 +228,10 @@ NJ_SINGLETON_M(Manager)
     if (!videoLayer) {
         return;
     }
-    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromLayer:videoLayer];
+    CGRect videoFrame = [pipWindow.layer convertRect:videoLayer.frame fromCoordinateSpace:videoLayer.coordinateSpace];
     if (!CGRectIsEmpty(videoFrame)) {
         danmakuView.frame = videoFrame;
-        [danmakuView layoutSublayersIfNeeded];
+        [danmakuView layoutIfNeeded];
     }
 }
 
