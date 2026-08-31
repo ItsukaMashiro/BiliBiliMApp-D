@@ -1169,30 +1169,33 @@ static int NJPiPLayerRequiresFlush(AVSampleBufferDisplayLayer *layer) {
 }
 
 static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
-    if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"timebase")]) {
+    if (!layer) {
         return @"-";
     }
+    CMTimebaseRef timebase = NULL;
     @try {
         id tb = [layer valueForKey:@"timebase"];
-        if (!tb) {
-            return @"-";
+        if ([tb isKindOfClass:[NSValue class]]) {
+            timebase = (CMTimebaseRef)[(NSValue *)tb pointerValue];
         }
-        CMTimebaseRef timebase = (CMTimebaseRef)(__bridge void *)tb;
-        Float64 rate = CMTimebaseGetRate(timebase);
-        if (rate == 0) {
-            return @"paused";
-        }
-        CMTime time = CMTimebaseGetTime(timebase);
 #ifndef __OBJC_ARC__
         [tb release];
 #endif
-        if (time.timescale <= 0) {
-            return [NSString stringWithFormat:@"rate=%.2f time=invalid", rate];
-        }
-        return [NSString stringWithFormat:@"rate=%.2f time=%.3f", rate, CMTimeGetSeconds(time)];
     } @catch (__unused NSException *exception) {
+        timebase = NULL;
+    }
+    if (!timebase) {
         return @"-";
     }
+    Float64 rate = CMTimebaseGetRate(timebase);
+    CMTime time = CMTimebaseGetTime(timebase);
+    if (rate == 0) {
+        return @"paused";
+    }
+    if (time.timescale <= 0) {
+        return [NSString stringWithFormat:@"rate=%.2f time=invalid", rate];
+    }
+    return [NSString stringWithFormat:@"rate=%.2f time=%.3f", rate, CMTimeGetSeconds(time)];
 }
 
 static NSMutableDictionary<NSString *, NSValue *> *NJPiPOriginalIMPs(void) {
