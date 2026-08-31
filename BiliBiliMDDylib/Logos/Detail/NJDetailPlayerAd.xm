@@ -1334,10 +1334,44 @@ static void NJPiPDiagHeartbeat(void) {
     NJPiPDiag("hb app=%d states=%lu", applicationState, (unsigned long)states.count);
 }
 
+static void NJPiPDiagBackgroundProbe(void) {
+    int applicationState = 0;
+    UIApplication *application = UIApplication.sharedApplication;
+    if (application) {
+        applicationState = (int)application.applicationState;
+    }
+    NSArray<NJPiPMirrorState *> *states;
+    @synchronized (NJPiPMirrorStates()) {
+        states = [NJPiPMirrorStates() allObjects];
+    }
+    for (NJPiPMirrorState *state in states) {
+        if (!state) {
+            continue;
+        }
+        AVPictureInPictureController *controller = state.controller;
+        BOOL isSuspended = NO;
+        if (controller && [controller respondsToSelector:@selector(isSuspended)]) {
+            isSuspended = (BOOL)[(id)controller performSelector:@selector(isSuspended)];
+        }
+        UIView *hostView = state.contentViewController.hostView;
+        NJPiPDiag("bgprobe st=%p app=%d pres=%d pipAct=%d pipPos=%d pipSusp=%d host=%p hostWin=%s n=%lu",
+                  state,
+                  applicationState,
+                  (int)state.isPresenting,
+                  controller ? (int)controller.pictureInPictureActive : -1,
+                  controller ? (int)controller.pictureInPicturePossible : -1,
+                  (int)isSuspended,
+                  hostView,
+                  NJPiPClassName(hostView.window),
+                  (unsigned long)state.mirroredFrameCount);
+    }
+}
+
 static void NJPiPDiagStart(void) {
     static dispatch_once_t onceToken;
+    static dispatch_source_t timer = NULL;
     dispatch_once(&onceToken, ^{
-        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, NJPiPDiagQueue());
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, NJPiPDiagQueue());
         dispatch_source_set_event_handler(timer, ^{
             NJPiPDiagHeartbeat();
             NJPiPDiagFlushLocked();
@@ -2490,10 +2524,11 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
         NJPiPDiagFlush();
     }];
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                                     object:nil
-                                                      queue:nil
-                                                 usingBlock:^(__unused NSNotification *note) {
+                                                      object:nil
+                                                       queue:nil
+                                                  usingBlock:^(__unused NSNotification *note) {
         NJPiPDiag("app background");
+        NJPiPDiagBackgroundProbe();
         NJPiPDiagFlush();
     }];
     if (NJ_MASTER_SWITCH_VALUE) {
