@@ -1172,7 +1172,7 @@ static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
     if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"timebase")]) {
         return @"-";
     }
-    CMTimebase *timebase = NULL;
+    CMTimebaseRef timebase = NULL;
     @try {
         timebase = [layer valueForKey:@"timebase"];
     } @catch (__unused NSException *exception) {
@@ -2476,8 +2476,8 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDiag("load sha=%s target=%s bundle=%s build=%s master=%d pip=%d",
               NJ_PI_P_BUILD_SHA,
               NJ_PI_P_TARGET_APP_URL,
-              [bundleInfo objectForKey:@"CFBundleShortVersionString"].UTF8String,
-              [bundleInfo objectForKey:@"CFBundleVersion"].UTF8String,
+               [(NSString *)[bundleInfo objectForKey:@"CFBundleShortVersionString"] UTF8String],
+               [(NSString *)[bundleInfo objectForKey:@"CFBundleVersion"] UTF8String],
               NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
     NJPiPDiagStart();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
