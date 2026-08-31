@@ -1178,9 +1178,6 @@ static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
         if ([tb isKindOfClass:[NSValue class]]) {
             timebase = (CMTimebaseRef)[(NSValue *)tb pointerValue];
         }
-#ifndef __OBJC_ARC__
-        [tb release];
-#endif
     } @catch (__unused NSException *exception) {
         timebase = NULL;
     }
