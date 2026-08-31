@@ -1143,14 +1143,39 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     if (mirrorLayer.status == AVQueuedSampleBufferRenderingStatusFailed) {
         [mirrorLayer flushAndRemoveImage];
     }
-    [mirrorLayer enqueueSampleBuffer:sampleBuffer];
+
+    // IJK's display-layer samples intentionally carry invalid presentation
+    // timestamps and are consumed by the original renderer as "display now".
+    // A second AVSampleBufferDisplayLayer cannot infer that private scheduling
+    // state, so enqueueing the same sample leaves it permanently not-ready.
+    // CMSampleBufferCreateCopy is a shallow copy of the media payload; mark only
+    // the mirror copy for immediate display and leave Bilibili's sample intact.
+    CMSampleBufferRef mirrorSample = NULL;
+    OSStatus copyStatus = CMSampleBufferCreateCopy(kCFAllocatorDefault,
+                                                    sampleBuffer,
+                                                    &mirrorSample);
+    if (copyStatus != noErr || !mirrorSample) {
+        return;
+    }
+    CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(mirrorSample, true);
+    CFIndex attachmentCount = attachments ? CFArrayGetCount(attachments) : 0;
+    for (CFIndex index = 0; index < attachmentCount; index++) {
+        CFMutableDictionaryRef attachment =
+            (CFMutableDictionaryRef)CFArrayGetValueAtIndex(attachments, index);
+        CFDictionarySetValue(attachment,
+                             kCMSampleAttachmentKey_DisplayImmediately,
+                             kCFBooleanTrue);
+    }
+    [mirrorLayer enqueueSampleBuffer:mirrorSample];
     self.mirroredFrameCount += 1;
     if (self.mirroredFrameCount == 1) {
         os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
-                         "[NJPiPDanmaku] first sample mirrored pts=%.3f ready=%d",
+                         "[NJPiPDanmaku] first immediate sample pts=%.3f attachments=%ld ready=%d",
                          CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                         (long)attachmentCount,
                          mirrorLayer.readyForDisplay);
     }
+    CFRelease(mirrorSample);
 }
 
 - (void)restoreContent {
@@ -1348,7 +1373,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.mirrorView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     state.mirrorView.sampleBufferDisplayLayer.videoGravity =
         sourceLayer.videoGravity ?: AVLayerVideoGravityResizeAspect;
-    state.mirrorView.sampleBufferDisplayLayer.controlTimebase = sourceLayer.controlTimebase;
+    // Mirrored IJK samples are delivered at the source renderer's cadence and
+    // carry invalid PTS.  A copied control timebase would wait for timestamps
+    // that never become valid; DisplayImmediately samples need no timebase.
+    state.mirrorView.sampleBufferDisplayLayer.controlTimebase = NULL;
     [hostView addSubview:state.mirrorView];
     hostView.videoView = state.mirrorView;
     state.mirrorVideoRenderer = NJPiPSampleBufferRenderer(state.mirrorView.sampleBufferDisplayLayer);
