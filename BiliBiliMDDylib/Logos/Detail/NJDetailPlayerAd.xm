@@ -1174,23 +1174,22 @@ static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
     }
     CMTimebaseRef timebase = NULL;
     @try {
-        timebase = [layer valueForKey:@"timebase"];
+        timebase = (CMTimebaseRef)[layer valueForKey:@"timebase"];
     } @catch (__unused NSException *exception) {
-        return @"-";
+        timebase = NULL;
     }
     if (!timebase) {
         return @"-";
     }
-    CMTime rate = CMTimebaseGetRate(timebase);
-    if (!CMTimeIsValid(rate) || CMTimeGetSeconds(rate) == 0) {
+    Float64 rate = CMTimebaseGetRate(timebase);
+    if (rate == 0) {
         return @"paused";
     }
-    CMTime time = CMTimebaseGetCurrentTime(timebase);
-    if (!CMTimeIsValid(time)) {
-        return [NSString stringWithFormat:@"rate=%.2f time=invalid", CMTimeGetSeconds(rate)];
+    CMTime time = CMTimebaseGetTime(timebase);
+    if (!time.valid) {
+        return [NSString stringWithFormat:@"rate=%.2f time=invalid", rate];
     }
-    return [NSString stringWithFormat:@"rate=%.2f time=%.3f",
-            CMTimeGetSeconds(rate), CMTimeGetSeconds(time)];
+    return [NSString stringWithFormat:@"rate=%.2f time=%.3f", rate, CMTimeGetSeconds(time)];
 }
 
 static NSMutableDictionary<NSString *, NSValue *> *NJPiPOriginalIMPs(void) {
