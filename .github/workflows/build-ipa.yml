@@ -81,6 +81,16 @@ jobs:
           test -d BiliBiliMD/bili-universal.app
           test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
+      - name: Write build stamp
+        run: |
+          mkdir -p BiliBiliMDDylib/Logos/Tool
+          {
+            echo "#pragma once"
+            echo "#define NJ_PI_P_BUILD_SHA \"${GITHUB_SHA}\""
+            echo "#define NJ_PI_P_TARGET_APP_URL \"${TARGET_APP_URL}\""
+          } > BiliBiliMDDylib/Logos/Tool/NJBuildStamp.h
+          cat BiliBiliMDDylib/Logos/Tool/NJBuildStamp.h
+
       - name: Build injected app
         run: |
           xcodebuild \

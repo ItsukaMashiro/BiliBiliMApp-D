@@ -127,6 +127,16 @@
 #import <os/log.h>
 #import "NJCommonDefine.h"
 
+#if __has_include("NJBuildStamp.h")
+#import "NJBuildStamp.h"
+#endif
+#ifndef NJ_PI_P_BUILD_SHA
+#define NJ_PI_P_BUILD_SHA "local"
+#endif
+#ifndef NJ_PI_P_TARGET_APP_URL
+#define NJ_PI_P_TARGET_APP_URL "unknown"
+#endif
+
 // MARK: - Picture in Picture danmaku
 
 static const void *NJPiPDanmakuStateKey = &NJPiPDanmakuStateKey;
@@ -141,6 +151,91 @@ static os_log_t NJPiPDanmakuLog(void) {
 
 static const char *NJPiPClassName(id object) {
     return object ? NSStringFromClass([object class]).UTF8String : "(nil)";
+}
+
+// MARK: - Persistent file diagnostics (observe only)
+
+static dispatch_queue_t NJPiPDiagQueue(void) {
+    static dispatch_queue_t queue = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        queue = dispatch_queue_create("com.njbilibili.pip.diag", DISPATCH_QUEUE_SERIAL);
+    });
+    return queue;
+}
+
+static NSString *NJPiPDiagFilePath(void) {
+    NSArray<NSString *> *paths = NSSearchPathForDirectoriesInDomains(NSDocumentDirectory, NSUserDomainMask, YES);
+    return [paths.firstObject stringByAppendingPathComponent:@"NJPiPDiagnostics.ndjson"];
+}
+
+static NSMutableData *NJPiPDiagBuffer(void) {
+    static NSMutableData *buffer = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        buffer = [NSMutableData data];
+    });
+    return buffer;
+}
+
+static void NJPiPDiagFlushLocked(void);
+
+static void NJPiPDiagAppendLineLocked(NSString *message) {
+    NSMutableData *buffer = NJPiPDiagBuffer();
+    long long nowMs = (long long)llround([NSDate date].timeIntervalSince1970 * 1000.0);
+    [buffer appendData:[NSString stringWithFormat:@"{\"t\":%lld,\"m\":\"%@\"}\n", nowMs, message]
+        dataUsingEncoding:NSUTF8StringEncoding]];
+    if (buffer.length >= 16 * 1024) {
+        NJPiPDiagFlushLocked();
+    }
+}
+
+static void NJPiPDiagFlushLocked(void) {
+    NSMutableData *buffer = NJPiPDiagBuffer();
+    if (buffer.length == 0) {
+        return;
+    }
+    NSString *path = NJPiPDiagFilePath();
+    NSFileManager *fileManager = [NSFileManager defaultManager];
+    NSDictionary<NSString *, id> *attributes = [fileManager attributesOfItemAtPath:path error:nil];
+    if ([attributes[NSFileSize] unsignedLongLongValue] > 512 * 1024) {
+        [fileManager removeItemAtPath:path error:nil];
+    }
+    if (![fileManager fileExistsAtPath:path]) {
+        [fileManager createFileAtPath:path contents:nil attributes:nil];
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForWritingAtPath:path];
+    if (!handle) {
+        return;
+    }
+    [handle seekToEndOfFile];
+    [handle writeData:buffer];
+    [handle closeFile];
+    [buffer setLength:0];
+}
+
+static void NJPiPDiagFlush(void) {
+    dispatch_async(NJPiPDiagQueue(), ^{
+        NJPiPDiagFlushLocked();
+    });
+}
+
+static void NJPiPDiag(const char *format, ...) __attribute__((format(printf, 1, 2)));
+
+static void NJPiPDiag(const char *format, ...) {
+    va_list args;
+    va_start(args, format);
+    char message[2048];
+    vsnprintf(message, sizeof(message), format, args);
+    va_end(args);
+    NSString *text = [NSString stringWithUTF8String:message];
+    dispatch_async(NJPiPDiagQueue(), ^{
+        NSString *escaped = [text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
+        escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
+        escaped = [escaped stringByReplacingOccurrencesOfString:@"\n" withString:@" "];
+        escaped = [escaped stringByReplacingOccurrencesOfString:@"\r" withString:@""];
+        NJPiPDiagAppendLineLocked(escaped);
+    });
 }
 
 static NSHashTable<UIView *> *NJPiPDanmakuViews(void) {
@@ -567,6 +662,8 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
                      "[NJPiPDanmaku] intercept contentSource replacement sample=%p playerLayer=%p active=%d",
                      sampleBufferLayer, playerLayer, self.controller.pictureInPictureActive);
+    NJPiPDiag("adopt contentSource sample=%p playerLayer=%p active=%d",
+              sampleBufferLayer, playerLayer, (int)self.controller.pictureInPictureActive);
 
     if (sampleBufferLayer) {
         [self removePictureInPicturePlayerLayer];
@@ -735,6 +832,7 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
     [self.state moveContentIntoPictureInPicture];
+    NJPiPDiag("danmaku willStart");
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerWillStartPictureInPicture:controller];
     }
@@ -747,6 +845,9 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
                      controller.pictureInPicturePossible,
                      self.state.pictureInPictureVideoLayer.readyForDisplay,
                      self.state.danmakuView.superview == self.state.contentViewController.hostView);
+    NJPiPDiag("danmaku didStart active=%d possible=%d",
+              (int)controller.pictureInPictureActive,
+              (int)controller.pictureInPicturePossible);
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStartPictureInPicture:controller];
     }
@@ -759,6 +860,8 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
                      error.domain.UTF8String,
                      (long)error.code,
                      error.localizedDescription.UTF8String);
+    NJPiPDiag("danmaku failed domain=%s code=%ld",
+              error.domain.UTF8String, (long)error.code);
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller failedToStartPictureInPictureWithError:error];
@@ -770,6 +873,7 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
                      "[NJPiPDanmaku] willStop active=%d possible=%d",
                      controller.pictureInPictureActive,
                      controller.pictureInPicturePossible);
+    NJPiPDiag("danmaku willStop");
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerWillStopPictureInPicture:controller];
     }
@@ -777,6 +881,7 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT, "[NJPiPDanmaku] didStop");
+    NJPiPDiag("danmaku didStop");
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -785,10 +890,11 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)controller
  restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    NJPiPDiag("danmaku restoreUI");
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller
-restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
+ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
     } else {
         completionHandler(YES);
     }
@@ -837,9 +943,14 @@ static NJPiPDanmakuState *NJMakePiPDanmakuState(AVPlayerLayer *videoLayer) API_A
                      NJPiPClassName(sourceView),
                      NJPiPClassName(videoView),
                      NJPiPClassName(danmakuView),
-                     sourceView.window,
-                     videoLayer.player,
-                     videoLayer.player.currentItem);
+                      sourceView.window,
+                      videoLayer.player,
+                      videoLayer.player.currentItem);
+    NJPiPDiag("prepared danmaku source=%s video=%s danmaku=%s player=%p",
+              NJPiPClassName(sourceView),
+              NJPiPClassName(videoView),
+              NJPiPClassName(danmakuView),
+              videoLayer.player);
     return state;
 }
 
@@ -1031,9 +1142,210 @@ static void NJTrackPiPController(AVPictureInPictureController *controller) {
 @property (nonatomic, copy) NSArray<NSLayoutConstraint *> *danmakuConstraints;
 @property (atomic, assign, getter=isPresenting) BOOL presenting;
 @property (atomic, assign) NSUInteger mirroredFrameCount;
+@property (atomic, assign) long long diagLastSampleLogMs;
 - (void)enqueueMirroredSampleBuffer:(CMSampleBufferRef)sampleBuffer;
 - (void)invalidate;
 @end
+
+static NSHashTable<NJPiPMirrorState *> *NJPiPMirrorStates(void) {
+    static NSHashTable<NJPiPMirrorState *> *states;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        states = [NSHashTable weakObjectsHashTable];
+    });
+    return states;
+}
+
+static int NJPiPLayerRequiresFlush(AVSampleBufferDisplayLayer *layer) {
+    if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"requiresFlushToResumeDecoding")]) {
+        return 0;
+    }
+    @try {
+        return [layer valueForKey:@"requiresFlushToResumeDecoding"] ? 1 : 0;
+    } @catch (__unused NSException *exception) {
+        return 0;
+    }
+}
+
+static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
+    if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"timebase")]) {
+        return @"-";
+    }
+    CMTimebase *timebase = NULL;
+    @try {
+        timebase = [layer valueForKey:@"timebase"];
+    } @catch (__unused NSException *exception) {
+        return @"-";
+    }
+    if (!timebase) {
+        return @"-";
+    }
+    CMTime rate = CMTimebaseGetRate(timebase);
+    if (!CMTimeIsValid(rate) || CMTimeGetSeconds(rate) == 0) {
+        return @"paused";
+    }
+    CMTime time = CMTimebaseGetCurrentTime(timebase);
+    if (!CMTimeIsValid(time)) {
+        return [NSString stringWithFormat:@"rate=%.2f time=invalid", CMTimeGetSeconds(rate)];
+    }
+    return [NSString stringWithFormat:@"rate=%.2f time=%.3f",
+            CMTimeGetSeconds(rate), CMTimeGetSeconds(time)];
+}
+
+static NSMutableDictionary<NSString *, NSValue *> *NJPiPOriginalIMPs(void) {
+    static NSMutableDictionary<NSString *, NSValue *> *imps;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        imps = [NSMutableDictionary dictionary];
+    });
+    return imps;
+}
+
+static NSValue *NJPiPDiagPlaybackTimeRange(id self, SEL selector, id item, CMTime time) {
+    NSString *key = [NSString stringWithFormat:@"%@/%@",
+                     NSStringFromClass([self class]), NSStringFromSelector(selector)];
+    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    if (original) {
+        return ((NSValue *(*)(id, SEL, id, CMTime))original)(self, selector, item, time);
+    }
+    return nil;
+}
+
+static void NJPiPDiagSeekToTime(id self, SEL selector, CMTime time, void (^completionHandler)(BOOL finished)) {
+    NSString *key = [NSString stringWithFormat:@"%@/%@",
+                     NSStringFromClass([self class]), NSStringFromSelector(selector)];
+    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    if (original) {
+        ((void (*)(id, SEL, CMTime, void (^)(BOOL)))original)(self, selector, time, completionHandler);
+        return;
+    }
+    if (completionHandler) {
+        completionHandler(YES);
+    }
+}
+
+static int NJPiPDiagTimeControlStatus(id self, SEL selector) {
+    NSString *key = [NSString stringWithFormat:@"%@/%@",
+                     NSStringFromClass([self class]), NSStringFromSelector(selector)];
+    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    if (original) {
+        return ((int (*)(id, SEL))original)(self, selector);
+    }
+    return 0;
+}
+
+static void NJPiPSwizzlePlaybackDelegateIfNeeded(id playbackDelegate) {
+    if (!playbackDelegate) {
+        return;
+    }
+    Class delegateClass = [playbackDelegate class];
+    NSString *className = NSStringFromClass(delegateClass);
+    static NSMutableSet<NSString *> *swizzledClasses;
+    static dispatch_once_t swizzledOnceToken;
+    dispatch_once(&swizzledOnceToken, ^{
+        swizzledClasses = [NSMutableSet set];
+    });
+    @synchronized (swizzledClasses) {
+        if ([swizzledClasses containsObject:className]) {
+            return;
+        }
+        [swizzledClasses addObject:className];
+    }
+    SEL selectors[3] = {
+        NSSelectorFromString(@"sampleBufferPlaybackDelegate:playbackTimeRangeForItem:time:"),
+        NSSelectorFromString(@"sampleBufferPlaybackDelegate:seekToTime:completionHandler:"),
+        NSSelectorFromString(@"sampleBufferPlaybackDelegateTimeControlStatusForPlayback:"),
+    };
+    IMP replacements[3] = {
+        (IMP)NJPiPDiagPlaybackTimeRange,
+        (IMP)NJPiPDiagSeekToTime,
+        (IMP)NJPiPDiagTimeControlStatus,
+    };
+    for (int index = 0; index < 3; index++) {
+        SEL selector = selectors[index];
+        if (!class_respondsToSelector(delegateClass, selector)) {
+            continue;
+        }
+        Method method = class_getInstanceMethod(delegateClass, selector);
+        if (!method) {
+            continue;
+        }
+        [NJPiPOriginalIMPs() setValue:[NSValue valueWithPointer:method_getImplementation(method)]
+                               forKey:[NSString stringWithFormat:@"%@/%@",
+                                       className, NSStringFromSelector(selector)]];
+        class_replaceMethod(delegateClass,
+                            selector,
+                            replacements[index],
+                            method_getTypeEncoding(method));
+    }
+}
+
+static void NJPiPDiagHeartbeat(void) {
+    int applicationState = 0;
+    UIApplication *application = UIApplication.sharedApplication;
+    if (application) {
+        applicationState = (int)application.applicationState;
+    }
+    NSArray<NJPiPMirrorState *> *states;
+    @synchronized (NJPiPMirrorStates()) {
+        states = [NJPiPMirrorStates() allObjects];
+    }
+    for (NJPiPMirrorState *state in states) {
+        if (!state) {
+            continue;
+        }
+        AVSampleBufferDisplayLayer *sourceLayer = state.sourceDisplayLayer;
+        AVSampleBufferDisplayLayer *mirrorLayer =
+            state.mirrorView ? state.mirrorView.sampleBufferDisplayLayer : nil;
+        AVPictureInPictureController *controller = state.controller;
+        BOOL isSuspended = NO;
+        if (controller && [controller respondsToSelector:@selector(isSuspended)]) {
+            isSuspended = [controller isSuspended];
+        }
+        id playbackDelegate = nil;
+        if (state.customContentSource &&
+            [state.customContentSource respondsToSelector:@selector(sampleBufferPlaybackDelegate)]) {
+            playbackDelegate = [state.customContentSource performSelector:@selector(sampleBufferPlaybackDelegate)];
+        }
+        if (playbackDelegate) {
+            NJPiPSwizzlePlaybackDelegateIfNeeded(playbackDelegate);
+        }
+        NJPiPDiag("hb st=%p app=%d pres=%d n=%lu pipAct=%d pipPos=%d pipSusp=%d srcSt=%ld mirSt=%ld srcRdy=%d mirRdy=%d srcFl=%d mirFl=%d srcTb=%s mirTb=%s delegate=%s",
+                  state,
+                  applicationState,
+                  (int)state.isPresenting,
+                  (unsigned long)state.mirroredFrameCount,
+                  controller ? (int)controller.pictureInPictureActive : -1,
+                  controller ? (int)controller.pictureInPicturePossible : -1,
+                  (int)isSuspended,
+                  sourceLayer ? (long)sourceLayer.status : -1,
+                  mirrorLayer ? (long)mirrorLayer.status : -1,
+                  sourceLayer ? (int)sourceLayer.readyForDisplay : -1,
+                  mirrorLayer ? (int)mirrorLayer.readyForDisplay : -1,
+                  NJPiPLayerRequiresFlush(sourceLayer),
+                  NJPiPLayerRequiresFlush(mirrorLayer),
+                  NJPiPLayerTimebaseInfo(sourceLayer).UTF8String,
+                  NJPiPLayerTimebaseInfo(mirrorLayer).UTF8String,
+                  NJPiPClassName(playbackDelegate));
+    }
+    NJPiPDiag("hb app=%d states=%lu", applicationState, (unsigned long)states.count);
+}
+
+static void NJPiPDiagStart(void) {
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, NJPiPDiagQueue());
+        dispatch_source_set_event_handler(timer, ^{
+            NJPiPDiagHeartbeat();
+            NJPiPDiagFlushLocked();
+        });
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, NSEC_PER_SEC),
+                                  NSEC_PER_SEC,
+                                  100 * NSEC_PER_MSEC);
+        dispatch_resume(timer);
+    });
+}
 
 static id NJPiPSampleBufferRenderer(AVSampleBufferDisplayLayer *layer) {
     if (!layer || ![layer respondsToSelector:NSSelectorFromString(@"sampleBufferRenderer")]) {
@@ -1133,6 +1445,11 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
                      self.sourceDisplayLayer,
                      NJPiPClassName(self.danmakuView),
                      self.danmakuView.superview == hostView);
+    NJPiPDiag("present source=%s danmaku=%s attached=%d frames=%lu",
+              NJPiPClassName(sourceView),
+              NJPiPClassName(self.danmakuView),
+              self.danmakuView.superview == hostView,
+              (unsigned long)self.mirroredFrameCount);
 }
 
 - (void)enqueueMirroredSampleBuffer:(CMSampleBufferRef)sampleBuffer {
@@ -1197,6 +1514,27 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
                          (long)attachmentCount,
                          mirrorLayer.readyForDisplay);
     }
+    long long diagNowMs = (long long)llround([NSDate date].timeIntervalSince1970 * 1000.0);
+    if (diagNowMs - self.diagLastSampleLogMs >= 500) {
+        self.diagLastSampleLogMs = diagNowMs;
+        CFArrayRef sourceAttachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, NO);
+        CFDictionaryRef pixelInfo = CVPixelBufferGetPixelFormatInfo(imageBuffer);
+        CFNumberRef pixelFormatNumber =
+            pixelInfo ? (CFNumberRef)CFDictionaryGetValue(pixelInfo, kCVPixelBufferPixelFormatTypeKey) : NULL;
+        CMTime sourcePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+        NJPiPDiag("smp n=%lu pts=%.3f opst=%.3f ready=%d att=%ld fmt=%ld size=%lux%lu mpts=%.3f mst=%ld mrdy=%d",
+                  (unsigned long)self.mirroredFrameCount,
+                  CMTimeGetSeconds(sourcePTS),
+                  CMTimeGetSeconds(CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer)),
+                  (int)CMSampleBufferIsReady(sampleBuffer),
+                  sourceAttachments ? (long)CFArrayGetCount(sourceAttachments) : 0,
+                  pixelFormatNumber ? (long)[(NSNumber *)pixelFormatNumber longValue] : -1,
+                  (unsigned long)CVPixelBufferGetWidth(imageBuffer),
+                  (unsigned long)CVPixelBufferGetHeight(imageBuffer),
+                  CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(mirrorSample)),
+                  (long)mirrorLayer.status,
+                  (int)mirrorLayer.readyForDisplay);
+    }
     CFRelease(mirrorSample);
 }
 
@@ -1224,10 +1562,14 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] restored danmaku hierarchy mirroredFrames=%lu",
                      (unsigned long)self.mirroredFrameCount);
+    NJPiPDiag("restore frames=%lu", (unsigned long)self.mirroredFrameCount);
     self.mirroredFrameCount = 0;
 }
 
 - (void)invalidate {
+    @synchronized (NJPiPMirrorStates()) {
+        [NJPiPMirrorStates() removeObject:self];
+    }
     [self restoreContent];
     NJRemovePiPMirrorAssociation(self.sourceDisplayLayer, self);
     NJRemovePiPMirrorAssociation(self.sourceVideoRenderer, self);
@@ -1256,6 +1598,7 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
     [self.state moveContentIntoPictureInPicture];
+    NJPiPDiag("mirror willStart");
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerWillStartPictureInPicture:controller];
     }
@@ -1268,6 +1611,10 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
                      controller.pictureInPicturePossible,
                      self.state.mirrorView.sampleBufferDisplayLayer.readyForDisplay,
                      (unsigned long)self.state.mirroredFrameCount);
+    NJPiPDiag("mirror didStart active=%d possible=%d frames=%lu",
+              (int)controller.pictureInPictureActive,
+              (int)controller.pictureInPicturePossible,
+              (unsigned long)self.state.mirroredFrameCount);
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStartPictureInPicture:controller];
     }
@@ -1280,20 +1627,24 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
                      error.domain.UTF8String,
                      (long)error.code,
                      error.localizedDescription.UTF8String);
+    NJPiPDiag("mirror failed domain=%s code=%ld",
+              error.domain.UTF8String, (long)error.code);
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller
-                 failedToStartPictureInPictureWithError:error];
+                  failedToStartPictureInPictureWithError:error];
     }
 }
 
 - (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("mirror willStop");
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerWillStopPictureInPicture:controller];
     }
 }
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("mirror didStop");
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -1302,10 +1653,11 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
 
 - (void)pictureInPictureController:(AVPictureInPictureController *)controller
  restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    NJPiPDiag("mirror restoreUI");
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller
-restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
+ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
     } else {
         completionHandler(YES);
     }
@@ -1423,8 +1775,15 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      activeSourceFrame.origin.y,
                      activeSourceFrame.size.width,
                      activeSourceFrame.size.height,
-                     contentSize.width,
-                     contentSize.height);
+                      contentSize.width,
+                      contentSize.height);
+    @synchronized (NJPiPMirrorStates()) {
+        [NJPiPMirrorStates() addObject:state];
+    }
+    NJPiPDiag("prepared anchor=%p layer=%p danmaku=%s",
+              activeSourceView,
+              sourceLayer,
+              NJPiPClassName(state.danmakuView));
     return state;
 }
 
@@ -1454,6 +1813,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] DanmakuService start self=%p view=%p time=%.3f rate=%.3f",
                      self, [self view], [self currentTime], [self playbackRate]);
+    NJPiPDiag("dm service start");
     %orig;
 
     // The service creates its renderer asynchronously.  Reading `view` before
@@ -1476,6 +1836,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] DanmakuService stop self=%p view=%p time=%.3f",
                      self, [self view], [self currentTime]);
+    NJPiPDiag("dm service stop");
     %orig;
 }
 
@@ -1542,6 +1903,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager init self=%p result=%p class=%{public}s",
                      self, result, NJPiPClassName(result));
+    NJPiPDiag("sbg init");
     return result;
 }
 
@@ -1550,22 +1912,25 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager needsBinding self=%p result=%d status=%ld",
                      self, result, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg needsBinding=%d status=%ld", (int)result, (long)[self pictureInPictureStatus]);
     return result;
 }
 
 - (void)bindGraftData:(id)graftData shareId:(id)shareId dataSource:(id)dataSource completion:(id)completion {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager bind shared self=%p graft=%p(%{public}s) share=%p source=%p(%{public}s) completion=%p",
-                     self, graftData, NJPiPClassName(graftData), shareId,
-                     dataSource, NJPiPClassName(dataSource), completion);
+                      self, graftData, NJPiPClassName(graftData), shareId,
+                      dataSource, NJPiPClassName(dataSource), completion);
+    NJPiPDiag("sbg bind share");
     %orig;
 }
 
 - (void)bindGraftData:(id)graftData ugcDataSourceAdapter:(id)adapter completion:(id)completion {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager bind UGC self=%p graft=%p(%{public}s) adapter=%p(%{public}s) completion=%p",
-                     self, graftData, NJPiPClassName(graftData),
-                     adapter, NJPiPClassName(adapter), completion);
+                      self, graftData, NJPiPClassName(graftData),
+                      adapter, NJPiPClassName(adapter), completion);
+    NJPiPDiag("sbg bind ugc");
     %orig;
 }
 
@@ -1573,6 +1938,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager prepare self=%p status=%ld needsBinding=%d",
                      self, (long)[self pictureInPictureStatus], [self needsBindingPlayerContainer]);
+    NJPiPDiag("sbg prepare status=%ld", (long)[self pictureInPictureStatus]);
     %orig;
 }
 
@@ -1580,6 +1946,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager stopPreparing self=%p status=%ld",
                      self, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg stopPreparing");
     %orig;
 }
 
@@ -1587,6 +1954,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager start self=%p status=%ld",
                      self, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg start");
     %orig;
 }
 
@@ -1594,6 +1962,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager stop self=%p status=%ld",
                      self, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg stop");
     %orig;
 }
 
@@ -1601,6 +1970,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager stopWithReason self=%p reason=%ld status=%ld",
                      self, (long)reason, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg stopWithReason=%ld", (long)reason);
     %orig;
 }
 
@@ -1609,6 +1979,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager status self=%p old=%ld new=%ld",
                      self, (long)oldStatus, (long)status);
+    NJPiPDiag("sbg status old=%ld new=%ld", (long)oldStatus, (long)status);
     %orig;
 }
 
@@ -1616,6 +1987,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] SBManager dealloc self=%p status=%ld",
                      self, (long)[self pictureInPictureStatus]);
+    NJPiPDiag("sbg dealloc");
     %orig;
 }
 
@@ -1633,6 +2005,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] PlayerContainer init self=%p result=%p class=%{public}s",
                      self, result, NJPiPClassName(result));
+    NJPiPDiag("sbgc init");
     return result;
 }
 
@@ -1640,6 +2013,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] PlayerContainer prepared self=%p thread=%{public}s",
                      self, NSThread.currentThread.description.UTF8String);
+    NJPiPDiag("sbgc prepared");
     %orig;
 }
 
@@ -1647,6 +2021,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] PlayerContainer complete self=%p",
                      self);
+    NJPiPDiag("sbgc complete");
     %orig;
 }
 
@@ -1722,6 +2097,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] controller player-layer init class=%{public}s controller=%p enabled=%d",
                      NJPiPClassName(controller), controller, NJPiPDanmakuEnabled());
+    NJPiPDiag("pip initPlayerLayer enabled=%d", NJPiPDanmakuEnabled());
     if (controller && NJPiPDanmakuEnabled() && [playerLayer isKindOfClass:AVPlayerLayer.class]) {
         NJTrackPiPController(controller);
         objc_setAssociatedObject(controller,
@@ -1756,6 +2132,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 }
 
 - (void)startPictureInPicture {
+    NJPiPDiag("pip start");
     UIView *fallbackSourceView = objc_getAssociatedObject(self, NJPiPFallbackSourceViewKey);
     if (!fallbackSourceView.window) {
         AVPlayerLayer *fallbackPlayerLayer = objc_getAssociatedObject(self,
@@ -1771,6 +2148,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] controller content-source init class=%{public}s source=%{public}s enabled=%d",
                      NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
+    NJPiPDiag("pip initContentSource enabled=%d", NJPiPDanmakuEnabled());
     if (@available(iOS 15.0, *)) {
         NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil, nil, nil);
         if (state) {
@@ -1798,6 +2176,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] controller set source class=%{public}s source=%{public}s enabled=%d",
                      NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
+    NJPiPDiag("pip setContentSource enabled=%d", NJPiPDanmakuEnabled());
     NJPiPMirrorState *oldState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (contentSource == oldState.customContentSource) {
         %orig;
@@ -1877,6 +2256,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 }
 
 - (void)dealloc {
+    NJPiPDiag("pip dealloc");
     NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     [mirrorState invalidate];
     objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -2093,6 +2473,28 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] module loaded master=%d pip=%d",
                      NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
+    NSDictionary<NSString *, id> *bundleInfo = [NSBundle mainBundle].infoDictionary;
+    NJPiPDiag("load sha=%s target=%s bundle=%s build=%s master=%d pip=%d",
+              NJ_PI_P_BUILD_SHA,
+              NJ_PI_P_TARGET_APP_URL,
+              [bundleInfo objectForKey:@"CFBundleShortVersionString"].UTF8String,
+              [bundleInfo objectForKey:@"CFBundleVersion"].UTF8String,
+              NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
+    NJPiPDiagStart();
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
+                                                     object:nil
+                                                      queue:nil
+                                                 usingBlock:^(__unused NSNotification *note) {
+        NJPiPDiag("app foreground");
+        NJPiPDiagFlush();
+    }];
+    [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationDidEnterBackgroundNotification
+                                                     object:nil
+                                                      queue:nil
+                                                 usingBlock:^(__unused NSNotification *note) {
+        NJPiPDiag("app background");
+        NJPiPDiagFlush();
+    }];
     if (NJ_MASTER_SWITCH_VALUE) {
         %init(App);
     }
