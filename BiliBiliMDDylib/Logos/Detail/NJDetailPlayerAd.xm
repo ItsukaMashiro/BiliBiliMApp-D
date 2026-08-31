@@ -1174,7 +1174,7 @@ static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
     }
     CMTimebaseRef timebase = NULL;
     @try {
-        timebase = (CMTimebaseRef)[layer valueForKey:@"timebase"];
+        timebase = (CMTimebaseRef)(void *)[layer valueForKey:@"timebase"];
     } @catch (__unused NSException *exception) {
         timebase = NULL;
     }
@@ -1186,7 +1186,7 @@ static NSString *NJPiPLayerTimebaseInfo(AVSampleBufferDisplayLayer *layer) {
         return @"paused";
     }
     CMTime time = CMTimebaseGetTime(timebase);
-    if (!time.valid) {
+    if (time.timescale <= 0) {
         return [NSString stringWithFormat:@"rate=%.2f time=invalid", rate];
     }
     return [NSString stringWithFormat:@"rate=%.2f time=%.3f", rate, CMTimeGetSeconds(time)];
