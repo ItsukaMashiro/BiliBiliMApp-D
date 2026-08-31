@@ -1145,16 +1145,37 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     }
 
     // IJK's display-layer samples intentionally carry invalid presentation
-    // timestamps and are consumed by the original renderer as "display now".
-    // A second AVSampleBufferDisplayLayer cannot infer that private scheduling
-    // state, so enqueueing the same sample leaves it permanently not-ready.
-    // CMSampleBufferCreateCopy is a shallow copy of the media payload; mark only
-    // the mirror copy for immediate display and leave Bilibili's sample intact.
+    // timestamps and depend on state inside its private renderer.  Even a copied
+    // DisplayImmediately attachment is not sufficient for a second independent
+    // AVSampleBufferDisplayLayer.  Re-wrap the already-decoded CVPixelBuffer in a
+    // standard ready sample with a host-clock PTS.  This retains the pixel buffer;
+    // it does not decode again or copy its pixels.
     CMSampleBufferRef mirrorSample = NULL;
-    OSStatus copyStatus = CMSampleBufferCreateCopy(kCFAllocatorDefault,
-                                                    sampleBuffer,
-                                                    &mirrorSample);
-    if (copyStatus != noErr || !mirrorSample) {
+    CVImageBufferRef imageBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (!imageBuffer) {
+        return;
+    }
+    CMVideoFormatDescriptionRef formatDescription = NULL;
+    OSStatus formatStatus = CMVideoFormatDescriptionCreateForImageBuffer(
+        kCFAllocatorDefault,
+        imageBuffer,
+        &formatDescription);
+    if (formatStatus != noErr || !formatDescription) {
+        return;
+    }
+    CMSampleTimingInfo timing = {
+        .duration = kCMTimeInvalid,
+        .presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock()),
+        .decodeTimeStamp = kCMTimeInvalid,
+    };
+    OSStatus sampleStatus = CMSampleBufferCreateReadyWithImageBuffer(
+        kCFAllocatorDefault,
+        imageBuffer,
+        formatDescription,
+        &timing,
+        &mirrorSample);
+    CFRelease(formatDescription);
+    if (sampleStatus != noErr || !mirrorSample) {
         return;
     }
     CFArrayRef attachments = CMSampleBufferGetSampleAttachmentsArray(mirrorSample, true);
@@ -1170,8 +1191,9 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     self.mirroredFrameCount += 1;
     if (self.mirroredFrameCount == 1) {
         os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
-                         "[NJPiPDanmaku] first immediate sample pts=%.3f attachments=%ld ready=%d",
+                         "[NJPiPDanmaku] first ready sample sourcePTS=%.3f mirrorPTS=%.3f attachments=%ld ready=%d",
                          CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(sampleBuffer)),
+                         CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(mirrorSample)),
                          (long)attachmentCount,
                          mirrorLayer.readyForDisplay);
     }
