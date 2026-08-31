@@ -125,6 +125,7 @@
 #import <AVKit/AVKit.h>
 #import <objc/runtime.h>
 #import <os/log.h>
+#import <CoreMedia/CoreMedia.h>
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
@@ -183,7 +184,7 @@ static void NJPiPDiagFlushLocked(void);
 static void NJPiPDiagAppendLineLocked(NSString *message) {
     NSMutableData *buffer = NJPiPDiagBuffer();
     long long nowMs = (long long)llround([NSDate date].timeIntervalSince1970 * 1000.0);
-    [buffer appendData:[NSString stringWithFormat:@"{\"t\":%lld,\"m\":\"%@\"}\n", nowMs, message]
+    [buffer appendData:[[NSString stringWithFormat:@"{\"t\":%lld,\"m\":\"%@\"}\n", nowMs, message]
         dataUsingEncoding:NSUTF8StringEncoding]];
     if (buffer.length >= 16 * 1024) {
         NJPiPDiagFlushLocked();
@@ -1204,7 +1205,7 @@ static NSMutableDictionary<NSString *, NSValue *> *NJPiPOriginalIMPs(void) {
 static NSValue *NJPiPDiagPlaybackTimeRange(id self, SEL selector, id item, CMTime time) {
     NSString *key = [NSString stringWithFormat:@"%@/%@",
                      NSStringFromClass([self class]), NSStringFromSelector(selector)];
-    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    IMP original = (IMP)[[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
     if (original) {
         return ((NSValue *(*)(id, SEL, id, CMTime))original)(self, selector, item, time);
     }
@@ -1214,7 +1215,7 @@ static NSValue *NJPiPDiagPlaybackTimeRange(id self, SEL selector, id item, CMTim
 static void NJPiPDiagSeekToTime(id self, SEL selector, CMTime time, void (^completionHandler)(BOOL finished)) {
     NSString *key = [NSString stringWithFormat:@"%@/%@",
                      NSStringFromClass([self class]), NSStringFromSelector(selector)];
-    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    IMP original = (IMP)[[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
     if (original) {
         ((void (*)(id, SEL, CMTime, void (^)(BOOL)))original)(self, selector, time, completionHandler);
         return;
@@ -1227,7 +1228,7 @@ static void NJPiPDiagSeekToTime(id self, SEL selector, CMTime time, void (^compl
 static int NJPiPDiagTimeControlStatus(id self, SEL selector) {
     NSString *key = [NSString stringWithFormat:@"%@/%@",
                      NSStringFromClass([self class]), NSStringFromSelector(selector)];
-    IMP original = [[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
+    IMP original = (IMP)[[NJPiPOriginalIMPs() objectForKey:key] pointerValue];
     if (original) {
         return ((int (*)(id, SEL))original)(self, selector);
     }
@@ -1270,7 +1271,7 @@ static void NJPiPSwizzlePlaybackDelegateIfNeeded(id playbackDelegate) {
         if (!method) {
             continue;
         }
-        [NJPiPOriginalIMPs() setValue:[NSValue valueWithPointer:method_getImplementation(method)]
+        [NJPiPOriginalIMPs() setValue:[NSValue valueWithPointer:(void *)method_getImplementation(method)]
                                forKey:[NSString stringWithFormat:@"%@/%@",
                                        className, NSStringFromSelector(selector)]];
         class_replaceMethod(delegateClass,
@@ -1300,7 +1301,7 @@ static void NJPiPDiagHeartbeat(void) {
         AVPictureInPictureController *controller = state.controller;
         BOOL isSuspended = NO;
         if (controller && [controller respondsToSelector:@selector(isSuspended)]) {
-            isSuspended = [controller isSuspended];
+            isSuspended = (BOOL)[(id)controller performSelector:@selector(isSuspended)];
         }
         id playbackDelegate = nil;
         if (state.customContentSource &&
@@ -1518,17 +1519,15 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
     if (diagNowMs - self.diagLastSampleLogMs >= 500) {
         self.diagLastSampleLogMs = diagNowMs;
         CFArrayRef sourceAttachments = CMSampleBufferGetSampleAttachmentsArray(sampleBuffer, NO);
-        CFDictionaryRef pixelInfo = CVPixelBufferGetPixelFormatInfo(imageBuffer);
-        CFNumberRef pixelFormatNumber =
-            pixelInfo ? (CFNumberRef)CFDictionaryGetValue(pixelInfo, kCVPixelBufferPixelFormatTypeKey) : NULL;
+        OSType pixelFormat = CVPixelBufferGetPixelFormatType(imageBuffer);
         CMTime sourcePTS = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
         NJPiPDiag("smp n=%lu pts=%.3f opst=%.3f ready=%d att=%ld fmt=%ld size=%lux%lu mpts=%.3f mst=%ld mrdy=%d",
                   (unsigned long)self.mirroredFrameCount,
                   CMTimeGetSeconds(sourcePTS),
                   CMTimeGetSeconds(CMSampleBufferGetOutputPresentationTimeStamp(sampleBuffer)),
-                  (int)CMSampleBufferIsReady(sampleBuffer),
-                  sourceAttachments ? (long)CFArrayGetCount(sourceAttachments) : 0,
-                  pixelFormatNumber ? (long)[(NSNumber *)pixelFormatNumber longValue] : -1,
+                   (int)CMSampleBufferDataIsReady(sampleBuffer),
+                   sourceAttachments ? (long)CFArrayGetCount(sourceAttachments) : 0,
+                   (long)pixelFormat,
                   (unsigned long)CVPixelBufferGetWidth(imageBuffer),
                   (unsigned long)CVPixelBufferGetHeight(imageBuffer),
                   CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(mirrorSample)),
