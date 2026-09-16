@@ -24,7 +24,13 @@ concurrency:
 env:
   MONKEYDEV_COMMIT: c37b5cc5e9a4184d80eb18fb9ae8c48bb8689442
   THEOS_COMMIT: 5280bd038207e14f8bd76f5417aa2fe641c03228
-  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/bili-universal_8.89.0.app.zip
+  # Pinned to 8.76.0 so the built binary matches the project Info.plist
+  # (8.76.0 / 87600100) and the existing static reverse-engineering results.
+  # The 8.89.0 target left the outer plist reporting 8.76.0 while the
+  # executable was 8.89.0, invalidating the 8.76.0 offset-based hooks.
+  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/2.7.0/bili-universal_8.76.0.app.zip
+  # libellekit.dylib is a version-independent injection runtime; keep the
+  # 3.1.0 upstream IPA so the pinned ELLEKIT_SHA256 check stays valid.
   UPSTREAM_IPA_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/BiliBiliMApp_8.89.0.v3.1.0.ipa
   ELLEKIT_SHA256: ca7aae6dd4c5591bb93510076f0f73d6e688e12e09cab37e91203fb12343b6ee
 
