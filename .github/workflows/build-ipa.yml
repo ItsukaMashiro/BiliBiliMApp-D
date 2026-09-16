@@ -130,6 +130,15 @@ jobs:
           test -n "$APP_EXECUTABLE"
           test -s "$APP_PATH/$APP_EXECUTABLE"
 
+          # Copy libellekit from the source app to the built app BEFORE removing
+          # the duplicate source bundle (which would delete the libellekit).
+          SOURCE_APP="BiliBiliMD/bili-universal.app"
+          if [[ -f "$SOURCE_APP/Frameworks/libellekit.dylib" ]]; then
+            mkdir -p "$APP_PATH/Frameworks"
+            cp "$SOURCE_APP/Frameworks/libellekit.dylib" "$APP_PATH/Frameworks/libellekit.dylib"
+            echo "Copied libellekit.dylib to built app"
+          fi
+
           # MonkeyDev's BSD cp invocation can leave the source bundle as a child
           # even after its contents have been copied into the built app. The outer
           # executable check above makes it safe to remove only that exact duplicate.
