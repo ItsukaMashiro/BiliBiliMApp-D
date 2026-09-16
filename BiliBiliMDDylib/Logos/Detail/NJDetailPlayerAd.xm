@@ -1782,10 +1782,20 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     state.mirrorView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
     state.mirrorView.sampleBufferDisplayLayer.videoGravity =
         sourceLayer.videoGravity ?: AVLayerVideoGravityResizeAspect;
-    // Mirrored IJK samples are delivered at the source renderer's cadence and
-    // carry invalid PTS.  A copied control timebase would wait for timestamps
-    // that never become valid; DisplayImmediately samples need no timebase.
-    state.mirrorView.sampleBufferDisplayLayer.controlTimebase = NULL;
+    // The video-call content source requires a running control timebase to
+    // display the sample buffer display layer's content.  A NULL timebase
+    // causes the system to wait indefinitely for the first frame (gray screen
+    // + loading spinner).  Create a running timebase; the DisplayImmediately
+    // attachment ensures frames are displayed immediately, even though the PTS
+    // is in the host timebase (different from the control timebase).
+    CMTimebaseRef mirrorTimebase = NULL;
+    OSStatus tbStatus = CMTimebaseCreate(&mirrorTimebase);
+    if (tbStatus == noErr && mirrorTimebase) {
+        CMTimebaseSetRate(mirrorTimebase, 1.0);
+        CMTimebaseSetTime(mirrorTimebase, kCMTimeZero);
+        state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
+    }
+    NJPiPDiag("mirror timebase running=%d", (int)(tbStatus == noErr));
     [hostView addSubview:state.mirrorView];
     hostView.videoView = state.mirrorView;
     state.mirrorVideoRenderer = NJPiPSampleBufferRenderer(state.mirrorView.sampleBufferDisplayLayer);
