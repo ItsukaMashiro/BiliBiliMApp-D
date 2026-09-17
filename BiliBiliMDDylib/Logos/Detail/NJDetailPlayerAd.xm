@@ -126,7 +126,17 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <CoreMedia/CoreMedia.h>
-#import <CoreMedia/CMTimebase.h>
+// CMTimebase.h (and CFClock.h) are not exposed in this build environment's
+// SDK (only the CoreMedia umbrella header is importable), so forward-declare
+// the running-timebase constructor we need. The sample buffer display layer
+// requires a running control timebase to show its content;
+// CMTimebaseCreateForHostTime creates one based on the host (mach) time,
+// which is the same timebase the sample buffer PTS uses. Re-declaring the
+// typedef is safe in C11 when the umbrella header already provides it.
+struct OpaqueCMTimebase;
+typedef struct OpaqueCMTimebase *CMTimebaseRef;
+extern "C" OSStatus CMTimebaseCreateForHostTime(CFAllocatorRef allocator,
+                                              CMTimebaseRef *timebaseRef);
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
