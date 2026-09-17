@@ -126,6 +126,7 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreFoundation/CFClock.h>
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
