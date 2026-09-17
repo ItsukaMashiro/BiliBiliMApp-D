@@ -128,15 +128,16 @@
 #import <CoreMedia/CoreMedia.h>
 // CMTimebase.h (and CFClock.h) are not exposed in this build environment's
 // SDK (only the CoreMedia umbrella header is importable), so forward-declare
-// the running-timebase constructor we need. The sample buffer display layer
-// requires a running control timebase to show its content;
-// CMTimebaseCreateForHostTime creates one based on the host (mach) time,
+// the running-timebase APIs we need. The sample buffer display layer requires
+// a running control timebase to show its content; CMTimebaseCreate +
+// CMTimebaseStart produce a running timebase in the host (mach) time domain,
 // which is the same timebase the sample buffer PTS uses. Re-declaring the
 // typedef is safe in C11 when the umbrella header already provides it.
 struct OpaqueCMTimebase;
 typedef struct OpaqueCMTimebase *CMTimebaseRef;
-extern "C" OSStatus CMTimebaseCreateForHostTime(CFAllocatorRef allocator,
-                                              CMTimebaseRef *timebaseRef);
+extern "C" OSStatus CMTimebaseCreate(CFAllocatorRef allocator,
+                                    CMTimebaseRef *timebaseRef);
+extern "C" OSStatus CMTimebaseStart(CMTimebaseRef timebaseRef);
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
@@ -1796,14 +1797,16 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // The video-call content source requires a running control timebase to
     // display the sample buffer display layer's content.  A NULL timebase
     // causes the system to wait indefinitely for the first frame (gray screen
-    // + loading spinner).  Create a running timebase from the host time; the
-    // sample buffer PTS is already in the host timebase, so the control
-    // timebase and the PTS share the same timebase and frames display
+    // + loading spinner).  Create a running timebase in the host (mach) time
+    // domain; the sample buffer PTS is already in the host timebase, so the
+    // control timebase and the PTS share the same timebase and frames display
     // immediately.  (CMTimebaseCreateForClock/kCFClockRealtime were used
-    // before, but CFClock.h is not present in the iOS SDK, so the host-time
-    // timebase is the portable equivalent.)
+    // before, but CFClock.h is not present in the iOS SDK, so CMTimebaseCreate
+    // + CMTimebaseStart is the portable equivalent.)
     CMTimebaseRef mirrorTimebase = NULL;
-    CMTimebaseCreateForHostTime(NULL, &mirrorTimebase);
+    if (CMTimebaseCreate(NULL, &mirrorTimebase) == noErr) {
+        CMTimebaseStart(mirrorTimebase);
+    }
     if (mirrorTimebase) {
         state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
     }
