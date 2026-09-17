@@ -1788,7 +1788,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // + loading spinner).  Create a running timebase; the DisplayImmediately
     // attachment ensures frames are displayed immediately, even though the PTS
     // is in the host timebase (different from the control timebase).
-    CMTimebaseRef mirrorTimebase = CMTimebaseCreateForHostTime(NULL);
+    CMTimebaseRef mirrorTimebase = CMTimebaseCreateForClock(kCFClockRealtime, NULL);
     if (mirrorTimebase) {
         state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
     }
