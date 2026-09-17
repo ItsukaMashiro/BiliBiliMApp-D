@@ -126,7 +126,7 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <CoreMedia/CoreMedia.h>
-#import <CoreFoundation/CFClock.h>
+#import <CoreMedia/CMTimebase.h>
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
@@ -1786,10 +1786,13 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // The video-call content source requires a running control timebase to
     // display the sample buffer display layer's content.  A NULL timebase
     // causes the system to wait indefinitely for the first frame (gray screen
-    // + loading spinner).  Create a running timebase; the DisplayImmediately
-    // attachment ensures frames are displayed immediately, even though the PTS
-    // is in the host timebase (different from the control timebase).
-    CMTimebaseRef mirrorTimebase = CMTimebaseCreateForClock(kCFClockRealtime, NULL);
+    // + loading spinner).  Create a running timebase from the host time; the
+    // sample buffer PTS is already in the host timebase, so the control
+    // timebase and the PTS share the same timebase and frames display
+    // immediately.  (CMTimebaseCreateForClock/kCFClockRealtime were used
+    // before, but CFClock.h is not present in the iOS SDK, so the host-time
+    // timebase is the portable equivalent.)
+    CMTimebaseRef mirrorTimebase = CMTimebaseCreateForHostTime(NULL);
     if (mirrorTimebase) {
         state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
     }
