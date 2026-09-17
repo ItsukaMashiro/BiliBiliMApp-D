@@ -126,18 +126,6 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <CoreMedia/CoreMedia.h>
-// CMTimebase.h (and CFClock.h) are not exposed in this build environment's
-// SDK (only the CoreMedia umbrella header is importable), so forward-declare
-// the running-timebase APIs we need. The sample buffer display layer requires
-// a running control timebase to show its content; CMTimebaseCreate +
-// CMTimebaseStart produce a running timebase in the host (mach) time domain,
-// which is the same timebase the sample buffer PTS uses. Re-declaring the
-// typedef is safe in C11 when the umbrella header already provides it.
-struct OpaqueCMTimebase;
-typedef struct OpaqueCMTimebase *CMTimebaseRef;
-extern "C" OSStatus CMTimebaseCreate(CFAllocatorRef allocator,
-                                    CMTimebaseRef *timebaseRef);
-extern "C" OSStatus CMTimebaseStart(CMTimebaseRef timebaseRef);
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
@@ -1797,20 +1785,25 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // The video-call content source requires a running control timebase to
     // display the sample buffer display layer's content.  A NULL timebase
     // causes the system to wait indefinitely for the first frame (gray screen
-    // + loading spinner).  Create a running timebase in the host (mach) time
-    // domain; the sample buffer PTS is already in the host timebase, so the
-    // control timebase and the PTS share the same timebase and frames display
-    // immediately.  (CMTimebaseCreateForClock/kCFClockRealtime were used
-    // before, but CFClock.h is not present in the iOS SDK, so CMTimebaseCreate
-    // + CMTimebaseStart is the portable equivalent.)
+    // + loading spinner).  The source layer is actively rendering, so it owns
+    // a running timebase; reuse it via KVC instead of creating a new one.
+    // This avoids the CMTimebase* creation APIs, which this build environment's
+    // CoreMedia does not export (only the getter functions link).  The mirror
+    // shows the same sample buffers as the source, so the PTS and the reused
+    // timebase share the same time domain and frames display immediately.
     CMTimebaseRef mirrorTimebase = NULL;
-    if (CMTimebaseCreate(NULL, &mirrorTimebase) == noErr) {
-        CMTimebaseStart(mirrorTimebase);
+    @try {
+        id sourceTimebaseValue = [sourceLayer valueForKey:@"timebase"];
+        if ([sourceTimebaseValue isKindOfClass:[NSValue class]]) {
+            mirrorTimebase = (CMTimebaseRef)[(NSValue *)sourceTimebaseValue pointerValue];
+        }
+    } @catch (__unused NSException *exception) {
+        mirrorTimebase = NULL;
     }
     if (mirrorTimebase) {
         state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
     }
-    NJPiPDiag("mirror timebase running=%d", (int)(mirrorTimebase != NULL));
+    NJPiPDiag("mirror timebase reused=%d", (int)(mirrorTimebase != NULL));
     [hostView addSubview:state.mirrorView];
     hostView.videoView = state.mirrorView;
     state.mirrorVideoRenderer = NJPiPSampleBufferRenderer(state.mirrorView.sampleBufferDisplayLayer);
