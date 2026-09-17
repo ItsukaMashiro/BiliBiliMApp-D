@@ -2198,6 +2198,8 @@
 					AVKit,
 					"-framework",
 					LookinServer,
+					"-framework",
+					CoreMedia,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "BiliBiliMDDylib/Logos/Tool/BiliBiliTweak-Bridging-Header.h";
@@ -2271,6 +2273,8 @@
 					AVFoundation,
 					"-framework",
 					AVKit,
+					"-framework",
+					CoreMedia,
 				);
 				PRODUCT_NAME = "$(TARGET_NAME)";
 				SWIFT_OBJC_BRIDGING_HEADER = "BiliBiliMDDylib/Logos/Tool/BiliBiliTweak-Bridging-Header.h";
