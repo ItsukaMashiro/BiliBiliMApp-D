@@ -2,16 +2,9 @@ name: Build unsigned IPA
 
 on:
   workflow_dispatch:
-    inputs:
-      branch:
-        description: 'Branch to build'
-        required: true
-        default: 'main'
-        type: 'string'
   push:
     branches:
       - main
-      - agent/pip-danmaku
   pull_request:
 
 permissions:
@@ -24,13 +17,7 @@ concurrency:
 env:
   MONKEYDEV_COMMIT: c37b5cc5e9a4184d80eb18fb9ae8c48bb8689442
   THEOS_COMMIT: 5280bd038207e14f8bd76f5417aa2fe641c03228
-  # Pinned to 8.76.0 so the built binary matches the project Info.plist
-  # (8.76.0 / 87600100) and the existing static reverse-engineering results.
-  # The 8.89.0 target left the outer plist reporting 8.76.0 while the
-  # executable was 8.89.0, invalidating the 8.76.0 offset-based hooks.
-  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/2.7.0/bili-universal_8.76.0.app.zip
-  # libellekit.dylib is a version-independent injection runtime; keep the
-  # 3.1.0 upstream IPA so the pinned ELLEKIT_SHA256 check stays valid.
+  TARGET_APP_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/bili-universal_8.89.0.app.zip
   UPSTREAM_IPA_URL: https://github.com/TouchFriend/BiliBiliMApp/releases/download/3.1.0/BiliBiliMApp_8.89.0.v3.1.0.ipa
   ELLEKIT_SHA256: ca7aae6dd4c5591bb93510076f0f73d6e688e12e09cab37e91203fb12343b6ee
 
@@ -42,8 +29,6 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v5
-        with:
-          ref: ${{ github.event.inputs.branch || github.ref }}
 
       - name: Select Xcode 16.4
         run: |
@@ -96,16 +81,6 @@ jobs:
           test -d BiliBiliMD/bili-universal.app
           test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
-      - name: Write build stamp
-        run: |
-          mkdir -p BiliBiliMDDylib/Logos/Tool
-          {
-            echo "#pragma once"
-            echo "#define NJ_PI_P_BUILD_SHA \"${GITHUB_SHA}\""
-            echo "#define NJ_PI_P_TARGET_APP_URL \"${TARGET_APP_URL}\""
-          } > BiliBiliMDDylib/Logos/Tool/NJBuildStamp.h
-          cat BiliBiliMDDylib/Logos/Tool/NJBuildStamp.h
-
       - name: Build injected app
         run: |
           xcodebuild \
@@ -129,15 +104,6 @@ jobs:
           APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           test -n "$APP_EXECUTABLE"
           test -s "$APP_PATH/$APP_EXECUTABLE"
-
-          # Copy libellekit from the source app to the built app BEFORE removing
-          # the duplicate source bundle (which would delete the libellekit).
-          SOURCE_APP="BiliBiliMD/bili-universal.app"
-          if [[ -f "$SOURCE_APP/Frameworks/libellekit.dylib" ]]; then
-            mkdir -p "$APP_PATH/Frameworks"
-            cp "$SOURCE_APP/Frameworks/libellekit.dylib" "$APP_PATH/Frameworks/libellekit.dylib"
-            echo "Copied libellekit.dylib to built app"
-          fi
 
           # MonkeyDev's BSD cp invocation can leave the source bundle as a child
           # even after its contents have been copied into the built app. The outer
