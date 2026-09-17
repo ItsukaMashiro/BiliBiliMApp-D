@@ -1802,7 +1802,8 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     // immediately.  (CMTimebaseCreateForClock/kCFClockRealtime were used
     // before, but CFClock.h is not present in the iOS SDK, so the host-time
     // timebase is the portable equivalent.)
-    CMTimebaseRef mirrorTimebase = CMTimebaseCreateForHostTime(NULL);
+    CMTimebaseRef mirrorTimebase = NULL;
+    CMTimebaseCreateForHostTime(NULL, &mirrorTimebase);
     if (mirrorTimebase) {
         state.mirrorView.sampleBufferDisplayLayer.controlTimebase = mirrorTimebase;
     }
