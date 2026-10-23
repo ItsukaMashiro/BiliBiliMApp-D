@@ -7,14 +7,36 @@
  * objects, and every failure is swallowed so the host app cannot crash.
  *
  * Output: NDJSON appended to <NSHomeDirectory()>/Library/NJPiPProbe.ndjson,
- * one JSON object per line: {"ts":<ms>,"ev":"<event>","d":{...}}
+ * one JSON object per line: {"ts":<ms>,"v":<probe version>,"ev":"<event>","d":{...}}
+ * Every line is hard-capped at 400 characters (over-long payloads are replaced
+ * with a {"tr":1,...} stub). High-frequency methods are counted only; a per-30s
+ * "cnt" summary reports the counters instead of per-call lines.
+ *
+ * v2 (nj-pip-probe-2): display-path forensics for the native-overlay test:
+ *   A) SBDL vs Metal: IJKSDLSampleBufferView -display_pixels, _vtb, _ffmpeg and
+ *      -enqueueSmapleBuffer: counts + first-arg types + instance layer class +
+ *      +layerClass; BFCCRONRenderViewV2 instantiation + backing layer class
+ *      (_displayLayer); BFCPlayerSampleBufferView / IJKSampleBufferWrapView
+ *      instantiation + getCurrentRenderer/switchRenderer:.
+ *   B) PiP instance identity: -[AVSampleBufferDisplayLayer enqueueSampleBuffer:]
+ *      counted per layer address with first-3 superlayer + backtrace samples;
+ *      -[BFCPlayerControllerV2 sampleBufferDisplayLayer] return addresses;
+ *      generateContentSourceWithCompletionHandler: on BBPlayerPlayback and
+ *      BFCPlayerControllerV2; ContentSource -initWithSampleBufferDisplayLayer:
+ *      playbackDelegate:; -[BBPiPController setContentSource:].
+ *   C) danmaku carrier: -didMoveToWindow watchlist over the DM view classes
+ *      recording backing layer + sublayer class names;
+ *      BFCChronosRendererWrapper instantiation (via state snapshots) and
+ *      -copyPixelBuffer counts (never invoked by the probe itself).
  *
  * No Node.js APIs, no require, no process — Frida/ObjC bridge + NativeFunction only.
  */
 (function () {
   'use strict';
 
-  var PROBE_VERSION = 'nj-pip-probe-1';
+  var PROBE_VERSION = 'nj-pip-probe-2';
+  var PROBE_V = 2;
+  var MAX_LINE = 400;
 
   // ---------------------------------------------------------------------------
   // native export lookup (compatible across Frida API generations)
@@ -77,11 +99,21 @@
       if (sysOpen === null || sysWrite === null || sysClose === null) return;
       var path = resolveProbePath();
       if (path === null) return;
-      var line = JSON.stringify(obj) + '\n';
-      var buf = Memory.allocUtf8String(line);
+      var body;
+      try { body = JSON.stringify(obj); } catch (e0) { return; }
+      if (body.length > MAX_LINE) {
+        // every record must stay <= 400 chars: keep the envelope, stub the data
+        try {
+          body = JSON.stringify({ ts: obj.ts, v: obj.v, ev: obj.ev, tr: 1, d: trunc(JSON.stringify(obj.d), 240) });
+        } catch (e1) {
+          body = body.substring(0, MAX_LINE);
+        }
+      }
+      body += '\n';
+      var buf = Memory.allocUtf8String(body);
       var fd = sysOpen(Memory.allocUtf8String(path), O_WRONLY | O_CREAT | O_APPEND, MODE_0644);
       if (fd < 0) return; // 'int' return type gives a plain JS number
-      sysWrite(fd, buf, line.length);
+      sysWrite(fd, buf, body.length);
       sysClose(fd);
     } catch (e) {
       // never propagate
@@ -89,7 +121,7 @@
   }
 
   function log(ev, d) {
-    appendLine({ ts: Date.now(), ev: ev, d: (d === undefined) ? null : d });
+    appendLine({ ts: Date.now(), v: PROBE_V, ev: ev, d: (d === undefined) ? null : d });
   }
 
   // ---------------------------------------------------------------------------
@@ -126,6 +158,19 @@
       if (typeof v.isNull === 'function' && v.isNull()) return null;
       if (v.class !== undefined) return v.class.toString();
       return null;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // address + class of a raw pointer argument / native value, or null for nil
+  function objInfo(p) {
+    try {
+      if (p === null || p === undefined) return null;
+      var po = (p instanceof NativePointer) ? p : new NativePointer(p);
+      if (po.isNull()) return null;
+      var o = new ObjC.Object(po);
+      return { addr: po.toString(), cls: o.class.toString() };
     } catch (e) {
       return null;
     }
@@ -224,7 +269,9 @@
   }
 
   // ---------------------------------------------------------------------------
-  // dumpState — snapshot of live objects and their state
+  // dumpState — snapshot of live objects and their state.
+  // v2: one bounded line per class ("state") plus per-instance detail lines
+  // ("state1") for the interesting classes, so every record stays under the cap.
   // ---------------------------------------------------------------------------
   var SNAPSHOT_CLASSES = [
     'BBSBPiPManager',
@@ -234,7 +281,19 @@
     'AVSampleBufferDisplayLayer',
     'BBPlayerDanmakuService',
     'BBPlayerDanmakuVoutView',
-    'BBPlayerChronosContainerView'
+    'BBPlayerChronosContainerView',
+    // v2 additions
+    'BFCPlayerControllerV2',
+    'BBPlayerPlayback',
+    'BBPiPController',
+    'BFCCRONRenderViewV2',
+    'IJKSDLSampleBufferView',
+    'BFCPlayerSampleBufferView',
+    'IJKSampleBufferWrapView',
+    'BFCChronosRendererWrapper',
+    'BBPlayerDMView',
+    'BFCPlayerDMView',
+    'DMRenderLayerView'
   ];
 
   function snapshotOnePiP(o) {
@@ -306,43 +365,34 @@
 
   function dumpState(tag) {
     try {
-      var snap = { tag: tag, classes: {} };
       for (var i = 0; i < SNAPSHOT_CLASSES.length; i++) {
         var name = SNAPSHOT_CLASSES[i];
         try {
           var cls = findClass(name);
           if (cls === null) {
-            snap.classes[name] = { registered: false };
+            log('state', { tag: tag, cls: name, registered: false });
             continue;
           }
           var instances = ObjC.chooseSync(cls);
-          var entry = { registered: true, count: instances.length, addrs: [] };
-          for (var j = 0; j < instances.length; j++) {
-            entry.addrs.push(instances[j].handle.toString());
+          var addrs = [];
+          for (var j = 0; j < instances.length && j < 6; j++) {
+            addrs.push(instances[j].handle.toString());
           }
-          // detailed per-instance state for the interesting classes
-          if (name === 'AVPictureInPictureController' && instances.length <= 8) {
-            entry.details = [];
+          log('state', { tag: tag, cls: name, registered: true, count: instances.length, addrs: addrs });
+          var detailFn = null;
+          if (name === 'AVPictureInPictureController' && instances.length <= 8) detailFn = snapshotOnePiP;
+          else if (name === 'AVSampleBufferDisplayLayer' && instances.length <= 16) detailFn = snapshotOneLayer;
+          else if (name === 'BBPlayerDanmakuService' && instances.length <= 8) detailFn = snapshotOneDanmakuService;
+          if (detailFn !== null) {
             for (var k = 0; k < instances.length; k++) {
-              try { entry.details.push(snapshotOnePiP(instances[k])); } catch (e1) { entry.details.push({ error: trunc(e1.message, 100) }); }
-            }
-          } else if (name === 'AVSampleBufferDisplayLayer' && instances.length <= 16) {
-            entry.details = [];
-            for (var m = 0; m < instances.length; m++) {
-              try { entry.details.push(snapshotOneLayer(instances[m])); } catch (e2) { entry.details.push({ error: trunc(e2.message, 100) }); }
-            }
-          } else if (name === 'BBPlayerDanmakuService' && instances.length <= 8) {
-            entry.details = [];
-            for (var q = 0; q < instances.length; q++) {
-              try { entry.details.push(snapshotOneDanmakuService(instances[q])); } catch (e3) { entry.details.push({ error: trunc(e3.message, 100) }); }
+              try { log('state1', { tag: tag, cls: name, d: detailFn(instances[k]) }); }
+              catch (e1) { log('state1', { tag: tag, cls: name, error: trunc(e1.message || ('' + e1), 100) }); }
             }
           }
-          snap.classes[name] = entry;
         } catch (e) {
-          snap.classes[name] = { error: trunc(e.message || ('' + e), 120) };
+          log('state', { tag: tag, cls: name, error: trunc(e.message || ('' + e), 120) });
         }
       }
-      log('state', snap);
     } catch (e) {
       log('state_error', { tag: tag, error: trunc(e.message || ('' + e), 200) });
     }
@@ -363,9 +413,20 @@
     if (classesEventSent) return;
     try {
       var names = Object.keys(ObjC.classes);
-      var hits = names.filter(function (n) {
-        return n.indexOf('PlayerContainer') !== -1 || n.indexOf('BBPictureInPicture') !== -1;
-      });
+      var pats = [
+        'PlayerContainer', 'BBPictureInPicture', 'PictureInPictureControllerContentSource',
+        'BFCCRON', 'IJKSDL', 'BFCPlayerSampleBuffer', 'IJKSampleBufferWrap',
+        'BBPiPController', 'BFCPlayerControllerV2', 'BFCChronosRendererWrapper',
+        'DMRenderLayerView', 'DMDanmakuRendererView', 'BBPlayerDMView',
+        'BFCPlayerDMView', 'BBWWebDMView', 'DMImageView', 'DMVideoLayoutView'
+      ];
+      var hits = [];
+      for (var i = 0; i < names.length && hits.length < 120; i++) {
+        var n = names[i];
+        for (var j = 0; j < pats.length; j++) {
+          if (n.indexOf(pats[j]) !== -1) { hits.push(n); break; }
+        }
+      }
       classesEventSent = true;
       log('classes', { total: names.length, matched: hits });
     } catch (e) {
@@ -582,6 +643,340 @@
     }
   }
 
+  // ===========================================================================
+  // v2 forensics — SBDL vs Metal display path, PiP instance identity, danmaku
+  // host views. All read-only: counters + bounded samples, never mutating.
+  // ===========================================================================
+  var missingReported = {};
+  function reportMissing(name, why) {
+    if (missingReported[name]) return;
+    missingReported[name] = true;
+    log('missing', { cls: name, why: trunc(why || 'class never appeared', 120) });
+  }
+
+  function argTypeOf(m, idx) {
+    try {
+      var at = m.argumentTypes;
+      return (at && at.length > idx) ? at[idx] : '?';
+    } catch (e) {
+      return '?';
+    }
+  }
+
+  function btSymbols(ctx, nFrames) {
+    try {
+      var addrs = Thread.backtrace(ctx, Backtracer.FUZZY).slice(0, nFrames || 6);
+      var out = [];
+      for (var i = 0; i < addrs.length; i++) {
+        var sym = null;
+        try { sym = DebugSymbol.fromAddress(addrs[i]); } catch (e0) {}
+        if (sym !== null && sym !== undefined) {
+          var mod = null;
+          try { mod = sym.module ? sym.module.name : null; } catch (e1) {}
+          out.push((mod ? mod + '!' : '') + (sym.name || ('' + addrs[i])));
+        } else {
+          out.push('' + addrs[i]);
+        }
+      }
+      return out;
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // counters for high-frequency methods; a per-30s ticker emits "cnt" summaries.
+  var counters = {};
+  function countHook(className, cls, selName, opts) {
+    var key = className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      var limit = (opts && opts.sampleFirst !== undefined) ? opts.sampleFirst : 2;
+      var byAddr = !!(opts && opts.byAddr);
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) {
+          try {
+            st.n++;
+            if (byAddr) {
+              if (!st.addrs) st.addrs = {};
+              var a = args[0].toString();
+              st.addrs[a] = (st.addrs[a] || 0) + 1;
+            }
+            if (st.n > limit) return;
+            var d = { key: key, n: st.n, self: objInfo(args[0]) };
+            if (opts && opts.argObjs) {
+              for (var i = 0; i < opts.argObjs.length; i++) {
+                var idx = opts.argObjs[i];
+                var t = argTypeOf(m, idx);
+                d['a' + idx] = (t === '@') ? objInfo(args[idx]) : ('t=' + t + ' ' + args[idx]);
+              }
+            }
+            if (opts && opts.selfLayer) {
+              try {
+                var l = new ObjC.Object(args[0]).layer();
+                if (l !== null && l !== undefined) d.layer = { addr: l.handle.toString(), cls: l.class.toString() };
+              } catch (e1) { d.layer = 'err'; }
+            }
+            if (opts && opts.superlayer) {
+              try {
+                var sl = new ObjC.Object(args[0]).superlayer();
+                if (sl !== null && sl !== undefined) d.superlayer = objInfo(sl.handle);
+              } catch (e3) { d.superlayer = 'err'; }
+            }
+            if (opts && opts.backtrace) d.bt = btSymbols(this.context, 6);
+            log('cnt1', d);
+          } catch (e) {}
+        },
+        onLeave: function (retval) {
+          if (!(opts && opts.retInfo)) return;
+          try {
+            if (st.n <= limit) log('cnt1', { key: key, ret: objInfo(retval) });
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'count' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // instantiation watcher for a designated initializer: logs at most 3 records,
+  // filtered to the target class by constructed-object class name (the IMP may
+  // be an inherited one), records backing layer + ivar _displayLayer class.
+  var instCounters = {};
+  function instHook(className, cls, selName) {
+    var key = className + ' ' + selName;
+    if (instCounters[key]) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      var st = instCounters[key] = { n: 0 };
+      Interceptor.attach(m.implementation, {
+        onLeave: function (retval) {
+          try {
+            if (retval === null || retval === undefined || retval.isNull()) return;
+            var o = new ObjC.Object(retval);
+            var cn = o.class.toString();
+            if (cn.indexOf(className) === -1) return;
+            st.n++;
+            if (st.n > 3) return;
+            var d = { key: key, n: st.n, self: retval.toString(), cls: cn };
+            try {
+              var l = o.layer();
+              if (l !== null && l !== undefined) d.layer = { addr: l.handle.toString(), cls: l.class.toString() };
+            } catch (e1) {}
+            try {
+              var iv = null;
+              try { iv = o.$ivars._displayLayer; } catch (e2) { iv = null; }
+              if (iv === null || iv === undefined) {
+                try { iv = o.valueForKey_('_displayLayer'); } catch (e3) { iv = null; }
+              }
+              if (iv !== null && iv !== undefined) {
+                d.displayLayerCls = (iv.class !== undefined) ? iv.class.toString() : classNameOf(iv);
+              }
+            } catch (e4) {}
+            log('inst', d);
+          } catch (e) {}
+        }
+      });
+      log('instrumented', { cls: className, sel: selName, mode: 'inst' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // +layerClass of a class (best-effort; instance layer class is captured by
+  // the count hooks too, which is the authoritative answer).
+  function probeLayerClass(className, cls) {
+    var key = 'layerclass ' + className;
+    if (counters[key]) return true;
+    counters[key] = { n: 0, attached: true };
+    try {
+      var lc = cls.layerClass();
+      var name = null;
+      if (lc !== null && lc !== undefined) {
+        try { name = lc.toString(); } catch (e0) {}
+        if (name === null) { try { name = classNameOf(lc); } catch (e1) {} }
+      }
+      log('layerclass', { cls: className, layerClass: name });
+      return true;
+    } catch (e) {
+      log('layerclass', { cls: className, error: trunc(e.message || ('' + e), 100) });
+      return true;
+    }
+  }
+
+  // watchlist: UIView subclasses of interest get exactly one record per live
+  // instance at -didMoveToWindow time, with backing layer class and the class
+  // names of its direct sublayers. Single hook on UIView -didMoveToWindow,
+  // filtered by class name, so unrelated views cost one string compare.
+  var WATCH_VIEWS = [
+    'BBPlayerDMView', 'BFCPlayerDMView', 'BBWWebDMView', 'DMRenderLayerView',
+    'DMImageView', 'DMVideoLayoutView', 'DMDanmakuRendererViewV2',
+    'BFCPlayerSampleBufferView', 'IJKSampleBufferWrapView'
+  ];
+  var viewWatchDone = false;
+  var viewSeen = {}; // view addr -> true (one record per instance)
+  function installViewWatch() {
+    if (viewWatchDone) return true;
+    var uv = findClass('UIView');
+    if (uv === null) return false;
+    var m = uv['- didMoveToWindow'];
+    if (!m || !m.implementation) return false;
+    Interceptor.attach(m.implementation, {
+      onEnter: function (args) {
+        try {
+          var selfObj = new ObjC.Object(args[0]);
+          var cn = selfObj.class.toString();
+          var hit = null;
+          for (var i = 0; i < WATCH_VIEWS.length; i++) {
+            if (cn === WATCH_VIEWS[i] || cn.indexOf(WATCH_VIEWS[i]) !== -1) { hit = WATCH_VIEWS[i]; break; }
+          }
+          if (hit === null) return;
+          var addr = args[0].toString();
+          if (viewSeen[addr]) return;
+          viewSeen[addr] = true;
+          var d = { host: hit, cls: cn, view: addr };
+          try {
+            var l = selfObj.layer();
+            if (l !== null && l !== undefined) {
+              d.layer = { addr: l.handle.toString(), cls: l.class.toString() };
+              try {
+                var sls = l.sublayers();
+                if (sls !== null && sls !== undefined) {
+                  var total = sls.count();
+                  var names = [];
+                  var lim = Math.min(total, 8);
+                  for (var j = 0; j < lim; j++) {
+                    try { names.push(sls.objectAtIndex(j).class.toString()); } catch (e0) { names.push('?'); }
+                  }
+                  d.sublayers = names;
+                  d.subTotal = total;
+                }
+              } catch (e1) {}
+            }
+          } catch (e2) {}
+          log('view', d);
+        } catch (e) {}
+      }
+    });
+    viewWatchDone = true;
+    log('instrumented', { cls: 'UIView', sel: '- didMoveToWindow', mode: 'watch_filter' });
+    return true;
+  }
+
+  // per-30s counter summaries: one short line per non-zero counter, never
+  // per-call lines for the hot paths.
+  function startCountSummary() {
+    setInterval(function () {
+      try {
+        var keys = Object.keys(counters);
+        for (var i = 0; i < keys.length; i++) {
+          var st = counters[keys[i]];
+          if (!st || !st.n) continue;
+          var d = { k: keys[i], n: st.n };
+          if (st.addrs) {
+            var ak = Object.keys(st.addrs);
+            var top = {};
+            for (var j = 0; j < ak.length && j < 4; j++) top[ak[j]] = st.addrs[ak[j]];
+            d.addrCount = ak.length;
+            d.addrs = top;
+          }
+          log('cnt', d);
+        }
+      } catch (e) {}
+    }, 30000);
+  }
+
+  var FX_METHODS = [
+    // A. display path: SBDL vs Metal
+    { cls: 'IJKSDLSampleBufferView', sel: '- display_pixels:', mode: 'count', opts: { argObjs: [2], selfLayer: true, sampleFirst: 3 } },
+    { cls: 'IJKSDLSampleBufferView', sel: '- display_pixels_vtb:', mode: 'count', opts: { argObjs: [2], sampleFirst: 2 } },
+    { cls: 'IJKSDLSampleBufferView', sel: '- display_pixels_ffmpeg:', mode: 'count', opts: { argObjs: [2], sampleFirst: 2 } },
+    { cls: 'IJKSDLSampleBufferView', sel: '- enqueueSmapleBuffer:', mode: 'count', opts: { argObjs: [2], selfLayer: true, sampleFirst: 3 } },
+    { cls: 'IJKSDLSampleBufferView', sel: '+ layerClass', mode: 'layerclass' },
+    { cls: 'BFCCRONRenderViewV2', sel: '- initWithFrame:', mode: 'inst' },
+    { cls: 'BFCPlayerSampleBufferView', sel: '- getCurrentRenderer', mode: 'count', opts: { retInfo: true, sampleFirst: 3 } },
+    { cls: 'BFCPlayerSampleBufferView', sel: '- switchRenderer:', mode: 'call' },
+    { cls: 'IJKSampleBufferWrapView', sel: '- getCurrentRenderer', mode: 'count', opts: { retInfo: true, sampleFirst: 3 } },
+    { cls: 'IJKSampleBufferWrapView', sel: '- switchRenderer:', mode: 'call' },
+    // B. PiP instance identity
+    { cls: 'AVSampleBufferDisplayLayer', sel: '- enqueueSampleBuffer:', mode: 'count', opts: { argObjs: [2], superlayer: true, backtrace: true, byAddr: true, sampleFirst: 3 } },
+    { cls: 'BFCPlayerControllerV2', sel: '- sampleBufferDisplayLayer', mode: 'count', opts: { retInfo: true, sampleFirst: 5 } },
+    { cls: 'BBPlayerPlayback', sel: '- generateContentSourceWithCompletionHandler:', mode: 'call' },
+    { cls: 'BFCPlayerControllerV2', sel: '- generateContentSourceWithCompletionHandler:', mode: 'call' },
+    { cls: 'AVPictureInPictureControllerContentSource', sel: '- initWithSampleBufferDisplayLayer:playbackDelegate:', mode: 'call' },
+    { cls: 'BBPiPController', sel: '- setContentSource:', mode: 'call' },
+    // C. danmaku engine carrier (instantiation seen via state snapshots / view watch)
+    { cls: 'BFCChronosRendererWrapper', sel: '- copyPixelBuffer', mode: 'count', opts: { sampleFirst: 1 } }
+  ];
+
+  var fxLastPending = null;
+  var fxTicks = 0;
+  var fxTimer = null;
+  function tryForensicsOnce() {
+    var pending = [];
+    for (var i = 0; i < FX_METHODS.length; i++) {
+      var e = FX_METHODS[i];
+      var key = e.cls + ' ' + e.sel;
+      if (counters[key] && counters[key].attached) continue;
+      if (instCounters[key]) continue;
+      if (instrumented[key]) continue;
+      if (key === 'IJKSDLSampleBufferView + layerClass' && counters['layerclass IJKSDLSampleBufferView']) continue;
+      var cls = findClass(e.cls);
+      if (cls === null) { pending.push(key); continue; }
+      var ok = false;
+      try {
+        if (e.mode === 'count') ok = countHook(e.cls, cls, e.sel, e.opts);
+        else if (e.mode === 'call') ok = instrumentMethod(e.cls, cls, e.sel, e.opts);
+        else if (e.mode === 'inst') ok = instHook(e.cls, cls, e.sel);
+        else if (e.mode === 'layerclass') ok = probeLayerClass(e.cls, cls);
+      } catch (err) { ok = false; }
+      if (!ok) pending.push(key);
+    }
+    if (!viewWatchDone) installViewWatch();
+    return pending;
+  }
+
+  function startForensics() {
+    var pending = tryForensicsOnce(); // immediate first pass
+    fxLastPending = pending.join(';');
+    if (pending.length === 0) { log('fx_ready', { at: 0 }); return; }
+    if (fxTicks === 0) log('fx_pending', { list: trunc(fxLastPending, 320) });
+    fxTimer = setInterval(function () {
+      try {
+        fxTicks++;
+        var p = tryForensicsOnce();
+        var joined = p.join(';');
+        if (joined !== fxLastPending) {
+          if (p.length === 0) {
+            log('fx_ready', { at: fxTicks });
+          } else if (fxTicks <= 10) {
+            log('fx_pending', { list: trunc(joined, 320) });
+          }
+          fxLastPending = joined;
+        }
+        if (p.length === 0 || fxTicks >= 240) {
+          if (fxTimer !== null) { clearInterval(fxTimer); fxTimer = null; }
+          if (p.length > 0) {
+            for (var j = 0; j < p.length; j++) {
+              reportMissing(p[j].split(' ')[0], 'target never appeared: ' + p[j]);
+            }
+            log('fx_missing_final', { list: trunc(p.join(';'), 320) });
+          }
+        }
+      } catch (e) {}
+    }, 5000);
+  }
+
   // retry loop: classes register lazily when the player is created
   var MAX_ATTEMPTS = 10;
 
@@ -624,6 +1019,18 @@
     tryInstrument(0);
   } catch (e) {
     log('setup_error', { step: 'instrument', error: trunc(e.message || ('' + e), 150) });
+  }
+
+  try {
+    startForensics();
+  } catch (e) {
+    log('setup_error', { step: 'forensics', error: trunc(e.message || ('' + e), 150) });
+  }
+
+  try {
+    startCountSummary();
+  } catch (e) {
+    log('setup_error', { step: 'count_summary', error: trunc(e.message || ('' + e), 150) });
   }
 
   try {
