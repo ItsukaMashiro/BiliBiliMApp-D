@@ -164,9 +164,11 @@ jobs:
           test -n "$APP_EXECUTABLE"
           test -s "$APP_PATH/$APP_EXECUTABLE"
 
+          # 17.x publishes the iOS gadget only as ios-universal (fat: contains
+          # the arm64 device slice); there is no ios-arm64 asset.
           curl --fail --location --retry 3 \
             --output "$RUNNER_TEMP/frida-gadget.dylib.xz" \
-            "https://github.com/frida/frida/releases/download/17.24.3/frida-gadget-17.24.3-ios-arm64.dylib.xz"
+            "https://github.com/frida/frida/releases/download/17.24.3/frida-gadget-17.24.3-ios-universal.dylib.xz"
           xz -d "$RUNNER_TEMP/frida-gadget.dylib.xz"
           install -m 0755 "$RUNNER_TEMP/frida-gadget.dylib" "$APP_PATH/FridaGadget.dylib"
           lipo -archs "$APP_PATH/FridaGadget.dylib" | grep -qw arm64
