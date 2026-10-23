@@ -1502,8 +1502,10 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
         // attach a plain container CALayer and move the danmaku view's
         // backing layer into it.
         CALayer *containerLayer = [CALayer layer];
+        // No autoresizing: the official SBDL's bounds stay fixed in app
+        // coordinates while PiP runs (the PiP window scales the whole layer
+        // tree outside this subtree), so a one-shot frame copy is correct.
         containerLayer.frame = officialLayer.bounds;
-        containerLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
         containerLayer.masksToBounds = NO;
         self.overlayContainerLayer = containerLayer;
         self.danmakuOriginalSuperlayer = danmakuLayer.superlayer;
