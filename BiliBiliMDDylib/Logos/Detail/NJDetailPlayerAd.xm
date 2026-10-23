@@ -146,7 +146,7 @@
  打开方式：把这里的 0 改成 1，或编译期 -DNJ_PIP_GPU_COMPOSITE_ENABLED=1。
  */
 #ifndef NJ_PIP_GPU_COMPOSITE_ENABLED
-#define NJ_PIP_GPU_COMPOSITE_ENABLED 0
+#define NJ_PIP_GPU_COMPOSITE_ENABLED 1 // TEMP: agent/pip-danmaku-gpu-test — compile-verification only, DO NOT merge to agent/pip-danmaku
 #endif
 
 // MARK: - Picture in Picture danmaku
