@@ -86,6 +86,15 @@ jobs:
           test -d BiliBiliMD/bili-universal.app
           test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
+      - name: Generate build stamp header
+        run: |
+          # NJDetailPlayerAd.xm reads NJ_PI_P_BUILD_SHA via __has_include("NJBuildStamp.h")
+          # with a "local" fallback; the quoted include resolves next to the .xm, so
+          # generate the header there (CI-only, never committed).
+          printf '#define NJ_PI_P_BUILD_SHA "%s"\n' "${GITHUB_SHA:0:7}" \
+            > BiliBiliMDDylib/Logos/Detail/NJBuildStamp.h
+          cat BiliBiliMDDylib/Logos/Detail/NJBuildStamp.h
+
       - name: Build injected app
         run: |
           xcodebuild \
