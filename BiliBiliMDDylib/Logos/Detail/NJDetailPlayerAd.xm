@@ -149,6 +149,20 @@
 #define NJ_PIP_GPU_COMPOSITE_ENABLED 0
 #endif
 
+/*
+ 诊断日志的局域网上传（取日志不必插 USB）：把已经写进 NDJSON 文件的那批新增行
+ 同时 POST 给接收端（仓库 Tools/log-server.py：POST /njlog?name=<名字>）。
+ 纯旁路能力：不 hook、不在播放线程等待网络，任何失败只写有限几行诊断。
+ 与上面的 GPU 合成宏互不相干，各自独立开关。
+ 换地址：把下面改成你的地址，或编译期 -DNJ_PIP_LAN_LOG_URL='"http://192.168.1.9:8099/njlog"'
+ */
+#ifndef NJ_PIP_LAN_LOG_URL
+#define NJ_PIP_LAN_LOG_URL "http://10.0.0.241:8099/njlog"
+#endif
+#ifndef NJ_PIP_LAN_LOG_UPLOAD_ENABLED
+#define NJ_PIP_LAN_LOG_UPLOAD_ENABLED 1
+#endif
+
 // MARK: - Picture in Picture danmaku
 
 static const void *NJPiPDanmakuStateKey = &NJPiPDanmakuStateKey;
@@ -191,6 +205,12 @@ static NSMutableData *NJPiPDiagBuffer(void) {
 }
 
 static void NJPiPDiagFlushLocked(void);
+#if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
+// 定义在下面（要用 NJPiPDiag 写失败诊断）。两处调用都是 fire-and-forget，
+// 调用方不等待网络，也不看返回值。
+static void NJPiPLanUploadBuffer(NSData *payload);
+static void NJPiPLanUploadProbeFile(void);
+#endif
 
 static void NJPiPDiagAppendLineLocked(NSString *message) {
     NSMutableData *buffer = NJPiPDiagBuffer();
@@ -242,6 +262,13 @@ static void NJPiPDiagFlushLocked(void) {
         [copyHandle writeData:buffer];
         [copyHandle closeFile];
     }
+#if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
+    // 与文件写入共用同一批数据 = 只上传新增行（接收端对请求体有 8 MB 上限，
+    // 这里一批最多 16 KB，永远够）。只在两个文件都写完之后才发，语义就是
+    // 「已落盘的这些行」；网络失败不影响文件，也不回滚游标。
+    NJPiPLanUploadBuffer(buffer);
+    NJPiPLanUploadProbeFile();
+#endif
     [buffer setLength:0];
 }
 
@@ -274,6 +301,161 @@ static void NJPiPDiag(const char *format, ...) {
         NJPiPDiagAppendLineLocked(escaped);
     });
 }
+
+// MARK: - LAN log upload (observe only)
+
+#if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
+
+/*
+ 尽力而为的日志旁路：把刚落盘的 NDJSON 行 POST 到局域网接收端，取日志不需要插 USB。
+ 这里没有 hook、没有渲染路径、也不等网络：NSURLSession 的 completion 在自己的队列上，
+ 调用点只负责把请求丢出去。失败每种原因最多两行诊断（含 HTTP 状态或 NSError 域/码），
+ 成功不打印。计数器（att/ok/sentB）只在诊断里出现，跨队列读写给的是纯统计，允许撕裂。
+ */
+static NSUInteger NJPiPLanUploadAttemptCount;
+static NSUInteger NJPiPLanUploadOkCount;
+static NSUInteger NJPiPLanUploadSentBytes;
+static const char *const NJPiPLanUploadReasonNames[] = { "url", "http", "net" };
+static const NSUInteger NJPiPLanUploadReasonCount =
+    sizeof(NJPiPLanUploadReasonNames) / sizeof(NJPiPLanUploadReasonNames[0]);
+static NSUInteger NJPiPLanUploadReasonHits[4];
+
+static void NJPiPLanUploadNoteFailure(NSUInteger reason, NSString *detail) {
+    if (reason >= NJPiPLanUploadReasonCount) {
+        return;
+    }
+    NJPiPLanUploadReasonHits[reason] += 1;
+    if (NJPiPLanUploadReasonHits[reason] > 2) {
+        return;
+    }
+    NJPiPDiag("netup fail reason=%s n=%lu att=%lu ok=%lu sentB=%lu %s",
+              NJPiPLanUploadReasonNames[reason],
+              (unsigned long)NJPiPLanUploadReasonHits[reason],
+              (unsigned long)NJPiPLanUploadAttemptCount,
+              (unsigned long)NJPiPLanUploadOkCount,
+              (unsigned long)NJPiPLanUploadSentBytes,
+              detail.UTF8String);
+}
+
+static NSURLSession *NJPiPLanUploadSession(void) {
+    static NSURLSession *session;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        // ephemeral：不存 cookie/缓存，也不与 App 自己的 URLSession 抢东西。
+        NSURLSessionConfiguration *configuration = [NSURLSessionConfiguration ephemeralSessionConfiguration];
+        configuration.timeoutIntervalForRequest = 5.0;
+        configuration.timeoutIntervalForResource = 10.0;
+        configuration.requestCachePolicy = NSURLRequestReloadIgnoringLocalCacheData;
+        session = [NSURLSession sessionWithConfiguration:configuration];
+        // 只此一行，用来在设备上确认这次包里烧进去的地址。
+        NJPiPDiag("netup init url=%s timeout=5s", NJ_PIP_LAN_LOG_URL);
+    });
+    return session;
+}
+
+static void NJPiPLanUploadData(NSData *payload, NSString *name) {
+    if (payload.length == 0) {
+        return;
+    }
+    NSURL *url = [NSURL URLWithString:[NSString stringWithFormat:@"%s?name=%@", NJ_PIP_LAN_LOG_URL, name]];
+    if (!url) {
+        NJPiPLanUploadNoteFailure(0, [NSString stringWithFormat:@"name=%@ url=%s", name, NJ_PIP_LAN_LOG_URL]);
+        return;
+    }
+    NJPiPLanUploadAttemptCount += 1;
+    NSMutableURLRequest *request = [NSMutableURLRequest requestWithURL:url
+                                                          cachePolicy:NSURLRequestReloadIgnoringLocalCacheData
+                                                      timeoutInterval:5.0];
+    request.HTTPMethod = @"POST";
+    request.HTTPBody = payload;
+    [request setValue:@"application/x-ndjson" forHTTPHeaderField:@"Content-Type"];
+    NSURLSessionDataTask *task = [NJPiPLanUploadSession()
+        dataTaskWithRequest:request
+          completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+              if (error) {
+                  NJPiPLanUploadNoteFailure(2, [NSString stringWithFormat:@"errdom=%@ errcode=%ld",
+                                                error.domain ?: @"-", (long)error.code]);
+                  return;
+              }
+              if (![response isKindOfClass:NSHTTPURLResponse.class]) {
+                  NJPiPLanUploadNoteFailure(1, @"status=non-http-response");
+                  return;
+              }
+              NSInteger status = ((NSHTTPURLResponse *)response).statusCode;
+              if (status < 200 || status >= 300) {
+                  NSString *body = data.length
+                      ? ([[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"-")
+                      : @"-";
+                  if (body.length > 160) {
+                      body = [body substringToIndex:160];
+                  }
+                  NJPiPLanUploadNoteFailure(1, [NSString stringWithFormat:@"status=%ld body=%@",
+                                                (long)status, body]);
+                  return;
+              }
+              // 成功不打印；只累加计数，失败诊断里能看到上传是否在工作。
+              NJPiPLanUploadOkCount += 1;
+              NJPiPLanUploadSentBytes += (NSUInteger)payload.length;
+          }];
+    [task resume];
+}
+
+static void NJPiPLanUploadBuffer(NSData *payload) {
+    // 调用点紧接着会清空这个 NSMutableData，所以先固定一份不可变快照再发。
+    NJPiPLanUploadData([payload copy], @"NJPiPDiagnostics");
+}
+
+/*
+ 探针文件（Tools/frida/NJPipProbe.js 写的 <NSHomeDirectory()>/Library/NJPiPProbe.ndjson）
+ 只有插了 frida 的包才存在，读不到就静默跳过。同样只传新增行：自己的游标 + 只截到
+ 最后一个换行符，剩下的下次再传。约每 10 次 flush（≈10s）看一次，别每次 flush 都读盘。
+ */
+static unsigned long long NJPiPLanProbeCursor;
+static NSUInteger NJPiPLanProbeTick;
+
+static void NJPiPLanUploadProbeFile(void) {
+    NJPiPLanProbeTick += 1;
+    if (NJPiPLanProbeTick % 10 != 1) {
+        return;
+    }
+    NSString *path = [NSHomeDirectory() stringByAppendingPathComponent:@"Library/NJPiPProbe.ndjson"];
+    NSDictionary<NSString *, id> *attributes = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:nil];
+    unsigned long long size = [attributes[NSFileSize] unsignedLongLongValue];
+    if (NJPiPLanProbeCursor > size) {
+        NJPiPLanProbeCursor = 0;  // 文件被删掉重建
+    }
+    if (size <= NJPiPLanProbeCursor) {
+        return;
+    }
+    NSFileHandle *handle = [NSFileHandle fileHandleForReadingAtPath:path];
+    if (!handle) {
+        return;
+    }
+    [handle seekToFileOffset:NJPiPLanProbeCursor];
+    NSData *chunk = [handle readDataToEndOfFile];
+    [handle closeFile];
+    if (chunk.length == 0) {
+        return;
+    }
+    if (chunk.length > 4 * 1024 * 1024) {
+        chunk = [chunk subdataWithRange:NSMakeRange(0, 4 * 1024 * 1024)];  // 接收端 8 MB 上限，留一倍余量
+    }
+    const unsigned char *bytes = (const unsigned char *)chunk.bytes;
+    NSUInteger consumed = 0;
+    for (NSInteger index = (NSInteger)chunk.length - 1; index >= 0; index--) {
+        if (bytes[index] == '\n') {
+            consumed = (NSUInteger)(index + 1);
+            break;
+        }
+    }
+    if (consumed == 0) {
+        return;  // 半行，等下次
+    }
+    NJPiPLanProbeCursor += consumed;
+    NJPiPLanUploadData([chunk subdataWithRange:NSMakeRange(0, consumed)], @"NJPiPProbe");
+}
+
+#endif // NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 
 static NSHashTable<UIView *> *NJPiPDanmakuViews(void) {
     static NSHashTable<UIView *> *views;
