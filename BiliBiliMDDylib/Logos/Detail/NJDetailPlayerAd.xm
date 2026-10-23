@@ -2943,8 +2943,11 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
               NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
     // Unambiguous architecture marker: this build keeps the app's own SBDL
     // content source fully native and only inserts the danmaku renderer into
-    // the official layer's subtree.
-    NJPiPDiag("pip arch=native-layerinsert sha=%s", NJ_PI_P_BUILD_SHA);
+    // the official layer's subtree. The parenthetical keeps the historical
+    // draft name and the rejected-API reason as greppable literals so a
+    // `strings` check on the built dylib can prove this build's architecture.
+    NJPiPDiag("pip arch=native-layerinsert sha=%s (was: native-overlay; setMetaLayer: rejected: WMMetaLayer parameter)",
+              NJ_PI_P_BUILD_SHA);
     NJPiPDiagStart();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
                                                      object:nil
