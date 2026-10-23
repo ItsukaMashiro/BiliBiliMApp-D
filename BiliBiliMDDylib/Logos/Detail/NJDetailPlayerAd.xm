@@ -212,6 +212,25 @@ static void NJPiPDiagFlushLocked(void) {
     [handle seekToEndOfFile];
     [handle writeData:buffer];
     [handle closeFile];
+    // Second copy under an explicitly-recognisable name in the same Documents
+    // directory: LiveContainer file sharing can expose Documents through
+    // `pymobiledevice3 apps afc <bundleid> --documents`, and this file gives
+    // that channel a stable name. Best-effort only; failures are ignored.
+    NSString *copyPath = [path stringByReplacingOccurrencesOfString:@".ndjson"
+                                                       withString:@".copy.ndjson"];
+    NSDictionary<NSString *, id> *copyAttributes = [fileManager attributesOfItemAtPath:copyPath error:nil];
+    if ([copyAttributes[NSFileSize] unsignedLongLongValue] > 512 * 1024) {
+        [fileManager removeItemAtPath:copyPath error:nil];
+    }
+    if (![fileManager fileExistsAtPath:copyPath]) {
+        [fileManager createFileAtPath:copyPath contents:nil attributes:nil];
+    }
+    NSFileHandle *copyHandle = [NSFileHandle fileHandleForWritingAtPath:copyPath];
+    if (copyHandle) {
+        [copyHandle seekToEndOfFile];
+        [copyHandle writeData:buffer];
+        [copyHandle closeFile];
+    }
     [buffer setLength:0];
 }
 
@@ -230,6 +249,12 @@ static void NJPiPDiag(const char *format, ...) {
     vsnprintf(message, sizeof(message), format, args);
     va_end(args);
     NSString *text = [NSString stringWithUTF8String:message];
+    // Every diagnostic line is also mirrored to os_log: the container files
+    // of a nested app inside LiveContainer are not always reachable from the
+    // PC side, but os_log can be captured live. Keep the existing prefix.
+    os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT,
+                     "[NJPiPDanmaku] %{public}s",
+                     text.UTF8String);
     dispatch_async(NJPiPDiagQueue(), ^{
         NSString *escaped = [text stringByReplacingOccurrencesOfString:@"\\" withString:@"\\\\"];
         escaped = [escaped stringByReplacingOccurrencesOfString:@"\"" withString:@"\\\""];
@@ -1283,52 +1308,459 @@ static void NJPiPSwizzlePlaybackDelegateIfNeeded(id playbackDelegate) {
     }
 }
 
+// MARK: - Native-layer-insert danmaku overlay
+//
+// The previous architecture replaced the app's PiP content source with a
+// video-call controller hosting a second AVSampleBufferDisplayLayer, and the
+// live device showed a grey, stalled PiP window with no danmaku: replacing
+// the content source is itself the largest variable on the video path. This
+// architecture keeps the app's own SBDL content source completely native (the
+// video cannot grey out because we never touch it). The only thing it does is
+// insert the danmaku renderer into the official SBDL's layer tree while PiP
+// is running, and restore it exactly when PiP stops.
+//
+// A static re-check of the 8.89 binary showed -[BBPlayerDanmakuVoutView
+// setMetaLayer:] takes a WMMetaLayer (the WM/Metal core's own texture overlay
+// object, same type as the recorder's mDanmakuLayer/mLayer ivars), not an
+// AVSampleBufferDisplayLayer, so that official API cannot be fed here; the
+// layer-subtree insertion below is the only overlay path.
+
+static const void *NJPiPOverlayStateKey = &NJPiPOverlayStateKey;
+
+@class NJPiPOverlayDelegateProxy;
+
+@interface NJPiPOverlayState : NSObject
+@property (nonatomic, weak) AVPictureInPictureController *controller;
+@property (nonatomic, weak, nullable) AVSampleBufferDisplayLayer *officialLayer;
+@property (nonatomic, strong) NJPiPOverlayDelegateProxy *delegateProxy;
+@property (nonatomic, strong, nullable) UIView *danmakuView;
+@property (atomic, assign, getter=isAttached) BOOL attached;
+// view-carried insertion (preferred when the official layer has a backing view)
+@property (nonatomic, weak, nullable) UIView *danmakuOriginalSuperview;
+@property (nonatomic, assign) NSUInteger danmakuOriginalIndex;
+@property (nonatomic, assign) CGRect danmakuOriginalFrame;
+@property (nonatomic, assign) BOOL danmakuTranslatesAutoresizing;
+@property (nonatomic, copy) NSArray<NSLayoutConstraint *> *danmakuConstraints;
+// raw layer insertion (fallback when the official layer has no backing view)
+@property (nonatomic, strong, nullable) CALayer *overlayContainerLayer;
+@property (nonatomic, weak, nullable) CALayer *danmakuOriginalSuperlayer;
+@property (nonatomic, assign) NSUInteger danmakuOriginalLayerIndex;
+@property (nonatomic, assign) CGRect danmakuOriginalLayerFrame;
+- (void)attachDanmakuToOfficialLayer;
+- (void)restoreDanmaku;
+- (void)invalidate;
+@end
+
+@interface NJPiPOverlayDelegateProxy : NSObject <AVPictureInPictureControllerDelegate>
+@property (nonatomic, weak) id<AVPictureInPictureControllerDelegate> downstream;
+@property (nonatomic, weak) NJPiPOverlayState *state;
+@end
+
+static NSHashTable<NJPiPOverlayState *> *NJPiPOverlayStates(void) {
+    static NSHashTable<NJPiPOverlayState *> *states;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        states = [NSHashTable weakObjectsHashTable];
+    });
+    return states;
+}
+
+static NSString *NJPiPSublayerClassList(CALayer *layer) {
+    NSArray<CALayer *> *sublayers = layer.sublayers;
+    NSMutableString *list = [NSMutableString string];
+    NSUInteger limit = MIN(sublayers.count, (NSUInteger)6);
+    for (NSUInteger index = 0; index < limit; index++) {
+        if (index > 0) {
+            [list appendString:@","];
+        }
+        [list appendFormat:@"%s@%lu",
+         NSStringFromClass([sublayers[index] class]).UTF8String,
+         (unsigned long)index];
+    }
+    if (sublayers.count > limit) {
+        [list appendFormat:@"|+%lu", (unsigned long)(sublayers.count - limit)];
+    }
+    return list;
+}
+
+// Maps a layer's bounds rect up the layer tree into an ancestor layer's
+// coordinate space. Rotation/skew is ignored, which holds for the player's
+// display-layer stack.
+static CGRect NJLayerFrameRelativeToAncestor(CALayer *layer, CALayer *ancestor) {
+    if (!layer || !ancestor) {
+        return CGRectNull;
+    }
+    CGRect frame = layer.bounds;
+    CALayer *current = layer;
+    while (current && current != ancestor) {
+        CGPoint origin = CGPointApplyAffineTransform(frame.origin, current.affineTransform);
+        frame = CGRectMake(origin.x, origin.y, frame.size.width, frame.size.height);
+        current = current.superlayer;
+    }
+    return current == ancestor ? frame : CGRectNull;
+}
+
+static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
+                                     CALayer *officialLayer,
+                                     const char *stage) {
+    CALayer *danmakuLayer = danmakuView.layer;
+    UIView *officialView = NJSourceViewForLayer(officialLayer);
+    Class metalLayerClass = NSClassFromString(@"CAMetalLayer");
+    NJPiPDiag("ov %s off=%s offBounds=(%.1f,%.1f %.1fx%.1f) offSubN=%lu offView=%s offViewWin=%p dm=%s dmWin=%p dmViewFrame=(%.1f,%.1f %.1fx%.1f) dmLayer=%s dmMetal=%d dmLayerBounds=(%.0f,%.0f %.0fx%.0f) dmSubN=%lu dmSub=[%s] dmContentsNil=%d dmLayerSuper=%s",
+              stage,
+              NJPiPClassName(officialLayer),
+              officialLayer.bounds.origin.x,
+              officialLayer.bounds.origin.y,
+              officialLayer.bounds.size.width,
+              officialLayer.bounds.size.height,
+              (unsigned long)(officialLayer ? officialLayer.sublayers.count : 0),
+              NJPiPClassName(officialView),
+              officialView.window,
+              NJPiPClassName(danmakuView),
+              danmakuView.window,
+              danmakuView.frame.origin.x,
+              danmakuView.frame.origin.y,
+              danmakuView.frame.size.width,
+              danmakuView.frame.size.height,
+              NJPiPClassName(danmakuLayer),
+              (int)(metalLayerClass && danmakuLayer && [danmakuLayer isKindOfClass:metalLayerClass]),
+              danmakuLayer.bounds.size.width,
+              danmakuLayer.bounds.size.height,
+              (unsigned long)(danmakuLayer ? danmakuLayer.sublayers.count : 0),
+              danmakuLayer ? NJPiPSublayerClassList(danmakuLayer).UTF8String : "-",
+              (int)(danmakuLayer == nil || danmakuLayer.contents == nil),
+              NJPiPClassName(danmakuLayer.superlayer));
+}
+
+@implementation NJPiPOverlayState
+
+- (void)attachDanmakuToOfficialLayer {
+    if (self.attached) {
+        return;
+    }
+    AVSampleBufferDisplayLayer *officialLayer = self.officialLayer;
+    if (!officialLayer) {
+        NJPiPDiag("ov attach skip=no-official-layer");
+        return;
+    }
+    UIView *danmakuView = self.danmakuView;
+    if (!danmakuView) {
+        danmakuView = objc_getAssociatedObject(self.controller, NJPiPPrewarmedDanmakuViewKey);
+    }
+    if (!danmakuView) {
+        danmakuView = NJFindVisiblePiPDanmakuView();
+    }
+    if (!danmakuView || !danmakuView.layer) {
+        NJPiPDiag("ov attach skip=no-danmaku-view");
+        return;
+    }
+    self.danmakuView = danmakuView;
+    CALayer *danmakuLayer = danmakuView.layer;
+    UIView *hostView = nil;
+    id layerHost = officialLayer.delegate;
+    if ([layerHost isKindOfClass:UIView.class] && [(UIView *)layerHost layer] == officialLayer) {
+        hostView = (UIView *)layerHost;
+    }
+    NJPiPDiag("ov attach begin host=%s hostWin=%p", NJPiPClassName(hostView), hostView.window);
+    NJPiPDiagDanmakuRenderer(danmakuView, officialLayer, "pre");
+    self.attached = YES;
+    if (hostView) {
+        // View-carried insertion: the danmaku view becomes a subview of the
+        // view that owns the official SBDL, so its backing layer enters the
+        // official SBDL's layer tree through normal view machinery and the
+        // existing superview/index/frame/constraints restore pattern applies.
+        self.danmakuOriginalSuperview = danmakuView.superview;
+        self.danmakuOriginalIndex = self.danmakuOriginalSuperview
+            ? [self.danmakuOriginalSuperview.subviews indexOfObject:danmakuView]
+            : NSNotFound;
+        self.danmakuOriginalFrame = danmakuView.frame;
+        self.danmakuTranslatesAutoresizing = danmakuView.translatesAutoresizingMaskIntoConstraints;
+        self.danmakuConstraints = NJConstraintsForView(danmakuView, self.danmakuOriginalSuperview);
+        [NSLayoutConstraint deactivateConstraints:self.danmakuConstraints];
+        CGRect targetFrame = CGRectNull;
+        if (hostView.layer == officialLayer) {
+            targetFrame = hostView.bounds;
+        } else {
+            targetFrame = NJLayerFrameRelativeToAncestor(officialLayer, hostView.layer);
+        }
+        if (CGRectIsNull(targetFrame) || targetFrame.size.width < 1 || targetFrame.size.height < 1) {
+            targetFrame = hostView.bounds;
+        }
+        [danmakuView removeFromSuperview];
+        danmakuView.translatesAutoresizingMaskIntoConstraints = YES;
+        danmakuView.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        danmakuView.frame = targetFrame;
+        [hostView addSubview:danmakuView];
+        NJPiPDiag("ov inserted variant=view target=(%.1f,%.1f %.1fx%.1f) attachedToHost=%d",
+                  targetFrame.origin.x,
+                  targetFrame.origin.y,
+                  targetFrame.size.width,
+                  targetFrame.size.height,
+                  (int)(danmakuView.superview == hostView));
+    } else {
+        // Raw layer insertion: no backing view for the official layer, so
+        // attach a plain container CALayer and move the danmaku view's
+        // backing layer into it.
+        CALayer *containerLayer = [CALayer layer];
+        containerLayer.frame = officialLayer.bounds;
+        containerLayer.autoresizingMask = kCALayerWidthSizable | kCALayerHeightSizable;
+        containerLayer.masksToBounds = NO;
+        self.overlayContainerLayer = containerLayer;
+        self.danmakuOriginalSuperlayer = danmakuLayer.superlayer;
+        self.danmakuOriginalLayerIndex = danmakuLayer.superlayer
+            ? [danmakuLayer.superlayer.sublayers indexOfObject:danmakuLayer]
+            : NSNotFound;
+        self.danmakuOriginalLayerFrame = danmakuLayer.frame;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [officialLayer addSublayer:containerLayer];
+        [danmakuLayer removeFromSuperlayer];
+        danmakuLayer.frame = officialLayer.bounds;
+        [containerLayer addSublayer:danmakuLayer];
+        [CATransaction commit];
+        NJPiPDiag("ov inserted variant=layer container=%p containerFrame=(%.1f,%.1f %.1fx%.1f)",
+                  containerLayer,
+                  containerLayer.frame.origin.x,
+                  containerLayer.frame.origin.y,
+                  containerLayer.frame.size.width,
+                  containerLayer.frame.size.height);
+    }
+    NJPiPDiag("ov attach end offSubN=%lu dmLayerSuper=%s dmLayerInOfficialTree=%d",
+              (unsigned long)officialLayer.sublayers.count,
+              NJPiPClassName(danmakuLayer.superlayer),
+              (int)(danmakuLayer.superlayer == officialLayer ||
+                    danmakuLayer.superlayer == self.overlayContainerLayer));
+    NJPiPDiagDanmakuRenderer(danmakuView, officialLayer, "post");
+}
+
+- (void)restoreDanmaku {
+    if (!self.attached && !self.danmakuOriginalSuperview && !self.overlayContainerLayer) {
+        return;
+    }
+    UIView *danmakuView = self.danmakuView;
+    if (self.overlayContainerLayer) {
+        CALayer *danmakuLayer = danmakuView.layer;
+        CALayer *originalSuperlayer = self.danmakuOriginalSuperlayer;
+        [CATransaction begin];
+        [CATransaction setDisableActions:YES];
+        [self.overlayContainerLayer removeFromSuperlayer];
+        self.overlayContainerLayer = nil;
+        if (danmakuLayer) {
+            [danmakuLayer removeFromSuperlayer];
+            if (originalSuperlayer) {
+                NSUInteger index = MIN(self.danmakuOriginalLayerIndex,
+                                       originalSuperlayer.sublayers.count);
+                [originalSuperlayer insertSublayer:danmakuLayer atIndex:(unsigned)index];
+                danmakuLayer.frame = self.danmakuOriginalLayerFrame;
+            }
+        }
+        [CATransaction commit];
+        self.danmakuOriginalSuperlayer = nil;
+        NJPiPDiag("ov restored variant=layer");
+    }
+    if (danmakuView && self.danmakuOriginalSuperview) {
+        UIView *originalSuperview = self.danmakuOriginalSuperview;
+        [danmakuView removeFromSuperview];
+        NSUInteger index = MIN(self.danmakuOriginalIndex, originalSuperview.subviews.count);
+        [originalSuperview insertSubview:danmakuView atIndex:index];
+        danmakuView.translatesAutoresizingMaskIntoConstraints = self.danmakuTranslatesAutoresizing;
+        danmakuView.autoresizingMask = UIViewAutoresizingNone;
+        danmakuView.frame = self.danmakuOriginalFrame;
+        [NSLayoutConstraint activateConstraints:self.danmakuConstraints];
+        [originalSuperview setNeedsLayout];
+        NJPiPDiag("ov restored variant=view backTo=%s", NJPiPClassName(originalSuperview));
+    }
+    self.danmakuOriginalSuperview = nil;
+    self.danmakuConstraints = @[];
+    self.attached = NO;
+}
+
+- (void)invalidate {
+    @synchronized (NJPiPOverlayStates()) {
+        [NJPiPOverlayStates() removeObject:self];
+    }
+    [self restoreDanmaku];
+    self.officialLayer = nil;
+}
+
+- (void)dealloc {
+    [self invalidate];
+}
+
+@end
+
+@implementation NJPiPOverlayDelegateProxy
+
+- (BOOL)respondsToSelector:(SEL)selector {
+    return [super respondsToSelector:selector] || [self.downstream respondsToSelector:selector];
+}
+
+- (id)forwardingTargetForSelector:(SEL)selector {
+    if ([self.downstream respondsToSelector:selector]) {
+        return self.downstream;
+    }
+    return [super forwardingTargetForSelector:selector];
+}
+
+- (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("ov willStart");
+    [self.state attachDanmakuToOfficialLayer];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerWillStartPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureControllerDidStartPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("ov didStart pipAct=%d pipPos=%d attached=%d",
+              (int)controller.pictureInPictureActive,
+              (int)controller.pictureInPicturePossible,
+              (int)self.state.isAttached);
+    if (self.state && !self.state.isAttached) {
+        NJPiPDiag("ov retry@didStart");
+        [self.state attachDanmakuToOfficialLayer];
+    }
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerDidStartPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+ failedToStartPictureInPictureWithError:(NSError *)error {
+    NJPiPDiag("ov failed domain=%s code=%ld", error.domain.UTF8String, (long)error.code);
+    [self.state restoreDanmaku];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureController:controller
+                  failedToStartPictureInPictureWithError:error];
+    }
+}
+
+- (void)pictureInPictureControllerWillStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("ov willStop");
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerWillStopPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
+    NJPiPDiag("ov didStop");
+    [self.state restoreDanmaku];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
+    }
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:(void (^)(BOOL restored))completionHandler {
+    NJPiPDiag("ov restoreUI");
+    [self.state restoreDanmaku];
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [self.downstream pictureInPictureController:controller
+ restoreUserInterfaceForPictureInPictureStopWithCompletionHandler:completionHandler];
+    } else {
+        completionHandler(YES);
+    }
+}
+
+@end
+
+static void NJEnsurePiPOverlayState(AVPictureInPictureController *controller,
+                                    AVPictureInPictureControllerContentSource *contentSource) API_AVAILABLE(ios(15.0)) {
+    if (!controller || !contentSource || !NJPiPDanmakuEnabled()) {
+        return;
+    }
+    AVSampleBufferDisplayLayer *officialLayer = contentSource.sampleBufferDisplayLayer;
+    if (![officialLayer isKindOfClass:AVSampleBufferDisplayLayer.class]) {
+        NJPiPDiag("ov skip reason=source-not-sbdl src=%s", NJPiPClassName(contentSource));
+        return;
+    }
+    NJPiPOverlayState *state = objc_getAssociatedObject(controller, NJPiPOverlayStateKey);
+    if (state) {
+        if (state.officialLayer != officialLayer) {
+            NJPiPDiag("ov retarget old=%p new=%p attached=%d",
+                      state.officialLayer,
+                      officialLayer,
+                      (int)state.isAttached);
+            state.officialLayer = officialLayer;
+            if (state.isAttached) {
+                [state restoreDanmaku];
+                [state attachDanmakuToOfficialLayer];
+            }
+        }
+        return;
+    }
+    state = [[NJPiPOverlayState alloc] init];
+    state.controller = controller;
+    state.officialLayer = officialLayer;
+    state.delegateProxy = [[NJPiPOverlayDelegateProxy alloc] init];
+    state.delegateProxy.state = state;
+    state.delegateProxy.downstream = controller.delegate;
+    objc_setAssociatedObject(controller,
+                             NJPiPOverlayStateKey,
+                             state,
+                             OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    @synchronized (NJPiPOverlayStates()) {
+        [NJPiPOverlayStates() addObject:state];
+    }
+    controller.delegate = state.delegateProxy;
+    NJPiPDiag("ov state controller=%p source=%s layer=%p layerSize=%.0fx%.0f downstream=%s",
+              controller,
+              NJPiPClassName(contentSource),
+              officialLayer,
+              officialLayer.bounds.size.width,
+              officialLayer.bounds.size.height,
+              NJPiPClassName(state.delegateProxy.downstream));
+}
+
 static void NJPiPDiagHeartbeat(void) {
     int applicationState = 0;
     UIApplication *application = UIApplication.sharedApplication;
     if (application) {
         applicationState = (int)application.applicationState;
     }
-    NSArray<NJPiPMirrorState *> *states;
-    @synchronized (NJPiPMirrorStates()) {
-        states = [NJPiPMirrorStates() allObjects];
+    NSArray<NJPiPOverlayState *> *states;
+    @synchronized (NJPiPOverlayStates()) {
+        states = [NJPiPOverlayStates() allObjects];
     }
-    for (NJPiPMirrorState *state in states) {
+    for (NJPiPOverlayState *state in states) {
         if (!state) {
             continue;
         }
-        AVSampleBufferDisplayLayer *sourceLayer = state.sourceDisplayLayer;
-        AVSampleBufferDisplayLayer *mirrorLayer =
-            state.mirrorView ? state.mirrorView.sampleBufferDisplayLayer : nil;
+        AVSampleBufferDisplayLayer *officialLayer = state.officialLayer;
         AVPictureInPictureController *controller = state.controller;
         BOOL isSuspended = NO;
         if (controller && [controller respondsToSelector:@selector(isSuspended)]) {
             isSuspended = (BOOL)[(id)controller performSelector:@selector(isSuspended)];
         }
         id playbackDelegate = nil;
-        if (state.customContentSource &&
-            [state.customContentSource respondsToSelector:@selector(sampleBufferPlaybackDelegate)]) {
-            playbackDelegate = [state.customContentSource performSelector:@selector(sampleBufferPlaybackDelegate)];
+        if (@available(iOS 15.0, *)) {
+            AVPictureInPictureControllerContentSource *contentSource = controller.contentSource;
+            if (contentSource &&
+                [contentSource respondsToSelector:@selector(sampleBufferPlaybackDelegate)]) {
+                playbackDelegate = [contentSource performSelector:@selector(sampleBufferPlaybackDelegate)];
+            }
         }
         if (playbackDelegate) {
             NJPiPSwizzlePlaybackDelegateIfNeeded(playbackDelegate);
         }
-        NJPiPDiag("hb st=%p app=%d pres=%d n=%lu pipAct=%d pipPos=%d pipSusp=%d srcSt=%ld mirSt=%ld srcRdy=%d mirRdy=%d srcFl=%d mirFl=%d srcTb=%s mirTb=%s delegate=%s",
+        UIView *danmakuView = state.danmakuView;
+        CALayer *danmakuLayer = danmakuView.layer;
+        NJPiPDiag("hb st=%p app=%d att=%d variant=%s pipAct=%d pipPos=%d pipSusp=%d off=%s offSt=%ld offRdy=%d offFl=%d offTb=%s offSubN=%lu dm=%s dmLayer=%s dmMetal=%d delegate=%s",
                   state,
                   applicationState,
-                  (int)state.isPresenting,
-                  (unsigned long)state.mirroredFrameCount,
+                  (int)state.isAttached,
+                  state.overlayContainerLayer ? "layer" : (state.danmakuOriginalSuperview ? "view" : "-"),
                   controller ? (int)controller.pictureInPictureActive : -1,
                   controller ? (int)controller.pictureInPicturePossible : -1,
                   (int)isSuspended,
-                  sourceLayer ? (long)sourceLayer.status : -1,
-                  mirrorLayer ? (long)mirrorLayer.status : -1,
-                  sourceLayer ? (int)sourceLayer.readyForDisplay : -1,
-                  mirrorLayer ? (int)mirrorLayer.readyForDisplay : -1,
-                  NJPiPLayerRequiresFlush(sourceLayer),
-                  NJPiPLayerRequiresFlush(mirrorLayer),
-                  NJPiPLayerTimebaseInfo(sourceLayer).UTF8String,
-                  NJPiPLayerTimebaseInfo(mirrorLayer).UTF8String,
+                  NJPiPClassName(officialLayer),
+                  officialLayer ? (long)officialLayer.status : -1,
+                  officialLayer ? (int)officialLayer.readyForDisplay : -1,
+                  NJPiPLayerRequiresFlush(officialLayer),
+                  NJPiPLayerTimebaseInfo(officialLayer).UTF8String,
+                  (unsigned long)(officialLayer ? officialLayer.sublayers.count : 0),
+                  NJPiPClassName(danmakuView),
+                  NJPiPClassName(danmakuLayer),
+                  (int)[danmakuLayer isKindOfClass:NSClassFromString(@"CAMetalLayer")],
                   NJPiPClassName(playbackDelegate));
     }
     NJPiPDiag("hb app=%d states=%lu", applicationState, (unsigned long)states.count);
@@ -2202,26 +2634,16 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      "[NJPiPDanmaku] controller content-source init class=%{public}s source=%{public}s enabled=%d",
                      NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
     NJPiPDiag("pip initContentSource enabled=%d", NJPiPDanmakuEnabled());
-    if (@available(iOS 15.0, *)) {
-        NJPiPMirrorState *state = NJMakePiPMirrorState(contentSource, nil, nil, nil);
-        if (state) {
-            AVPictureInPictureController *controller = %orig(state.customContentSource);
-            if (controller) {
-                NJTrackPiPController(controller);
-                state.controller = controller;
-                objc_setAssociatedObject(controller,
-                                         NJPiPMirrorStateKey,
-                                         state,
-                                         OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-                controller.delegate = state.delegateProxy;
-                return controller;
-            }
-            [state invalidate];
-            return nil;
+    // New architecture: the app's own content source is never replaced and
+    // the init chain always goes through %orig untouched; we only attach a
+    // lightweight overlay state when the source carries an SBDL.
+    AVPictureInPictureController *controller = %orig;
+    if (controller && NJPiPDanmakuEnabled()) {
+        NJTrackPiPController(controller);
+        if (@available(iOS 15.0, *)) {
+            NJEnsurePiPOverlayState(controller, contentSource);
         }
     }
-    AVPictureInPictureController *controller = %orig;
-    NJTrackPiPController(controller);
     return controller;
 }
 
@@ -2230,56 +2652,33 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      "[NJPiPDanmaku] controller set source class=%{public}s source=%{public}s enabled=%d",
                      NJPiPClassName(self), NJPiPClassName(contentSource), NJPiPDanmakuEnabled());
     NJPiPDiag("pip setContentSource enabled=%d", NJPiPDanmakuEnabled());
+    // Legacy mirror-state bookkeeping is retained for rollback; those states
+    // are no longer created by either entry hook, so this pass is a no-op in
+    // the new architecture.
     NJPiPMirrorState *oldState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (contentSource == oldState.customContentSource) {
         %orig;
         return;
     }
-
-    id<AVPictureInPictureControllerDelegate> downstream = self.delegate;
     [oldState invalidate];
     objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
-
-    if (@available(iOS 15.0, *)) {
-        AVPlayerLayer *fallbackPlayerLayer = objc_getAssociatedObject(self,
-                                                                       NJPiPFallbackPlayerLayerKey);
-        UIView *fallbackSourceView = objc_getAssociatedObject(self,
-                                                               NJPiPFallbackSourceViewKey);
-        if (!fallbackSourceView.window) {
-            fallbackSourceView = NJViewWithBackingLayer(fallbackPlayerLayer) ?:
-                                 NJSourceViewForLayer(fallbackPlayerLayer);
-        }
-        if (!fallbackSourceView.window) {
-            fallbackSourceView = NJFindVisiblePiPDanmakuView();
-        }
-        UIView *prewarmedAnchorView = objc_getAssociatedObject(self,
-                                                                NJPiPPrewarmedAnchorViewKey);
-        UIView *prewarmedDanmakuView = objc_getAssociatedObject(self,
-                                                                 NJPiPPrewarmedDanmakuViewKey);
-        NJPiPMirrorState *newState = NJMakePiPMirrorState(contentSource,
-                                                          fallbackSourceView,
-                                                          prewarmedAnchorView,
-                                                          prewarmedDanmakuView);
-        if (newState) {
-            newState.controller = self;
-            newState.delegateProxy.downstream = downstream;
-            objc_setAssociatedObject(self,
-                                     NJPiPMirrorStateKey,
-                                     newState,
-                                     OBJC_ASSOCIATION_RETAIN_NONATOMIC);
-            %orig(newState.customContentSource);
-            self.delegate = newState.delegateProxy;
-            return;
-        }
-    }
-    // nil, player-layer, or an unrecognized source remains completely native.
+    // The app's own SBDL content source stays attached: %orig always receives
+    // the original source, never a replacement.
     %orig;
-    if (oldState && downstream) {
-        self.delegate = downstream;
+    if (@available(iOS 15.0, *)) {
+        if (NJPiPDanmakuEnabled() && contentSource) {
+            NJEnsurePiPOverlayState(self, contentSource);
+        }
     }
 }
 
 - (void)setDelegate:(id<AVPictureInPictureControllerDelegate>)delegate {
+    NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
+    if (overlayState && delegate != overlayState.delegateProxy) {
+        overlayState.delegateProxy.downstream = delegate;
+        %orig(overlayState.delegateProxy);
+        return;
+    }
     NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (mirrorState && delegate != mirrorState.delegateProxy) {
         mirrorState.delegateProxy.downstream = delegate;
@@ -2297,6 +2696,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (id<AVPictureInPictureControllerDelegate>)delegate {
     id<AVPictureInPictureControllerDelegate> delegate = %orig;
+    NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
+    if (overlayState && delegate == overlayState.delegateProxy && overlayState.delegateProxy.downstream) {
+        return overlayState.delegateProxy.downstream;
+    }
     NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (mirrorState && delegate == mirrorState.delegateProxy && mirrorState.delegateProxy.downstream) {
         return mirrorState.delegateProxy.downstream;
@@ -2310,6 +2713,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (void)dealloc {
     NJPiPDiag("pip dealloc");
+    NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
+    [overlayState invalidate];
+    objc_setAssociatedObject(self, NJPiPOverlayStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
     NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     [mirrorState invalidate];
     objc_setAssociatedObject(self, NJPiPMirrorStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
@@ -2533,6 +2939,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                [(NSString *)[bundleInfo objectForKey:@"CFBundleShortVersionString"] UTF8String],
                [(NSString *)[bundleInfo objectForKey:@"CFBundleVersion"] UTF8String],
               NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
+    // Unambiguous architecture marker: this build keeps the app's own SBDL
+    // content source fully native and only inserts the danmaku renderer into
+    // the official layer's subtree.
+    NJPiPDiag("pip arch=native-layerinsert sha=%s", NJ_PI_P_BUILD_SHA);
     NJPiPDiagStart();
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
                                                      object:nil
