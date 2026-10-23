@@ -1,4 +1,5 @@
 // 画中画弹幕
+/// 本文件对应的 NJPipDanmaku.mm 是 Logos 生成物：CI 构建会 touch Logos 下全部 .xm 并重新生成（见 project.pbxproj 中 Logos build phase 的 touch 循环），不要再手工维护 .mm。
 
 #import <UIKit/UIKit.h>
 #import "NJCommonDefine.h"

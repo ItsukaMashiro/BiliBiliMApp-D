@@ -1946,7 +1946,7 @@
 			);
 			runOnlyForDeploymentPostprocessing = 0;
 			shellPath = /bin/sh;
-			shellScript = "touch \"${SRCROOT}/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm\"\n/opt/MonkeyDev/bin/md --xcbp-logos\n";
+			shellScript = "find \"${SRCROOT}/BiliBiliMDDylib/Logos\" -name '*.xm' -exec touch {} +\n/opt/MonkeyDev/bin/md --xcbp-logos\n";
 		};
 /* End PBXShellScriptBuildPhase section */
 
