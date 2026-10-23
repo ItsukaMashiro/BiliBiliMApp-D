@@ -180,8 +180,10 @@ jobs:
           install -m 0644 Tools/frida/NJPipProbe.js "$APP_PATH/NJPipProbe.js"
 
           git clone --depth 1 https://github.com/tyilo/insert_dylib "$RUNNER_TEMP/insert_dylib"
+          # upstream keeps the single-file source at insert_dylib/main.c (C++ despite the extension)
+          test -s "$RUNNER_TEMP/insert_dylib/insert_dylib/main.c"
           clang++ -std=c++11 -O2 -o "$RUNNER_TEMP/insert_dylib_bin" \
-            "$RUNNER_TEMP/insert_dylib/insert_dylib.cpp"
+            "$RUNNER_TEMP/insert_dylib/insert_dylib/main.c"
           "$RUNNER_TEMP/insert_dylib_bin" --all-load-commands \
             "@executable_path/FridaGadget.dylib" \
             "$APP_PATH/$APP_EXECUTABLE" "$APP_PATH/$APP_EXECUTABLE.patched"
