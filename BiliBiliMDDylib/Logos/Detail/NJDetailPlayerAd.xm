@@ -138,6 +138,17 @@
 #define NJ_PI_P_TARGET_APP_URL "unknown"
 #endif
 
+/*
+ 画中画弹幕的第二条路径：GPU 合成（把弹幕烘焙进视频帧再入队）。
+ 默认 0 = 完全不参与编译（不 hook、不建 Metal 设备、不建计时器），
+ 现有「把弹幕层插进官方 SBDL 子层」的路径行为不变。
+ 实现体在下面的 `#pragma mark - GPU composite`（文件后半部分），
+ 打开方式：把这里的 0 改成 1，或编译期 -DNJ_PIP_GPU_COMPOSITE_ENABLED=1。
+ */
+#ifndef NJ_PIP_GPU_COMPOSITE_ENABLED
+#define NJ_PIP_GPU_COMPOSITE_ENABLED 0
+#endif
+
 // MARK: - Picture in Picture danmaku
 
 static const void *NJPiPDanmakuStateKey = &NJPiPDanmakuStateKey;
@@ -1438,6 +1449,12 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
     if (self.attached) {
         return;
     }
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
+    // 两条路径按构造互斥：GPU 合成打开时弹幕已经在帧里，再把渲染层插进官方
+    // SBDL 子层就会画两遍。宏为 0 时这段不存在，插层路径照旧。
+    NJPiPDiag("ov attach skipped reason=gpu-composite-enabled");
+    return;
+#endif
     AVSampleBufferDisplayLayer *officialLayer = self.officialLayer;
     if (!officialLayer) {
         NJPiPDiag("ov attach skip=no-official-layer");
@@ -1712,6 +1729,974 @@ static void NJEnsurePiPOverlayState(AVPictureInPictureController *controller,
               officialLayer.bounds.size.height,
               NJPiPClassName(state.delegateProxy.downstream));
 }
+
+/*
+ **************** PiP 弹幕的 GPU 合成兜底路径（编译期默认关闭） ****************
+
+ 兜底语义：官方 PiP 的内容源是 ijk 自己泵的 AVSampleBufferDisplayLayer
+ （静态证据：`IJKSDLSampleBufferView +layerClass` = SBDL、ivar `_mLayer`，
+ 帧经 `display_pixels:` → `display_pixels_vtb:` → `-[IJKSDLSampleBufferView
+ enqueueSmapleBuffer:]`（App 8.89 二进制里这个选择子拼写就是 Smaple）→
+ `-[AVSampleBufferDisplayLayer enqueueSampleBuffer:]`；全二进制没有
+ `AVSampleBufferVideoRenderer`/`insertTimeSource:`/任何 CMTimebase 设置，
+ 所以该层是 free-running，只认样本 PTS + 到达时间）。
+ 如果弹幕层插进那块 SBDL 子层这条路在真机上不被 AVKit 带进 PiP，
+ 就把弹幕以 source-over 合成进被入队的视频帧本身——PiP 里的内容源只有视频帧，
+ 帧里有弹幕就一定看得见。
+
+ 关掉时（默认）这段代码不产生任何运行时行为：整个实现（含 #import、计数器、
+ 挂钩安装）都在 `#if NJ_PIP_GPU_COMPOSITE_ENABLED` 里，宏为 0 时预处理阶段全部
+ 消失，本文件其余部分一行未改；不 hook、不建 Metal device、不建定时器、不多一个
+ 字符串字面量（诊断里用到的字面量也在块内）。开关本身定义在本文件顶部
+ （`NJ_PIP_GPU_COMPOSITE_ENABLED`，紧跟在 build stamp 兜底宏后面），把它改成 1
+ 即可启用；也可以在编译期传 -DNJ_PIP_GPU_COMPOSITE_ENABLED=1。
+ */
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
+
+#import <Metal/Metal.h>
+#import <CoreVideo/CoreVideo.h>
+#import <objc/runtime.h>
+#import <mach/mach_time.h>
+#import <string.h>
+#import <stdio.h>
+#import <stdlib.h>
+
+#pragma mark - GPU composite: state
+
+static id<MTLDevice> NJPiGpuDevice = nil;
+static id<MTLCommandQueue> NJPiGpuCommandQueue = nil;
+static id<MTLSamplerState> NJPiGpuSampler = nil;
+static CVMetalTextureCacheRef NJPiGpuTextureCache = NULL;
+// Pipelines are keyed by the source pixel layout, chosen once per stream:
+// 0 = BGRA copy, 1 = BT.601 video-range YUV copy, 2 = BT.709 YUV copy, 3 = danmaku source-over blend.
+#define NJP_GPU_PIPELINE_COUNT 4
+static id<MTLRenderPipelineState> NJPiGpuPipelines[NJP_GPU_PIPELINE_COUNT];
+static BOOL NJPiGpuSetupAttempted = NO;
+static const char *NJPiGpuSetupFailure = NULL;
+static CVPixelBufferPoolRef NJPiGpuPool = NULL;
+static OSType NJPiGpuPoolFormat = 0;
+static NSUInteger NJPiGpuPoolWidth = 0;
+static NSUInteger NJPiGpuPoolHeight = 0;
+// Ring of in-flight wraps: the wrapped sample is released by the display layer at
+// an arbitrary later time, so the pool buffers it hands out are recycled through
+// this ring instead of being released inline.
+#define NJP_GPU_RING_COUNT 4
+static CMSampleBufferRef NJPiGpuRing[NJP_GPU_RING_COUNT];
+static NSUInteger NJPiGpuRingNext = 0;
+
+static const char *NJPiGpuFourcc(OSType format) {
+    static char buffer[5];
+    buffer[0] = (char)((format >> 24) & 0xFF);
+    buffer[1] = (char)((format >> 16) & 0xFF);
+    buffer[2] = (char)((format >> 8) & 0xFF);
+    buffer[3] = (char)(format & 0xFF);
+    buffer[4] = '\0';
+    return buffer;
+}
+
+// Per-reason failure accounting: at most 5 lines per reason, then silence.
+#define NJP_GPU_MAX_REASONS 12
+static const char *NJPiGpuReasonNames[NJP_GPU_MAX_REASONS];
+static unsigned long long NJPiGpuReasonHits[NJP_GPU_MAX_REASONS];
+static NSUInteger NJPiGpuReasonCount = 0;
+
+static void NJPiGpuRegisterReasons(void) {
+    if (NJPiGpuReasonCount > 0) {
+        return;
+    }
+    const char *reasons[] = { "no-pb", "no-src-tex", "no-dm-pb", "no-dm-tex", "no-pool",
+                              "no-pl", "no-cb", "no-enc", "draw", "wrap", "init", "fmt" };
+    for (NSUInteger index = 0; index < NJP_GPU_MAX_REASONS; index++) {
+        NJPiGpuReasonNames[index] = reasons[index];
+    }
+    NJPiGpuReasonCount = NJP_GPU_MAX_REASONS;
+}
+
+static void NJPiGpuNoteFailure(const char *reason, CMSampleBufferRef sampleBuffer) {
+    NJPiGpuRegisterReasons();
+    NSUInteger slot = NJP_GPU_MAX_REASONS - 1; // "fmt" is the catch-all slot
+    for (NSUInteger index = 0; index < NJPiGpuReasonCount; index++) {
+        if (NJPiGpuReasonNames[index] && strcmp(NJPiGpuReasonNames[index], reason) == 0) {
+            slot = index;
+            break;
+        }
+    }
+    NJPiGpuReasonHits[slot] += 1;
+    if (NJPiGpuReasonHits[slot] <= 5) {
+        CVImageBufferRef imageBuffer = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
+        NJPiPDiag("gpu fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu",
+                  reason,
+                  NJPiGpuReasonHits[slot],
+                  imageBuffer ? 1 : 0,
+                  imageBuffer ? NJPiGpuFourcc(CVPixelBufferGetPixelFormatType(imageBuffer)) : "-",
+                  imageBuffer ? (unsigned long)CVPixelBufferGetWidth(imageBuffer) : 0,
+                  imageBuffer ? (unsigned long)CVPixelBufferGetHeight(imageBuffer) : 0);
+    }
+}
+
+// Cost accounting, summarised every 30s (see NJPiGpuStartSummary).
+static unsigned long long NJPiGpuOkFrames = 0;
+static unsigned long long NJPiGpuOkPixels = 0;
+static unsigned long long NJPiGpuDurationNs = 0;
+static unsigned long long NJPiGpuMaxDurationNs = 0;
+static mach_timebase_info_data_t NJPiGpuTimebase;
+static unsigned long long NJPiGpuSummaryLastOk = 0;
+static unsigned long long NJPiGpuSummaryLastFail = 0;
+
+static unsigned long long NJPiGpuFailTotal(void) {
+    unsigned long long total = 0;
+    for (NSUInteger index = 0; index < NJPiGpuReasonCount; index++) {
+        total += NJPiGpuReasonHits[index];
+    }
+    return total;
+}
+
+// mach_absolute_time() ticks are not nanoseconds; convert with the process timebase.
+static double NJPiGpuNanoseconds(unsigned long long ticks) {
+    if (NJPiGpuTimebase.den == 0) {
+        return 0.0;
+    }
+    return (double)ticks * (double)NJPiGpuTimebase.numer / (double)NJPiGpuTimebase.den;
+}
+
+static void NJPiGpuSummaryTick(void) {
+    NJPiGpuRegisterReasons();
+    unsigned long long failTotal = NJPiGpuFailTotal();
+    if (NJPiGpuOkFrames == NJPiGpuSummaryLastOk && failTotal == NJPiGpuSummaryLastFail) {
+        return; // nothing happened in this window: stay quiet
+    }
+    unsigned long long okDelta = NJPiGpuOkFrames - NJPiGpuSummaryLastOk;
+    unsigned long long failDelta = failTotal - NJPiGpuSummaryLastFail;
+    NJPiGpuSummaryLastOk = NJPiGpuOkFrames;
+    NJPiGpuSummaryLastFail = failTotal;
+    double avgMicroseconds = okDelta > 0
+        ? ((double)NJPiGpuDurationNs / (double)okDelta) * 0.001
+        : 0.0;
+    double maxMicroseconds = ((double)NJPiGpuMaxDurationNs) * 0.001;
+    double megaPixelsPerSecond = ((double)NJPiGpuOkPixels) / 1000000.0;
+    NSMutableString *counts = [NSMutableString string];
+    for (NSUInteger index = 0; index < NJPiGpuReasonCount; index++) {
+        if (NJPiGpuReasonHits[index] > 0) {
+            [counts appendFormat:@",%s=%llu", NJPiGpuReasonNames[index], NJPiGpuReasonHits[index]];
+        }
+    }
+    NJPiPDiag("gpu sum win=30s ok=%llu ok_d=%llu fail=%llu fail_d=%llu avg_us=%.1f max_us=%.1f "
+              "mpix_total=%.1f setup=%s fails=%s",
+              NJPiGpuOkFrames, okDelta, failTotal, failDelta,
+              avgMicroseconds, maxMicroseconds, megaPixelsPerSecond,
+              NJPiGpuSetupFailure ?: "ok", counts.UTF8String ?: "-");
+    NJPiGpuMaxDurationNs = 0;
+    NJPiGpuDurationNs = 0;
+}
+
+static void NJPiGpuStartSummary(void) {
+    static dispatch_source_t timer = NULL;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        mach_timebase_info(&NJPiGpuTimebase);
+        timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, NJPiPDiagQueue());
+        dispatch_source_set_event_handler(timer, ^{
+            NJPiGpuSummaryTick();
+        });
+        dispatch_source_set_timer(timer,
+                                  dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC),
+                                  30 * NSEC_PER_SEC,
+                                  NSEC_PER_SEC);
+        dispatch_resume(timer);
+    });
+}
+
+#pragma mark - GPU composite: Metal setup
+
+// Compiled at runtime with newLibraryWithSource:options:error: so the build needs no
+// Metal toolchain and no .metallib: the source below is a plain C string.
+// Pass 1 writes the decoded video frame into a BGRA target; pass 2 composites the
+// danmaku renderer's own output over it with source-over blending.
+static const char *NJPiGpuMetalSource =
+"#include <metal_stdlib>\n"
+"using namespace metal;\n"
+"struct NJPipVert {\n"
+"    float4 position [[position]];\n"
+"    float2 texCoord;\n"
+"};\n"
+"vertex NJPipVert nj_pip_vertex(uint vertexID [[vertex_id]]) {\n"
+"    // Fullscreen triangle. NDC y=+1 is row 0 of a Metal render target, so the V\n"
+"    // coordinate is flipped here to keep the copy upright inside the CVPixelBuffer.\n"
+"    float2 ndc[3] = { float2(-1.0, -1.0), float2(3.0, -1.0), float2(-1.0, 3.0) };\n"
+"    float2 uv[3]  = { float2(0.0, 1.0),   float2(2.0, 1.0),   float2(0.0, -2.0) };\n"
+"    NJPipVert out;\n"
+"    out.position = float4(ndc[vertexID], 0.0, 1.0);\n"
+"    out.texCoord = uv[vertexID];\n"
+"    return out;\n"
+"}\n"
+"fragment float4 nj_pip_copy_bgra(constant float *matrix [[buffer(0)]],\n"
+"                                 NJPipVert in [[stage_in]],\n"
+"                                 texture2d<float> plane [[texture(0)]],\n"
+"                                 sampler s [[sampler(0)]]) {\n"
+"    return plane.sample(s, in.texCoord);\n"
+"}\n"
+"fragment float4 nj_pip_copy_yuv(constant float *matrix [[buffer(0)]],\n"
+"                                NJPipVert in [[stage_in]],\n"
+"                                texture2d<float> planeY [[texture(0)]],\n"
+"                                texture2d<float> planeUV [[texture(1)]],\n"
+"                                sampler s [[sampler(0)]]) {\n"
+"    float y = planeY.sample(s, in.texCoord).r;\n"
+"    float2 c = planeUV.sample(s, in.texCoord).rg - float2(0.5, 0.5);\n"
+"    float3 rgb;\n"
+"    for (int i = 0; i < 3; i++) {\n"
+"        rgb[i] = matrix[i * 4 + 0] * y + matrix[i * 4 + 1] * c.x + matrix[i * 4 + 2] * c.y\n"
+"                 + matrix[i * 4 + 3];\n"
+"    }\n"
+"    // The matrix rows are R, G, B; a BGRA8Unorm render target maps x=B, y=G, z=R,\n"
+"    // so the write order is reversed here. (The identity copy of a BGRA source needs\n"
+"    // no swap: sampling and writing use the same channel order.)\n"
+"    return float4(rgb[2], rgb[1], rgb[0], 1.0);\n"
+"}\n"
+"fragment float4 nj_pip_blend_bgra(constant float *matrix [[buffer(0)]],\n"
+"                                  NJPipVert in [[stage_in]],\n"
+"                                  texture2d<float> plane [[texture(0)]],\n"
+"                                  sampler s [[sampler(0)]]) {\n"
+"    return plane.sample(s, in.texCoord);\n"
+"}\n";
+
+static BOOL NJPiGpuPipelineAvailable(NSUInteger index) {
+    if (index >= NJP_GPU_PIPELINE_COUNT || NJPiGpuPipelines[index]) {
+        return NJPiGpuPipelines[index] != nil;
+    }
+    if (!NJPiGpuDevice) {
+        return NO;
+    }
+    static const char *fragmentNames[NJP_GPU_PIPELINE_COUNT] = {
+        "nj_pip_copy_bgra", "nj_pip_copy_yuv", "nj_pip_copy_yuv", "nj_pip_blend_bgra"
+    };
+    NSError *error = nil;
+    // Compiled once and reused for every pipeline (a source compile costs a few ms).
+    static id<MTLLibrary> sharedLibrary = nil;
+    if (!sharedLibrary) {
+        sharedLibrary = [NJPiGpuDevice newLibraryWithSource:[NSString stringWithUTF8String:NJPiGpuMetalSource]
+                                                    options:nil
+                                                      error:&error];
+    }
+    id<MTLLibrary> library = sharedLibrary;
+    if (!library) {
+        NJPiGpuSetupFailure = "no-library";
+        NJPiPDiag("gpu fail reason=init no-library err=%s", error.localizedDescription.UTF8String ?: "-");
+        return NO;
+    }
+    id<MTLFunction> vertex = [library newFunctionWithName:@"nj_pip_vertex"];
+    id<MTLFunction> fragment = [library newFunctionWithName:[NSString stringWithUTF8String:fragmentNames[index]]];
+    if (!vertex || !fragment) {
+        NJPiGpuSetupFailure = "no-function";
+        return NO;
+    }
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.label = @"njpip-danmaku";
+    descriptor.vertexFunction = vertex;
+    descriptor.fragmentFunction = fragment;
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    if (index == 3) {
+        // source-over for a NON-premultiplied source: dst = src.rgb*src.a + dst*(1-src.a).
+        // If the real device shows dark halos around danmaku glyphs, the renderer's
+        // output is premultiplied and the RGB source factor becomes MTLBlendFactorOne.
+        descriptor.colorAttachments[0].blendingEnabled = YES;
+        descriptor.colorAttachments[0].rgbBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].alphaBlendOperation = MTLBlendOperationAdd;
+        descriptor.colorAttachments[0].sourceRGBBlendFactor = MTLBlendFactorSourceAlpha;
+        descriptor.colorAttachments[0].destinationRGBBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+        descriptor.colorAttachments[0].sourceAlphaBlendFactor = MTLBlendFactorOne;
+        descriptor.colorAttachments[0].destinationAlphaBlendFactor = MTLBlendFactorOneMinusSourceAlpha;
+    }
+    NSError *pipelineError = nil;
+    NJPiGpuPipelines[index] = [NJPiGpuDevice newRenderPipelineStateWithDescriptor:descriptor
+                                                                          error:&pipelineError];
+    if (!NJPiGpuPipelines[index]) {
+        NJPiGpuSetupFailure = "no-pipeline";
+        NJPiPDiag("gpu fail reason=init no-pl idx=%lu err=%s",
+                  (unsigned long)index, pipelineError.localizedDescription.UTF8String ?: "-");
+        return NO;
+    }
+    return YES;
+}
+
+static void NJPiGpuSetup(void) {
+    if (NJPiGpuSetupAttempted) {
+        return;
+    }
+    NJPiGpuSetupAttempted = YES;
+    NJPiGpuRegisterReasons();
+    NJPiGpuDevice = MTLCreateSystemDefaultDevice();
+    if (!NJPiGpuDevice) {
+        NJPiGpuSetupFailure = "no-device";
+        NJPiPDiag("gpu fail reason=init no-device");
+        return;
+    }
+    CVReturn cacheStatus = CVMetalTextureCacheCreate(kCFAllocatorDefault,
+                                                    NULL,
+                                                    NJPiGpuDevice,
+                                                    NULL,
+                                                    &NJPiGpuTextureCache);
+    if (cacheStatus != kCVReturnSuccess || !NJPiGpuTextureCache) {
+        NJPiGpuDevice = nil;
+        NJPiGpuSetupFailure = "no-texcache";
+        NJPiPDiag("gpu fail reason=init no-texcache status=%d", cacheStatus);
+        return;
+    }
+    NJPiGpuCommandQueue = [NJPiGpuDevice newCommandQueue];
+    MTLSamplerDescriptor *samplerDescriptor = [[MTLSamplerDescriptor alloc] init];
+    samplerDescriptor.minFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.magFilter = MTLSamplerMinMagFilterLinear;
+    samplerDescriptor.sAddressMode = MTLSamplerAddressModeClampToEdge;
+    samplerDescriptor.tAddressMode = MTLSamplerAddressModeClampToEdge;
+    NJPiGpuSampler = [NJPiGpuDevice newSamplerStateWithDescriptor:samplerDescriptor];
+    if (!NJPiGpuCommandQueue || !NJPiGpuSampler) {
+        NJPiGpuSetupFailure = "no-queue";
+        NJPiPDiag("gpu fail reason=init no-queue");
+        return;
+    }
+    CVPixelBufferRef probe = NULL;
+    NSDictionary<NSString *, id> *probeAttributes = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (NSString *)kCVPixelBufferWidthKey: @2,
+        (NSString *)kCVPixelBufferHeightKey: @2,
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    if (CVPixelBufferCreate(kCFAllocatorDefault, 2, 2, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)probeAttributes, &probe) == kCVReturnSuccess && probe) {
+        CVMetalTextureRef probeTexture = NULL;
+        if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiGpuTextureCache, probe, NULL,
+                                                      MTLPixelFormatBGRA8Unorm, 2, 2, 0, &probeTexture) == kCVReturnSuccess
+            && probeTexture) {
+            CFRelease(probeTexture);
+        }
+        CVPixelBufferRelease(probe);
+    }
+    NJPiPDiag("gpu init device=%s lowPower=%d texcache=ok",
+              NJPiGpuDevice.name.UTF8String ?: "-", (int)NJPiGpuDevice.isLowPowerDevice);
+}
+
+// Target pixel buffer pool: same width/height as the incoming frame. The pixel
+// format is 32BGRA because that is the only layout Metal can render into with one
+// pass; when the incoming frame already is 32BGRA this is byte-for-byte the same
+// format, and when it is 420v the first pass converts it (Metal has no 420v
+// render target). The new sample carries a format description built from the new
+// buffer, so the display layer sees a consistent pair.
+static CVPixelBufferRef NJPiGpuTargetBuffer(CVImageBufferRef sourceImage) {
+    NSUInteger width = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger height = CVPixelBufferGetHeight(sourceImage);
+    OSType targetFormat = kCVPixelFormatType_32BGRA;
+    if (!NJPiGpuPool || NJPiGpuPoolWidth != width || NJPiGpuPoolHeight != height
+        || NJPiGpuPoolFormat != targetFormat) {
+        if (NJPiGpuPool) {
+            CVPixelBufferPoolRelease(NJPiGpuPool);
+            NJPiGpuPool = NULL;
+        }
+        NSDictionary<NSString *, id> *attributes = @{
+            (NSString *)kCVPixelBufferPixelFormatTypeKey: @(targetFormat),
+            (NSString *)kCVPixelBufferWidthKey: @(width),
+            (NSString *)kCVPixelBufferHeightKey: @(height),
+            (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+        };
+        NSDictionary<NSString *, id> *poolAttributes = @{
+            (NSString *)kCVPixelBufferPoolMinimumBufferCountKey: @(NJP_GPU_RING_COUNT + 1),
+        };
+        CVReturn status = CVPixelBufferPoolCreate(kCFAllocatorDefault,
+                                                  (__bridge CFDictionaryRef)poolAttributes,
+                                                  (__bridge CFDictionaryRef)attributes,
+                                                  &NJPiGpuPool);
+        if (status != kCVReturnSuccess || !NJPiGpuPool) {
+            NJPiGpuPool = NULL;
+            NJPiGpuNoteFailure("no-pool", NULL);
+            return NULL;
+        }
+        NJPiGpuPoolWidth = width;
+        NJPiGpuPoolHeight = height;
+        NJPiGpuPoolFormat = targetFormat;
+        NJPiPDiag("gpu pool size=%lux%lu fmt=%s min=%d",
+                  (unsigned long)width, (unsigned long)height, NJPiGpuFourcc(targetFormat),
+                  NJP_GPU_RING_COUNT + 1);
+    }
+    CVPixelBufferRef target = NULL;
+    if (CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, NJPiGpuPool, &target) != kCVReturnSuccess
+        || !target) {
+        NJPiGpuNoteFailure("no-pool", NULL);
+        return NULL;
+    }
+    return target;
+}
+
+#pragma mark - GPU composite: danmaku pixel source
+
+// Static evidence (8.89 class dump, tmp/re89/objc-headers.txt):
+//  - `BBPlayerDanmakuVoutView : NSObject` owns `BFCChronosRendererWrapper *_rendererWrapper`
+//    and `WMMetaLayer *_mLayer`; the view-side element is the UIView whose layer is a
+//    CAMetalLayer installed through `BFCMetalLayerRender setMetalLayer:`.
+//  - `BFCChronosRendererWrapper` declares `- (struct __CVBuffer *)copyPixelBuffer;`,
+//    i.e. the renderer's own output. `copyPixelBuffer` follows the Core Foundation
+//    Create Rule, so the returned reference is owned (+1) and released after use.
+// The class dump cannot say how to get FROM the tracked view TO that wrapper at
+// runtime, so a few documented routes are probed and the one that answered is logged
+// once (`gpu dmsrc=…`); the summary line keeps the failure count if none of them do.
+// The call is made through a typed IMP so that the app's own selector never has to be
+// declared in a category (a `copy…`-named method declaration under ARC would also put
+// it in the copy method family, which is a needless compile risk here).
+typedef CVPixelBufferRef (*NJPiGpuCopyPixelBufferIMP)(id, SEL);
+
+static CVPixelBufferRef NJPiGpuCallCopyPixelBuffer(id candidate) {
+    if (!candidate) {
+        return NULL;
+    }
+    SEL selector = @selector(copyPixelBuffer);
+    if (![candidate respondsToSelector:selector]) {
+        return NULL;
+    }
+    IMP implementation = [candidate methodForSelector:selector];
+    if (!implementation) {
+        return NULL;
+    }
+    return ((NJPiGpuCopyPixelBufferIMP)implementation)(candidate, selector);
+}
+
+static id NJPiGpuValueForKey(id object, NSString *key) {
+    if (!object) {
+        return nil;
+    }
+    @try {
+        return [object valueForKey:key];
+    } @catch (__unused NSException *exception) {
+        return nil;
+    }
+}
+
+static CVPixelBufferRef NJPiGpuDanmakuPixelBuffer(CVImageBufferRef sourceImage) {
+    NSArray<NJPiPOverlayState *> *states;
+    @synchronized (NJPiPOverlayStates()) {
+        states = [NJPiPOverlayStates() allObjects];
+    }
+    for (NJPiPOverlayState *state in states) {
+        UIView *danmakuView = state.danmakuView;
+        if (!danmakuView) {
+            continue;
+        }
+        CALayer *danmakuLayer = danmakuView.layer;
+        // Route list: the view itself, then the object that owns its Metal layer
+        // (CAMetalLayer.delegate is the renderer in the BFCMetalLayerRender pattern),
+        // and the wrapper ivar behind each of them.
+        id holders[] = { danmakuView, danmakuLayer.delegate };
+        const char *holderNames[] = { "view", "layer-delegate" };
+        for (NSUInteger index = 0; index < 2; index++) {
+            id holder = holders[index];
+            if (!holder) {
+                continue;
+            }
+            CVPixelBufferRef pixelBuffer = NJPiGpuCallCopyPixelBuffer(holder);
+            char route[64];
+            snprintf(route, sizeof(route), "%s", holderNames[index]);
+            if (!pixelBuffer) {
+                id wrapper = NJPiGpuValueForKey(holder, @"rendererWrapper");
+                pixelBuffer = NJPiGpuCallCopyPixelBuffer(wrapper);
+                if (pixelBuffer) {
+                    snprintf(route, sizeof(route), "%s.rendererWrapper", holderNames[index]);
+                }
+            }
+            if (!pixelBuffer) {
+                continue;
+            }
+            static char lastRoute[64] = "";
+            if (strcmp(lastRoute, route) != 0) {
+                snprintf(lastRoute, sizeof(lastRoute), "%s", route);
+                NJPiPDiag("gpu dmsrc=%s dm=%s frame=%lux%lu dmsize=%lux%lu",
+                          route,
+                          object_getClassName(holder),
+                          (unsigned long)CVPixelBufferGetWidth(sourceImage),
+                          (unsigned long)CVPixelBufferGetHeight(sourceImage),
+                          (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
+                          (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
+            }
+            OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+            if (format != kCVPixelFormatType_32BGRA) {
+                // Only a BGRA source can be sampled by the blend pass without another
+                // conversion step; report it and fall back to the raw video frame.
+                NJPiGpuNoteFailure("fmt", NULL);
+                NJPiPDiag("gpu fail reason=fmt dmfmt=%s size=%lux%lu",
+                          NJPiGpuFourcc(format),
+                          (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
+                          (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
+                CVPixelBufferRelease(pixelBuffer);
+                return NULL;
+            }
+            return pixelBuffer;
+        }
+    }
+    return NULL;
+}
+
+#if 0
+// TODO(NJPiP-GPU): the fallback that does not work, kept deliberately off.
+// If the Chronos renderer ever stops exposing copyPixelBuffer, the only remaining
+// handle on the danmaku is its CALayer (`WMMetaLayer *_mLayer`, or the CAMetalLayer
+// that `BFCMetalLayerRender setMetalLayer:` installs). Metal cannot sample a
+// CALayer: getting its bits means -renderInContext: into a CGBitmapContext or a
+// CADisplayLink capture, i.e. CPU-side readback, which this path explicitly forbids
+// (no GPU->CPU round trip, no per-pixel CPU compositing). A GPU-feasible variant
+// would have to render the layer tree off-screen on the GPU
+// (CARenderServer/CAMetalLayer nextDrawable of a layer-hosted view), which needs a
+// layer-hosted view we do not own. Requires a dynamic check of what
+// BFCMetalLayerRender actually hands the renderer before any of this is worth
+// implementing; until then the path falls back to the unmodified video frame.
+#endif
+
+#pragma mark - GPU composite: the wrap
+
+static BOOL NJPiGpuIsYUV(OSType format) {
+    return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+}
+
+// Y'CbCr -> R'G'B' as the 16 floats the shader indexes (3 rows of y/cb/cr/const).
+// Chroma is sampled with the same texture coordinates as luma, i.e. treated as
+// centre-sited; the caveats for a real device are in the report.
+static void NJPiGpuYuvMatrix(OSType sourceFormat, BOOL bt709, float *matrix) {
+    double kr = bt709 ? 0.2126 : 0.299;   // BT.601 default, BT.709 when the buffer says so
+    double kb = bt709 ? 0.0722 : 0.114;
+    double kg = 1.0 - kr - kb;
+    BOOL fullRange = sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    double yScale = fullRange ? 1.0 : 255.0 / 219.0;
+    double yOffset = fullRange ? 0.0 : -16.0 / 219.0;
+    double cScale = fullRange ? 1.0 : 255.0 / 224.0;
+    double rOnCr = 2.0 * (1.0 - kr);
+    double bOnCb = 2.0 * (1.0 - kb);
+    double gOnCb = -(2.0 * kb * (1.0 - kb)) / kg;
+    double gOnCr = -(2.0 * kr * (1.0 - kr)) / kg;
+    double rOnCrScaled = rOnCr * cScale;
+    double bOnCbScaled = bOnCb * cScale;
+    double gOnCbScaled = gOnCb * cScale;
+    double gOnCrScaled = gOnCr * cScale;
+    matrix[0] = (float)yScale; matrix[1] = 0.0f;                matrix[2] = (float)rOnCrScaled; matrix[3] = (float)(yOffset - 0.5 * rOnCrScaled);
+    matrix[4] = (float)yScale; matrix[5] = (float)gOnCbScaled;  matrix[6] = (float)gOnCrScaled; matrix[7] = (float)(yOffset - 0.5 * (gOnCbScaled + gOnCrScaled));
+    matrix[8] = (float)yScale; matrix[9] = (float)bOnCbScaled;  matrix[10] = 0.0f;              matrix[11] = (float)(yOffset - 0.5 * bOnCbScaled);
+    matrix[12] = 0.0f; matrix[13] = 0.0f; matrix[14] = 0.0f; matrix[15] = 1.0f;
+}
+
+// The matrix a buffer asks for, read from its own attachments (never assumed).
+static BOOL NJPiGpuWantsBT709(CVImageBufferRef image) {
+    CFDictionaryRef attachments = CVBufferCopyAttachments(image, kCVImageBufferYCbCrMatrixKey);
+    if (!attachments) {
+        return NO;
+    }
+    CFTypeRef value = CFDictionaryGetValue(attachments, kCVImageBufferYCbCrMatrixKey);
+    BOOL bt709 = NO;
+    if (value && CFGetTypeID(value) == CFStringGetTypeID()) {
+        bt709 = CFStringCompare((CFStringRef)value, kCVImageBufferYCbCrMatrix_ITU_R_709_6, 0)
+                == kCFCompareEqualTo;
+    }
+    CFRelease(attachments);
+    return bt709;
+}
+
+
+// Returns the sample to enqueue: the composited one on success, the original on
+// any failure. Never re-encodes, never reads pixels back to the CPU.
+static id NJPiGpuComposite(id originalSampleObject) {
+    CMSampleBufferRef original = (__bridge CMSampleBufferRef)originalSampleObject;
+    CVImageBufferRef sourceImage = original ? CMSampleBufferGetImageBuffer(original) : NULL;
+    if (!sourceImage) {
+        NJPiGpuNoteFailure("no-pb", original);
+        return originalSampleObject;
+    }
+    NJPiGpuSetup();
+    if (!NJPiGpuTextureCache || !NJPiGpuCommandQueue) {
+        return originalSampleObject;
+    }
+    OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
+    NSUInteger width = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger height = CVPixelBufferGetHeight(sourceImage);
+    BOOL yuv = NJPiGpuIsYUV(sourceFormat);
+    NSUInteger pipelineIndex = 0;
+    float matrix[16] = { 0 };
+    if (sourceFormat == kCVPixelFormatType_32BGRA) {
+        pipelineIndex = 0;
+        NJPiGpuYuvMatrix(sourceFormat, NO, matrix);
+    } else if (yuv) {
+        BOOL bt709 = NJPiGpuWantsBT709(sourceImage);
+        pipelineIndex = bt709 ? 2 : 1;
+        NJPiGpuYuvMatrix(sourceFormat, bt709, matrix);
+    } else {
+        NJPiGpuNoteFailure("fmt", original);
+        return originalSampleObject;
+    }
+    if (!NJPiGpuPipelineAvailable(pipelineIndex) || !NJPiGpuPipelineAvailable(3)) {
+        return originalSampleObject;
+    }
+    CVPixelBufferRef targetImage = NJPiGpuTargetBuffer(sourceImage);
+    if (!targetImage) {
+        return originalSampleObject;
+    }
+    // Textures live until the GPU work is done; the ring keeps the wrapped sample
+    // (and therefore its target buffer) alive until the display layer is done with it.
+    CVMetalTextureRef sourcePlaneY = NULL;
+    CVMetalTextureRef sourcePlaneUV = NULL;
+    CVMetalTextureRef targetTextureRef = NULL;
+    CVMetalTextureRef danmakuTextureRef = NULL;
+    CVPixelBufferRef danmakuImage = NULL;
+    CMSampleBufferRef wrapped = NULL;
+    BOOL submitted = NO;
+    id wrappedObject = nil;
+    unsigned long long startedAt = mach_absolute_time();
+    do {
+        MTLPixelFormat lumaFormat = yuv ? MTLPixelFormatR8Unorm : MTLPixelFormatBGRA8Unorm;
+        if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiGpuTextureCache, sourceImage, NULL,
+                                                      lumaFormat, (size_t)width, (size_t)height, 0,
+                                                      &sourcePlaneY) != kCVReturnSuccess || !sourcePlaneY) {
+            NJPiGpuNoteFailure("no-src-tex", original);
+            break;
+        }
+        if (yuv) {
+            if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiGpuTextureCache, sourceImage, NULL,
+                                                          MTLPixelFormatRG8Unorm, (size_t)((width + 1) / 2),
+                                                          (size_t)((height + 1) / 2), 1,
+                                                          &sourcePlaneUV) != kCVReturnSuccess || !sourcePlaneUV) {
+                NJPiGpuNoteFailure("no-src-tex", original);
+                break;
+            }
+        }
+        if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiGpuTextureCache, targetImage, NULL,
+                                                      MTLPixelFormatBGRA8Unorm, (size_t)width, (size_t)height, 0,
+                                                      &targetTextureRef) != kCVReturnSuccess || !targetTextureRef) {
+            NJPiGpuNoteFailure("no-src-tex", original);
+            break;
+        }
+        danmakuImage = NJPiGpuDanmakuPixelBuffer(sourceImage);
+        if (!danmakuImage) {
+            NJPiGpuNoteFailure("no-dm-pb", original);
+            break;
+        }
+        if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiGpuTextureCache, danmakuImage, NULL,
+                                                      MTLPixelFormatBGRA8Unorm,
+                                                      (size_t)CVPixelBufferGetWidth(danmakuImage),
+                                                      (size_t)CVPixelBufferGetHeight(danmakuImage), 0,
+                                                      &danmakuTextureRef) != kCVReturnSuccess || !danmakuTextureRef) {
+            NJPiGpuNoteFailure("no-dm-tex", original);
+            break;
+        }
+        id<MTLCommandBuffer> commandBuffer = [NJPiGpuCommandQueue commandBuffer];
+        if (!commandBuffer) {
+            NJPiGpuNoteFailure("no-cb", original);
+            break;
+        }
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = CVMetalTextureGetTexture(targetTextureRef);
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            NJPiGpuNoteFailure("no-enc", original);
+            break;
+        }
+        [encoder setCullMode:MTLCullModeNone];
+        // Metal leaves no usable default viewport, so state it explicitly: both draws
+        // cover the whole target, which is the incoming frame's own size.
+        MTLViewport viewport = { 0.0, 0.0, (double)width, (double)height, 0.0, 1.0 };
+        [encoder setViewport:viewport];
+        [encoder setFragmentSamplerState:NJPiGpuSampler atIndex:0];
+        [encoder setFragmentBytes:matrix length:sizeof(matrix) atIndex:0];
+        // Pass 1: the decoded frame, converted to the BGRA target if it was YUV.
+        [encoder setRenderPipelineState:NJPiGpuPipelines[pipelineIndex]];
+        [encoder setFragmentTexture:CVMetalTextureGetTexture(sourcePlaneY) atIndex:0];
+        [encoder setFragmentTexture:yuv ? CVMetalTextureGetTexture(sourcePlaneUV) : nil atIndex:1];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        // Pass 2: the danmaku renderer's own output, source-over into the same target.
+        [encoder setRenderPipelineState:NJPiGpuPipelines[3]];
+        [encoder setFragmentTexture:CVMetalTextureGetTexture(danmakuTextureRef) atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        CVMetalTextureCacheFlush(NJPiGpuTextureCache, 0);
+        // The CoreVideo texture bridges must outlive the GPU work, so their
+        // references move to the command buffer's completion handler.
+        CFRetain(sourcePlaneY);
+        if (sourcePlaneUV) {
+            CFRetain(sourcePlaneUV);
+        }
+        CFRetain(targetTextureRef);
+        CFRetain(danmakuTextureRef);
+        submitted = YES;
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            CFRelease(sourcePlaneY);
+            if (sourcePlaneUV) {
+                CFRelease(sourcePlaneUV);
+            }
+            CFRelease(targetTextureRef);
+            CFRelease(danmakuTextureRef);
+        }];
+        [commandBuffer commit];
+        // Cost accounting for the wrap itself: the CPU side of the composite ends
+        // here, the GPU side is asynchronous and never blocks this thread.
+        double elapsedNs = NJPiGpuNanoseconds(mach_absolute_time() - startedAt);
+        if (elapsedNs > 0.0) {
+            NJPiGpuDurationNs += (unsigned long long)elapsedNs;
+            if ((unsigned long long)elapsedNs > NJPiGpuMaxDurationNs) {
+                NJPiGpuMaxDurationNs = (unsigned long long)elapsedNs;
+            }
+        }
+        // Timeline stays untouched: the timing and the per-sample attachments of the
+        // incoming sample are copied verbatim onto the wrapped one.
+        CMVideoFormatDescriptionRef formatDescription = NULL;
+        if (CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, targetImage, &formatDescription) != noErr
+            || !formatDescription) {
+            NJPiGpuNoteFailure("wrap", original);
+            break;
+        }
+        CMSampleTimingInfo timing = { kCMTimeInvalid, kCMTimeInvalid, kCMTimeInvalid };
+        if (CMSampleBufferGetSampleTimingInfo(original, 0, &timing) != noErr) {
+            timing.duration = CMSampleBufferGetDuration(original);
+            timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(original);
+            timing.decodeTimeStamp = kCMTimeInvalid;
+        }
+        OSStatus status = CMSampleBufferCreate(kCFAllocatorDefault, targetImage, true, NULL, NULL,
+                                              formatDescription, 1, 1, &timing, 0, NULL, &wrapped);
+        CFRelease(formatDescription);
+        if (status != noErr || !wrapped) {
+            NJPiGpuNoteFailure("wrap", original);
+            break;
+        }
+        CFArrayRef sourceAttachments = CMSampleBufferGetSampleAttachmentsArray(original, false);
+        if (sourceAttachments) {
+            CFArrayRef targetAttachments = CMSampleBufferGetSampleAttachmentsArray(wrapped, true);
+            CFIndex count = MIN(CFArrayGetCount(sourceAttachments), CFArrayGetCount(targetAttachments));
+            for (CFIndex index = 0; index < count; index++) {
+                CFMutableDictionaryRef target = (CFMutableDictionaryRef)CFArrayGetValueAtIndex(targetAttachments, index);
+                CFDictionaryRef source = (CFDictionaryRef)CFArrayGetValueAtIndex(sourceAttachments, index);
+                CFIndex keyCount = CFDictionaryGetCount(source);
+                if (keyCount <= 0 || keyCount > 32) {
+                    continue;
+                }
+                const void *keys[32];
+                const void *values[32];
+                CFDictionaryGetKeysAndValues(source, keys, values);
+                for (CFIndex key = 0; key < keyCount; key++) {
+                    CFDictionarySetValue(target, keys[key], values[key]);
+                }
+            }
+        }
+        wrappedObject = CFBridgingRelease(wrapped); // the create reference goes to ARC
+        wrapped = NULL;
+        // A ring of recent wrapped samples keeps the target pixel buffer alive for
+        // the display layer, which reads it asynchronously after we return.
+        NSUInteger slot = NJPiGpuRingNext;
+        NJPiGpuRingNext = (NJPiGpuRingNext + 1) % NJP_GPU_RING_COUNT;
+        if (NJPiGpuRing[slot]) {
+            CFRelease(NJPiGpuRing[slot]);
+        }
+        NJPiGpuRing[slot] = (CMSampleBufferRef)CFBridgingRetain(wrappedObject);
+        NJPiGpuOkFrames += 1;
+        NJPiGpuOkPixels += (unsigned long long)width * (unsigned long long)height;
+    } while (0);
+    if (!submitted) {
+        if (sourcePlaneY) {
+            CFRelease(sourcePlaneY);
+        }
+        if (sourcePlaneUV) {
+            CFRelease(sourcePlaneUV);
+        }
+        if (targetTextureRef) {
+            CFRelease(targetTextureRef);
+        }
+        if (danmakuTextureRef) {
+            CFRelease(danmakuTextureRef);
+        }
+    }
+    if (danmakuImage) {
+        CVPixelBufferRelease(danmakuImage);
+    }
+    if (targetImage) {
+        CVPixelBufferRelease(targetImage);
+    }
+    if (wrapped) {
+        CFRelease(wrapped);
+    }
+    if (!wrappedObject) {
+        return originalSampleObject;
+    }
+    return wrappedObject;
+}
+
+#pragma mark - GPU composite: PiP activity gate
+
+// Reuses the module's own PiP tracking instead of a second state machine: a path is
+// only allowed to touch frames while a PiP session this module knows about is live.
+static BOOL NJPiGpuPiPActive(void) {
+    NSArray<NJPiPOverlayState *> *overlayStates;
+    @synchronized (NJPiPOverlayStates()) {
+        overlayStates = [NJPiPOverlayStates() allObjects];
+    }
+    for (NJPiPOverlayState *state in overlayStates) {
+        AVPictureInPictureController *controller = state.controller;
+        if (controller && controller.pictureInPictureActive) {
+            return YES;
+        }
+    }
+    NSArray<NJPiPMirrorState *> *mirrorStates;
+    @synchronized (NJPiPMirrorStates()) {
+        mirrorStates = [NJPiPMirrorStates() allObjects];
+    }
+    for (NJPiPMirrorState *state in mirrorStates) {
+        AVPictureInPictureController *controller = state.controller;
+        if (state.isPresenting || (controller && controller.pictureInPictureActive)) {
+            return YES;
+        }
+    }
+    return NO;
+}
+
+// Whether `view` is the view whose layer is inside a tracked PiP content source.
+// Static analysis cannot pin down whether IJKSDLSampleBufferView's `_mLayer` is the
+// one handed to AVKit or an inline-playback-only sibling, so this is reported but
+// not required: both cases stay safe because the composite only happens while PiP
+// is active, and the log line names the instance addresses for a real device to
+// correlate with NJPipProbe.js's per-address counters.
+static const char *NJPiGpuPiPRole(id view) {
+    Class sbdlClass = AVSampleBufferDisplayLayer.class;
+    if (!sbdlClass) {
+        return "nolayer";
+    }
+    CALayer *layer = nil;
+    if ([view isKindOfClass:UIView.class]) {
+        layer = ((UIView *)view).layer;
+    }
+    if (!layer || ![layer isKindOfClass:sbdlClass]) {
+        return "not-sbdl";
+    }
+    NSArray<NJPiPOverlayState *> *states;
+    @synchronized (NJPiPOverlayStates()) {
+        states = [NJPiPOverlayStates() allObjects];
+    }
+    for (NJPiPOverlayState *state in states) {
+        if (state.officialLayer == layer) {
+            return "pip";
+        }
+    }
+    return "untracked";
+}
+
+#pragma mark - GPU composite: hook installation
+
+typedef void (*NJPiGpuEnqueueIMP)(id, SEL, id);
+static NJPiGpuEnqueueIMP NJPiGpuOriginalEnqueueSmapleBuffer = NULL;
+static NJPiGpuEnqueueIMP NJPiGpuOriginalEnqueueSampleBuffer = NULL;
+static unsigned long long NJPiGpuHookHits = 0;
+static unsigned long long NJPiGpuSkippedNotActive = 0;
+
+static void NJPiGpuTrampoline(id self, SEL _cmd, id sampleBuffer, BOOL primary) {
+    NJPiGpuHookHits += 1;
+    id enqueued = sampleBuffer;
+    // Two conditions, both required: this module's PiP session is live, and THIS
+    // instance is the one whose layer is inside the tracked PiP content source — the
+    // pump class is shared with inline playback (BFCPlayerSampleBufferView and
+    // IJKSampleBufferWrapView are subclasses of the same base), so the per-instance
+    // check is what keeps inline frames untouched.
+    const char *role = NJPiGpuPiPRole(self);
+    BOOL active = NJPiGpuPiPActive();
+    if (active && strcmp(role, "pip") == 0) {
+        enqueued = NJPiGpuComposite(sampleBuffer);
+    } else if (NJPiGpuSkippedNotActive < 5) {
+        NJPiGpuSkippedNotActive += 1;
+        CALayer *layer = [self isKindOfClass:UIView.class] ? ((UIView *)self).layer : nil;
+        NJPiPDiag("gpu skip n=%llu pip=%d role=%s self=%s layerClass=%s layerAddr=%p",
+                  NJPiGpuHookHits, (int)active, role, object_getClassName(self),
+                  layer ? NJPiPClassName(layer) : "-", layer);
+    }
+    NJPiGpuEnqueueIMP *storage = primary ? &NJPiGpuOriginalEnqueueSmapleBuffer
+                                         : &NJPiGpuOriginalEnqueueSampleBuffer;
+    if (*storage) {
+        (*storage)(self, _cmd, enqueued);
+    }
+}
+
+static void NJPiGpuHookedEnqueueSmapleBuffer(id self, SEL _cmd, id sampleBuffer) {
+    NJPiGpuTrampoline(self, _cmd, sampleBuffer, YES);
+}
+
+static void NJPiGpuHookedEnqueueSampleBuffer(id self, SEL _cmd, id sampleBuffer) {
+    NJPiGpuTrampoline(self, _cmd, sampleBuffer, NO);
+}
+
+// Only a method the class itself implements is replaced: an inherited one would
+// rewrite the superclass's implementation for every other user of it.
+static Method NJPiGpuOwnMethodNamed(Class cls, SEL selector) {
+    unsigned int count = 0;
+    Method *methods = class_copyMethodList(cls, &count);
+    Method found = NULL;
+    for (unsigned int index = 0; index < count; index++) {
+        if (sel_isEqual(method_getName(methods[index]), selector)) {
+            found = methods[index];
+            break;
+        }
+    }
+    free(methods);
+    return found;
+}
+
+static void NJPiGpuInstallHooks(void) {
+    // Static evidence (8.89 class dump, tmp/re89/objc-headers.txt):
+    //  - `IJKSDLSampleBufferView : UIView` at :1474401 declares
+    //    `- (void)enqueueSmapleBuffer:(id)arg0;` at :1474477 — that misspelling is the
+    //    only occurrence in the whole binary, and the class has no `enqueueSampleBuffer:`
+    //    of its own (it is a UIView, not a display layer: the pump reaches the layer
+    //    through its own `_mLayer`).
+    //  - `IJKSampleBufferWrapView : IJKSDLSampleBufferView` at :1472265 and
+    //    `BFCPlayerSampleBufferView : IJKSDLSampleBufferView` at :1467110 inherit it and
+    //    declare nothing, so replacing the base implementation covers every subclass and
+    //    hooks the same selector exactly once.
+    // Both spellings are probed so a renamed build keeps working.
+    const struct { const char *className; NSString *selectorName; } candidates[] = {
+        { "IJKSDLSampleBufferView", @"enqueueSmapleBuffer:" },
+        { "IJKSDLSampleBufferView", @"enqueueSampleBuffer:" },
+        { "IJKSampleBufferWrapView", @"enqueueSmapleBuffer:" },
+        { "IJKSampleBufferWrapView", @"enqueueSampleBuffer:" },
+    };
+    for (NSUInteger index = 0; index < sizeof(candidates) / sizeof(candidates[0]); index++) {
+        Class cls = objc_lookUpClass(candidates[index].className);
+        if (!cls) {
+            continue;
+        }
+        SEL selector = NSSelectorFromString(candidates[index].selectorName);
+        Method method = NJPiGpuOwnMethodNamed(cls, selector);
+        if (!method) {
+            continue;
+        }
+        IMP implementation = method_getImplementation(method);
+        if (!implementation) {
+            continue;
+        }
+        BOOL primary = [candidates[index].selectorName isEqualToString:@"enqueueSmapleBuffer:"];
+        NJPiGpuEnqueueIMP *storage = primary ? &NJPiGpuOriginalEnqueueSmapleBuffer
+                                             : &NJPiGpuOriginalEnqueueSampleBuffer;
+        if (*storage) {
+            continue; // already hooked on the other class
+        }
+        *storage = (NJPiGpuEnqueueIMP)implementation;
+        IMP replacement = primary ? (IMP)NJPiGpuHookedEnqueueSmapleBuffer
+                                  : (IMP)NJPiGpuHookedEnqueueSampleBuffer;
+        method_setImplementation(method, replacement);
+        NJPiPDiag("gpu hook cls=%s sel=%s orig=%p replaced=1",
+                  class_getName(cls), candidates[index].selectorName.UTF8String, *storage);
+    }
+    if (!NJPiGpuOriginalEnqueueSmapleBuffer && !NJPiGpuOriginalEnqueueSampleBuffer) {
+        NJPiPDiag("gpu hook none reason=no-enqueue-selector");
+    }
+}
+
+// 启动点在文件末尾的 %ctor 里（和 NJPiPDiagStart() 同一时刻），这样诊断通道、
+// 设置缓存的读取时机都与现有加载路径完全一致，不引入第二个 constructor。
+static void NJPiGpuStart(void) {
+    if (!NJPiPDanmakuEnabled()) {
+        NJPiPDiag("gpu load skipped feature-off");
+        return;
+    }
+    NJPiGpuStartSummary();
+    NJPiGpuInstallHooks();
+}
+
+#endif // NJ_PIP_GPU_COMPOSITE_ENABLED
 
 static void NJPiPDiagHeartbeat(void) {
     int applicationState = 0;
@@ -2949,6 +3934,13 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDiag("pip arch=native-layerinsert sha=%s (was: native-overlay; setMetaLayer: rejected: WMMetaLayer parameter)",
               NJ_PI_P_BUILD_SHA);
     NJPiPDiagStart();
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
+    // 第二条路径的启动点：与上面的插层路径互斥（插层在 attach 处让路），
+    // 只在编译期宏为 1 时存在；宏为 0 时这一行不存在，加载流程一字未改。
+    // 产物里是哪条路：`strings` 抓 "gpu-composite-enabled"（attach 让路的字面量）
+    // 或运行日志里的 "gpu hook cls=…" 即可判定，无需额外标记行。
+    NJPiGpuStart();
+#endif
     [[NSNotificationCenter defaultCenter] addObserverForName:UIApplicationWillEnterForegroundNotification
                                                      object:nil
                                                       queue:nil
