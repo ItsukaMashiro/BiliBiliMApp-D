@@ -2,6 +2,11 @@ name: Build unsigned IPA
 
 on:
   workflow_dispatch:
+    inputs:
+      gadget:
+        description: 'Diagnostic build: embed frida-gadget 17.24.3 + NJPipProbe.js and patch the main executable with an LC_LOAD_DYLIB for it'
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -81,6 +86,15 @@ jobs:
           test -d BiliBiliMD/bili-universal.app
           test -s BiliBiliMD/bili-universal.app/Frameworks/libellekit.dylib
 
+      - name: Generate build stamp header
+        run: |
+          # NJDetailPlayerAd.xm reads NJ_PI_P_BUILD_SHA via __has_include("NJBuildStamp.h")
+          # with a "local" fallback; the quoted include resolves next to the .xm, so
+          # generate the header there (CI-only, never committed).
+          printf '#define NJ_PI_P_BUILD_SHA "%s"\n' "${GITHUB_SHA:0:7}" \
+            > BiliBiliMDDylib/Logos/Detail/NJBuildStamp.h
+          cat BiliBiliMDDylib/Logos/Detail/NJBuildStamp.h
+
       - name: Build injected app
         run: |
           xcodebuild \
@@ -97,13 +111,19 @@ jobs:
             MONKEYDEV_ADD_SUBSTRATE=YES \
             build
 
-      - name: Package unsigned IPA
+      - name: Validate assembled app
         run: |
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
           test -d "$APP_PATH"
           APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
           test -n "$APP_EXECUTABLE"
           test -s "$APP_PATH/$APP_EXECUTABLE"
+
+          if [[ "${{ github.event.inputs.gadget }}" == "true" ]]; then
+            echo "IPA_ARTIFACT_NAME=BiliBiliMApp-D-gadget" >> "$GITHUB_ENV"
+          else
+            echo "IPA_ARTIFACT_NAME=BiliBiliMApp-D-unsigned" >> "$GITHUB_ENV"
+          fi
 
           # MonkeyDev's BSD cp invocation can leave the source bundle as a child
           # even after its contents have been copied into the built app. The outer
@@ -133,21 +153,81 @@ jobs:
             echo "Unexpected nested app bundle: $NESTED_APP" >&2
             exit 1
           fi
+
+      - name: Inject frida-gadget (diagnostic)
+        if: github.event.inputs.gadget == 'true'
+        run: |
+          set -euo pipefail
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
+          test -d "$APP_PATH"
+          APP_EXECUTABLE="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$APP_PATH/Info.plist")"
+          test -n "$APP_EXECUTABLE"
+          test -s "$APP_PATH/$APP_EXECUTABLE"
+
+          # 17.x publishes the iOS gadget only as ios-universal (fat: contains
+          # the arm64 device slice); there is no ios-arm64 asset.
+          curl --fail --location --retry 3 \
+            --output "$RUNNER_TEMP/frida-gadget.dylib.xz" \
+            "https://github.com/frida/frida/releases/download/17.24.3/frida-gadget-17.24.3-ios-universal.dylib.xz"
+          xz -d "$RUNNER_TEMP/frida-gadget.dylib.xz"
+          # 注入库一律放 .app/Frameworks/：这个包里已经三个注入库
+          # （libellekit / BilibiliVideoTools / libBiliBiliMDDylib）都在 Frameworks/ 下、
+          # 以 @executable_path/Frameworks/... 被加载，真机能起；而放 .app 根目录的
+          # FridaGadget.dylib 不在这条路径上，本地重签环节（按 .app/Frameworks/*.dylib
+          # 逐个签嵌套库）也不会覆盖它 —— 未签名的嵌套库在加载瞬间就被内核杀掉，
+          # 现象就是「一打开就闪退、设备日志一条都没有」（插件 %ctor 根本没跑到）。
+          # 另外 gadget 自身的 LC_ID 就是 @executable_path/Frameworks/FridaGadget.dylib
+          # （已用本机解析下载到的 17.24.3 ios-universal 确认），路径对齐它。
+          mkdir -p "$APP_PATH/Frameworks"
+          install -m 0755 "$RUNNER_TEMP/frida-gadget.dylib" "$APP_PATH/Frameworks/FridaGadget.dylib"
+          lipo -archs "$APP_PATH/Frameworks/FridaGadget.dylib" | grep -qw arm64
+
+          cat > "$APP_PATH/Frameworks/FridaGadget.config" <<'GADGETCFG'
+          {"interaction": {"type": "script", "path": "NJPipProbe.js"}}
+          GADGETCFG
+          test -s Tools/frida/NJPipProbe.js
+          install -m 0644 Tools/frida/NJPipProbe.js "$APP_PATH/Frameworks/NJPipProbe.js"
+
+          git clone --depth 1 https://github.com/tyilo/insert_dylib "$RUNNER_TEMP/insert_dylib"
+          # upstream keeps the single-file source at insert_dylib/main.c (C, not C++).
+          # current master has no --all-load-commands flag; its default appends the
+          # load command after the last one, which is the behavior we want.
+          # --all-yes/--strip-codesig keep it fully non-interactive.
+          test -s "$RUNNER_TEMP/insert_dylib/insert_dylib/main.c"
+          clang -O2 -o "$RUNNER_TEMP/insert_dylib_bin" \
+            "$RUNNER_TEMP/insert_dylib/insert_dylib/main.c"
+          "$RUNNER_TEMP/insert_dylib_bin" --all-yes --strip-codesig \
+            "@executable_path/Frameworks/FridaGadget.dylib" \
+            "$APP_PATH/$APP_EXECUTABLE" "$APP_PATH/$APP_EXECUTABLE.patched"
+          mv "$APP_PATH/$APP_EXECUTABLE.patched" "$APP_PATH/$APP_EXECUTABLE"
+          chmod 0755 "$APP_PATH/$APP_EXECUTABLE"
+
+          # Both injected libraries must be present as load commands.
+          otool -l "$APP_PATH/$APP_EXECUTABLE" | grep -A2 'cmd LC_LOAD_DYLIB' \
+            | grep -F 'name @executable_path/Frameworks/FridaGadget.dylib'
+          otool -l "$APP_PATH/$APP_EXECUTABLE" | grep -A2 'cmd LC_LOAD_DYLIB' \
+            | grep -F 'libBiliBiliMDDylib.dylib'
+
+      - name: Package unsigned IPA
+        run: |
+          APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
+          test -d "$APP_PATH"
+          test -n "$IPA_ARTIFACT_NAME"
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$APP_PATH" "$RUNNER_TEMP/ipa/Payload/BiliBiliMD.app"
           pushd "$RUNNER_TEMP/ipa"
-          zip -qry "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" Payload
+          zip -qry "$RUNNER_TEMP/${IPA_ARTIFACT_NAME}.ipa" Payload
           popd
-          IPA_SIZE_BYTES="$(stat -f '%z' "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa")"
+          IPA_SIZE_BYTES="$(stat -f '%z' "$RUNNER_TEMP/${IPA_ARTIFACT_NAME}.ipa")"
           echo "Unsigned IPA size: $IPA_SIZE_BYTES bytes"
           test "$IPA_SIZE_BYTES" -lt $((350 * 1024 * 1024))
           mkdir -p artifacts
-          cp "$RUNNER_TEMP/BiliBiliMApp-D-unsigned.ipa" artifacts/BiliBiliMApp-D-unsigned.ipa
+          cp "$RUNNER_TEMP/${IPA_ARTIFACT_NAME}.ipa" "artifacts/${IPA_ARTIFACT_NAME}.ipa"
 
       - name: Upload IPA
         uses: actions/upload-artifact@v4
         with:
-          name: BiliBiliMApp-D-unsigned
-          path: artifacts/BiliBiliMApp-D-unsigned.ipa
+          name: ${{ env.IPA_ARTIFACT_NAME }}
+          path: artifacts/${{ env.IPA_ARTIFACT_NAME }}.ipa
           if-no-files-found: error
           retention-days: 7
