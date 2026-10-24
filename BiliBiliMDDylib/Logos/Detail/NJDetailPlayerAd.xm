@@ -2490,7 +2490,7 @@ static void NJPiGpuDriveChronos(id wrapper) {
     if (!implementation) {
         return;
     }
-    if (NJPiGpuTimebase.den == 0) {
+    if (NJPiGpuTimebase.denom == 0) {
         mach_timebase_info(&NJPiGpuTimebase);
     }
     static __unsafe_unretained id drivenWrapper = nil;
@@ -3924,17 +3924,22 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 // 它想做的「拿到 vout 对象时登记」也就从来没发生过。这里改成登记在它真正发生的时刻：
 // -setupRenderer: 是把 BFCChronosRendererWrapper 装进 _rendererWrapper 的地方。
 // 在线路径不依赖这里（走上面的对象图），这里只给录制/下载那条 fallback 用。
-// 整块包在开关里：GPU 合成关掉时连这个 hook 都不安装，保持默认配置零行为变化。
-#if NJ_PIP_GPU_COMPOSITE_ENABLED
+//
+// 注意：`%hook` 不能整块包在 `#if` 里——logos 在 C 预处理之前就展开 `%hook`，
+// 生成的 ctor 仍然会引用 `_logos_method$…$setupRenderer$`，而函数定义被预处理裁掉，
+// 结果是 `-Wundefined-internal` + 链接失败（run 40053204709 就是这么挂的）。
+// 正确写法跟本文件上面 `-[BBPlayerDanmakuService initWithContext:]` 一致：
+// hook 常驻，只把**函数体里的那一句**包进开关；GPU 合成关掉时这里只剩 %orig 透传。
 %hook BBPlayerDanmakuVoutView
 
 - (void)setupRenderer:(id)renderer {
     %orig;
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
     NJPiGpuRememberDanmakuVout(self);
+#endif
 }
 
 %end
-#endif
 
 // Bilibili 8.89 can enqueue through either the display layer compatibility API
 // or its iOS 17+ renderer.  A thread-local depth guard ensures one mirror enqueue
