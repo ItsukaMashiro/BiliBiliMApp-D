@@ -4212,11 +4212,14 @@ static CALayer *NJPiMxDestinationLayer(id view) {
     if (!view) {
         return nil;
     }
-    void *ivarValue = NULL;
-    // 注意：现代 objc4 的 object_getInstanceVariable 成功时返回 Ivar 指针、失败返回
-    // NULL（文档里的 Ivar_OK 是老 GNU runtime 的枚举，头文件里没有这个名字）。
-    if (object_getInstanceVariable(view, "_mLayer", &ivarValue) != NULL && ivarValue) {
-        return (__bridge CALayer *)ivarValue;
+    // ARC 下 object_getInstanceVariable 被标记 unavailable（run 40069206216），
+    // 唯一可用组合是 class_getInstanceVariable + object_getIvar。
+    Ivar mLayerIvar = class_getInstanceVariable(object_getClass(view), "_mLayer");
+    if (mLayerIvar) {
+        id ivarValue = object_getIvar(view, mLayerIvar);
+        if ([ivarValue isKindOfClass:CALayer.class]) {
+            return (CALayer *)ivarValue;
+        }
     }
     SEL getter = sel_registerName("getSampleBufferLayer");
     if ([view respondsToSelector:getter]) {
@@ -4236,7 +4239,7 @@ static CALayer *NJPiMxDestinationLayer(id view) {
 }
 
 // 登记表里第一个（通常也是唯一一个）官方 PiP 层；顺带回答 needle 是否命中。
-static CALayer *NJPiMxTrackedPiPLayer(const void *needle, BOOL *matched) {
+static CALayer *NJPiMxTrackedPiPLayer(CALayer *needle, BOOL *matched) {
     CALayer *first = nil;
     *matched = NO;
     NSArray<NJPiPOverlayState *> *states;
@@ -4251,7 +4254,7 @@ static CALayer *NJPiMxTrackedPiPLayer(const void *needle, BOOL *matched) {
         if (!first) {
             first = official;
         }
-        if (needle && (const void *)official == (const void *)needle) {
+        if (needle && official == needle) {
             *matched = YES;
         }
     }
