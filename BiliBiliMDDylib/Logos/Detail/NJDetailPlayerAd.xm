@@ -170,6 +170,18 @@
  本宏为 1 时 GPU 路在 NJPiGpuStart 处让路、插层路在 attachDanmakuToOfficialLayer 处让路。
  实现体在下面的 `#pragma mark - Mixed offscreen`（文件后半部分），
  打开方式：把这里的 0 改成 1，或编译期 -DNJ_PIP_MIXED_OFFSCREEN_ENABLED=1。
+ 真机可观测性（第二轮加入，改动都在这条路的开关内）：
+ - 闸门只认权威来源，按权威度排序：我们挂在官方 controller 上的 delegate 代理收到
+   的 didStart/didStop（controller-callback）→ controller.pictureInPictureActive 属性
+   （layer-probe）→ mirror 路接管 contentSource 留下的 isPresenting（contentsource）。
+   判定每次变化打一行 `mx gate pip=0/1 src=…`，不发明任何推断。
+ - 每个被 hook 的实例解析它真正投递的 SBDL（ivar _mLayer；真机证明它不是 view.layer），
+   与登记的官方 PiP 层比对，打 `mx src self=类@地址 dst=… pipLayer=… match=0/1`；
+   role 取值 = pip-layer / inapp-layer / shared / unknown（确证语义见
+   Tools/Analysis/pip-sbdl-topology-2026-10-24.md）。
+ - mx sum 周期 30s→5s；同 reason 静默上限 5→20；PiP didStop / SBManager /
+   PlayerContainer / controller dealloc 时强制摘要+落盘（真机会话只有 ~9s，周期
+   等不到）。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 0
@@ -231,6 +243,12 @@ static NSMutableData *NJPiPDiagBuffer(void) {
 }
 
 static void NJPiPDiagFlushLocked(void);
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+// 定义在下面 Mixed offscreen 区：先把当前窗口的 mx sum 追加进缓冲，再把缓冲整体
+// 落盘（含局域网上传）。PiP didStop / SBManager / PlayerContainer / controller
+// dealloc 处调用；宏为 0 时这些调用点不存在（它们各自包在同一开关里）。
+static void NJPiMxFlushNow(void);
+#endif
 #if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 // 定义在下面（要用 NJPiPDiag 写失败诊断）。两处调用都是 fire-and-forget，
 // 调用方不等待网络，也不看返回值。
@@ -1552,6 +1570,9 @@ static const void *NJPiPOverlayStateKey = &NJPiPOverlayStateKey;
 @property (nonatomic, weak) AVPictureInPictureController *controller;
 @property (nonatomic, weak, nullable) AVSampleBufferDisplayLayer *officialLayer;
 @property (nonatomic, strong) NJPiPOverlayDelegateProxy *delegateProxy;
+// didStart/didStop 是系统经我们挂在官方 controller 上的 delegate 代理发来的确证
+// 事件（不是推断）。混合路闸门的最高权威来源，见 NJPiMxPiPActive。
+@property (atomic, assign) BOOL pipStartedByCallback;
 @property (nonatomic, strong, nullable) UIView *danmakuView;
 @property (atomic, assign, getter=isAttached) BOOL attached;
 // view-carried insertion (preferred when the official layer has a backing view)
@@ -1848,6 +1869,8 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
               (int)controller.pictureInPictureActive,
               (int)controller.pictureInPicturePossible,
               (int)self.state.isAttached);
+    // 系统确认 PiP 正在跑——闸门的权威事件，只记录不推断。
+    self.state.pipStartedByCallback = YES;
     if (self.state && !self.state.isAttached) {
         NJPiPDiag("ov retry@didStart");
         [self.state attachDanmakuToOfficialLayer];
@@ -1860,6 +1883,7 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
 - (void)pictureInPictureController:(AVPictureInPictureController *)controller
  failedToStartPictureInPictureWithError:(NSError *)error {
     NJPiPDiag("ov failed domain=%s code=%ld", error.domain.UTF8String, (long)error.code);
+    self.state.pipStartedByCallback = NO;
     [self.state restoreDanmaku];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureController:controller
@@ -1876,6 +1900,11 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
     NJPiPDiag("ov didStop");
+    self.state.pipStartedByCallback = NO;
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    // 真机第一轮就是栽在短会话：9 秒的 PiP，30s 的摘要周期永远不会触发。
+    NJPiMxFlushNow();
+#endif
     [self.state restoreDanmaku];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -3203,8 +3232,10 @@ static const char *NJPiMxFourcc(OSType format) {
     return buffer;
 }
 
-// Per-reason failure accounting: at most 5 lines per reason, then silence
-// (same discipline as the GPU path so one broken stream cannot flood the log).
+// Per-reason failure accounting: at most 20 lines per reason, then silence
+// (same discipline as the GPU path so one broken stream cannot flood the log;
+// 20 not 5 because the first real capture exhausted the old cap before PiP
+// even started, hiding everything that came after backgrounding).
 #define NJP_MX_MAX_REASONS 16
 static const char *NJPiMxReasonNames[NJP_MX_MAX_REASONS];
 static unsigned long long NJPiMxReasonHits[NJP_MX_MAX_REASONS];
@@ -3236,7 +3267,7 @@ static void NJPiMxNoteFailure(const char *reason, CMSampleBufferRef sampleBuffer
         }
     }
     NJPiMxReasonHits[slot] += 1;
-    if (NJPiMxReasonHits[slot] <= 5) {
+    if (NJPiMxReasonHits[slot] <= 20) {
         CVImageBufferRef imageBuffer = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
         NJPiPDiag("mx fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu route=%lu",
                   reason,
@@ -3252,7 +3283,9 @@ static void NJPiMxNoteFailure(const char *reason, CMSampleBufferRef sampleBuffer
 // Cost accounting: win = frames that entered the composite while PiP was live,
 // out = frames produced, ms = average CPU-side cost per produced frame (GPU work
 // is async and never blocks this thread, exactly like the GPU path). Summarised
-// every 30s; quiet when nothing happened in the window.
+// every 5s (down from 30s: the first device session lasted ~9s and never hit a
+// period), plus a forced tick from NJPiMxFlushNow at PiP stop / teardown; quiet
+// when nothing happened in the window.
 static unsigned long long NJPiMxEnteredFrames = 0;
 static unsigned long long NJPiMxOkFrames = 0;
 static unsigned long long NJPiMxDurationNs = 0;
@@ -3327,8 +3360,8 @@ static void NJPiMxStartSummary(void) {
             NJPiMxSummaryTick();
         });
         dispatch_source_set_timer(timer,
-                                  dispatch_time(DISPATCH_TIME_NOW, 30 * NSEC_PER_SEC),
-                                  30 * NSEC_PER_SEC,
+                                  dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC),
+                                  5 * NSEC_PER_SEC,
                                   NSEC_PER_SEC);
         dispatch_resume(timer);
     });
@@ -4114,20 +4147,42 @@ static id NJPiMxComposite(id originalSampleObject) {
     return wrapped;
 }
 
-#pragma mark - Mixed offscreen: PiP activity gate
+#pragma mark - Mixed offscreen: PiP activity gate (authoritative sources only)
 
-// Same two-condition gate as the GPU path (module-tracked PiP live + this instance
-// is the one inside the tracked content source), written against the module's own
-// tracking, no second state machine.
-static BOOL NJPiMxPiPActive(void) {
+// 真机第一轮暴露的缺陷：插层路已经通过 ov state 行确证了 controller 和官方
+// content source 都在，混合路却只用属性探测，并在日志里只报 pip=0 不报依据。
+// 现在按权威度排序，且来源名原样进日志（mx gate 行），错了能看出来：
+// 1) controller-callback：我们挂在官方 controller 上的 delegate 代理收到过
+//    pictureInPictureControllerDidStartPictureInPicture:（didStop/failedToStart 清掉）。
+//    这是系统发出的事件，不是推断；ov didStart 行早已证明这条观测通路是通的。
+// 2) layer-probe：controller.pictureInPictureActive 属性（系统状态直读，作为兜底）。
+// 3) contentsource：mirror 路在 PiP 中接管 contentSource 时留下的 isPresenting
+//    （adoptContentSourceDuringPictureInPicture），证明 PiP 正在用我们的源，
+//    但事件时序不如 1)。
+// 没有第四种推断：三个来源全部是已解析的官方对象/官方回调。
+typedef struct { BOOL active; const char *source; } NJPiMxGate;
+
+static NJPiMxGate NJPiMxMakeGate(BOOL active, const char *source) {
+    NJPiMxGate gate;
+    gate.active = active;
+    gate.source = source;
+    return gate;
+}
+
+static NJPiMxGate NJPiMxPiPActive(void) {
     NSArray<NJPiPOverlayState *> *overlayStates;
     @synchronized (NJPiPOverlayStates()) {
         overlayStates = [NJPiPOverlayStates() allObjects];
     }
     for (NJPiPOverlayState *state in overlayStates) {
+        if (state.pipStartedByCallback) {
+            return NJPiMxMakeGate(YES, "controller-callback");
+        }
+    }
+    for (NJPiPOverlayState *state in overlayStates) {
         AVPictureInPictureController *controller = state.controller;
         if (controller && controller.pictureInPictureActive) {
-            return YES;
+            return NJPiMxMakeGate(YES, "layer-probe");
         }
     }
     NSArray<NJPiPMirrorState *> *mirrorStates;
@@ -4135,36 +4190,123 @@ static BOOL NJPiMxPiPActive(void) {
         mirrorStates = [NJPiPMirrorStates() allObjects];
     }
     for (NJPiPMirrorState *state in mirrorStates) {
+        if (state.isPresenting) {
+            return NJPiMxMakeGate(YES, "contentsource");
+        }
         AVPictureInPictureController *controller = state.controller;
-        if (state.isPresenting || (controller && controller.pictureInPictureActive)) {
-            return YES;
+        if (controller && controller.pictureInPictureActive) {
+            return NJPiMxMakeGate(YES, "layer-probe");
         }
     }
-    return NO;
+    return NJPiMxMakeGate(NO, "none");
 }
 
-static const char *NJPiMxPiPRole(id view) {
-    Class sbdlClass = AVSampleBufferDisplayLayer.class;
-    if (!sbdlClass) {
-        return "nolayer";
+// 真机第一轮的第二个缺陷：role 用 view.layer 与官方层比对，出现
+// layerAddr=0x1163e2680 与 ov state 的 layer=0x3149a2900 对不上的假象——
+// enqueue 真正投递的目标是 ivar _mLayer（8.89 转储 :1474401；-
+// [IJKSDLSampleBufferView enqueueSmapleBuffer:]@0x114df692c 的 bl 目标就是它，
+// 见 Tools/Analysis/pip-sbdl-topology-2026-10-24.md），不是 view.layer。
+// 这里解析的就是那个目标层，并与登记表 NJPiPOverlayState.officialLayer
+// （contentSource.sampleBufferDisplayLayer 的权威来源）比对。
+static CALayer *NJPiMxDestinationLayer(id view) {
+    if (!view) {
+        return nil;
     }
-    CALayer *layer = nil;
+    void *ivarValue = NULL;
+    // 注意：现代 objc4 的 object_getInstanceVariable 成功时返回 Ivar 指针、失败返回
+    // NULL（文档里的 Ivar_OK 是老 GNU runtime 的枚举，头文件里没有这个名字）。
+    if (object_getInstanceVariable(view, "_mLayer", &ivarValue) != NULL && ivarValue) {
+        return (__bridge CALayer *)ivarValue;
+    }
+    SEL getter = sel_registerName("getSampleBufferLayer");
+    if ([view respondsToSelector:getter]) {
+        IMP implementation = [view methodForSelector:getter];
+        id value = implementation ? ((id (*)(id, SEL))implementation)(view, getter) : nil;
+        if (value) {
+            return (CALayer *)value;
+        }
+    }
     if ([view isKindOfClass:UIView.class]) {
-        layer = ((UIView *)view).layer;
+        CALayer *layer = ((UIView *)view).layer;
+        if ([layer isKindOfClass:AVSampleBufferDisplayLayer.class]) {
+            return layer;
+        }
     }
-    if (!layer || ![layer isKindOfClass:sbdlClass]) {
-        return "not-sbdl";
-    }
+    return nil;
+}
+
+// 登记表里第一个（通常也是唯一一个）官方 PiP 层；顺带回答 needle 是否命中。
+static CALayer *NJPiMxTrackedPiPLayer(const void *needle, BOOL *matched) {
+    CALayer *first = nil;
+    *matched = NO;
     NSArray<NJPiPOverlayState *> *states;
     @synchronized (NJPiPOverlayStates()) {
         states = [NJPiPOverlayStates() allObjects];
     }
     for (NJPiPOverlayState *state in states) {
-        if (state.officialLayer == layer) {
-            return "pip";
+        CALayer *official = state.officialLayer;
+        if (!official) {
+            continue;
+        }
+        if (!first) {
+            first = official;
+        }
+        if (needle && (const void *)official == (const void *)needle) {
+            *matched = YES;
         }
     }
-    return "untracked";
+    return first;
+}
+
+// 只有这四种，全是确证语义（拓扑报告同上文件）：
+// pip-layer = 目标层就是官方 PiP 层，且本视图不在任何窗口里（离屏供帧视图）；
+// shared    = 同一个 SBDL 既挂在窗口里又被 content source 引用；
+// inapp-layer = 目标层在窗口里但不是 PiP 层（正常 in-app 供帧，合成应跳过）；
+// unknown   = 解析不出目标层 / 层不在窗口里也不是 PiP 层（等运行时再归类）。
+static const char *NJPiMxRoleFor(id view, CALayer *destination, BOOL matchedPiP) {
+    if (!destination) {
+        return "unknown";
+    }
+    BOOL inWindow = ([view isKindOfClass:UIView.class] && [(UIView *)view window] != nil);
+    if (matchedPiP) {
+        return inWindow ? "shared" : "pip-layer";
+    }
+    return inWindow ? "inapp-layer" : "unknown";
+}
+
+// 每实例只在「目标层首次出现 / 发生变化」时打一行 mx src，总量封顶。
+// dst= 是真正被 enqueue 的 SBDL；pipLayer= 是登记到的官方层（0x0=还没登记）；
+// match= 是两者指针比对。低 1 位借用指针对齐存放 match，变化即重打。
+static NSMapTable *NJPiMxSrcMemo(void) {
+    static NSMapTable *memo = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        memo = [NSMapTable mapTableWithKeyOptions:NSMapTableWeakMemory
+                                     valueOptions:NSMapTableStrongMemory];
+    });
+    return memo;
+}
+static unsigned long long NJPiMxSrcLines = 0;
+
+static void NJPiMxNoteSource(id view, CALayer *destination, BOOL matched, const char *role) {
+    uintptr_t packed = ((uintptr_t)destination & ~(uintptr_t)1) | (uintptr_t)(matched ? 1 : 0);
+    NSNumber *previous = nil;
+    @synchronized (NJPiMxSrcMemo()) {
+        previous = [NJPiMxSrcMemo() objectForKey:view];
+        if (previous && previous.unsignedLongLongValue == packed) {
+            return;
+        }
+        [NJPiMxSrcMemo() setObject:@(packed) forKey:view];
+    }
+    if (NJPiMxSrcLines >= 12) {
+        return;
+    }
+    NJPiMxSrcLines += 1;
+    CALayer *pipLayer = NJPiMxTrackedPiPLayer(destination, &matched);
+    NJPiPDiag("mx src self=%s@%p dst=%p dstcls=%s pipLayer=%p match=%d role=%s",
+              object_getClassName(view), view, destination,
+              destination ? NJPiPClassName(destination) : "-",
+              pipLayer, (int)matched, role);
 }
 
 #pragma mark - Mixed offscreen: hook installation
@@ -4178,18 +4320,33 @@ static unsigned long long NJPiMxSkippedLogged = 0;
 static void NJPiMxTrampoline(id self, SEL _cmd, id sampleBuffer, BOOL primary) {
     NJPiMxHookHits += 1;
     id enqueued = sampleBuffer;
-    const char *role = NJPiMxPiPRole(self);
-    BOOL active = NJPiMxPiPActive();
-    if (active && strcmp(role, "pip") == 0) {
+    CALayer *destination = NJPiMxDestinationLayer(self);
+    BOOL matchedPiP = NO;
+    (void)NJPiMxTrackedPiPLayer(destination, &matchedPiP);
+    const char *role = NJPiMxRoleFor(self, destination, matchedPiP);
+    NJPiMxNoteSource(self, destination, matchedPiP, role);
+    NJPiMxGate gate = NJPiMxPiPActive();
+    // 闸门结论每次变化打一行（含首次），判定本身可审计。
+    static BOOL lastGateActive = NO;
+    static NSString *lastGateSource = nil;
+    if (gate.active != lastGateActive || ![lastGateSource isEqualToString:@(gate.source)]) {
+        lastGateActive = gate.active;
+        lastGateSource = @(gate.source);
+        NJPiPDiag("mx gate pip=%d src=%s", (int)gate.active, gate.source);
+    }
+    BOOL composited = NO;
+    if (gate.active && (strcmp(role, "pip-layer") == 0 || strcmp(role, "shared") == 0)) {
+        composited = YES;
         enqueued = NJPiMxComposite(sampleBuffer);
-    } else if (NJPiMxSkippedLogged < 5) {
+    }
+    // 上限 5→20：第一轮 5 条配额在进后台之前就烧光了，PiP 期间一条没留。
+    if (!composited && NJPiMxSkippedLogged < 20) {
         NJPiMxSkippedLogged += 1;
-        CALayer *layer = [self isKindOfClass:UIView.class] ? ((UIView *)self).layer : nil;
-        NJPiPDiag("mx skip n=%llu reason=%s pip=%d role=%s self=%s layerClass=%s layerAddr=%p",
+        NJPiPDiag("mx skip n=%llu reason=%s pip=%d gsrc=%s role=%s self=%s dst=%p",
                   NJPiMxHookHits,
-                  active ? "role-not-pip" : "pip-inactive",
-                  (int)active, role, object_getClassName(self),
-                  layer ? NJPiPClassName(layer) : "-", layer);
+                  gate.active ? "role-not-pip" : "pip-inactive",
+                  (int)gate.active, gate.source, role,
+                  object_getClassName(self), destination);
     }
     NJPiMxEnqueueIMP *storage = primary ? &NJPiMxOriginalEnqueueSmapleBuffer
                                         : &NJPiMxOriginalEnqueueSampleBuffer;
@@ -4269,6 +4426,16 @@ static void NJPiMxStart(void) {
     }
     NJPiMxStartSummary();
     NJPiMxInstallHooks();
+}
+
+// PiP didStop / SBManager / PlayerContainer / AVPictureInPictureController dealloc
+// 处调用：先把这个窗口的 mx sum 追加进缓冲，再把缓冲整体落盘（含局域网上传）。
+// 真机第一轮会话只有 ~9s，30s 周期永远打不出来——现在 5s 一次 + 结束时强制一次。
+static void NJPiMxFlushNow(void) {
+    dispatch_async(NJPiPDiagQueue(), ^{
+        NJPiMxSummaryTick();
+        NJPiPDiagFlushLocked();
+    });
 }
 
 #endif // NJ_PIP_MIXED_OFFSCREEN_ENABLED
@@ -5045,6 +5212,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
                      "[NJPiPTrace] SBManager dealloc self=%p status=%ld",
                      self, (long)[self pictureInPictureStatus]);
     NJPiPDiag("sbg dealloc");
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMxFlushNow();
+#endif
     %orig;
 }
 
@@ -5085,6 +5255,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)dealloc {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] PlayerContainer dealloc self=%p", self);
+    NJPiPDiag("sbgc dealloc");
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMxFlushNow();
+#endif
     %orig;
 }
 
@@ -5295,6 +5469,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (void)dealloc {
     NJPiPDiag("pip dealloc");
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMxFlushNow();
+#endif
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
     [overlayState invalidate];
     objc_setAssociatedObject(self, NJPiPOverlayStateKey, nil, OBJC_ASSOCIATION_ASSIGN);
