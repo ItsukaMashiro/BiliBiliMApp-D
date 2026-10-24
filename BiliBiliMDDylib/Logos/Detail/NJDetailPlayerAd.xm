@@ -248,6 +248,10 @@ static void NJPiPDiagFlushLocked(void);
 // 落盘（含局域网上传）。PiP didStop / SBManager / PlayerContainer / controller
 // dealloc 处调用；宏为 0 时这些调用点不存在（它们各自包在同一开关里）。
 static void NJPiMxFlushNow(void);
+// 定义在下面 capture 区：teardown（didStop / sbg / sbgc / pip dealloc）清掉捕获的
+// cron 视图实例，避免把已释放实例带进下一次会话。
+static void NJPiMxForgetCapturedViews(const char *why);
+static id NJPiMCapturedView(void);
 #endif
 #if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 // 定义在下面（要用 NJPiPDiag 写失败诊断）。两处调用都是 fire-and-forget，
@@ -1904,6 +1908,8 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     // 真机第一轮就是栽在短会话：9 秒的 PiP，30s 的摘要周期永远不会触发。
     NJPiMxFlushNow();
+    // PiP 停止后主播放器路径可能重建视图：清掉捕获实例，下一段由视图自己的方法重新捕获。
+    NJPiMxForgetCapturedViews("didStop");
 #endif
     [self.state restoreDanmaku];
     if ([self.downstream respondsToSelector:_cmd]) {
@@ -3214,6 +3220,10 @@ static id<MTLSamplerState> NJPiMxSampler = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineCopy = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineBlend = nil;
 static const char *NJPiMxSetupFailure = NULL;
+// mx fail 行附带最近一次确证过的视图类名（真机第二轮只有 no_tex/no_img，没有依据判断
+// 失败落在哪个实例上）；NJPiMxLastPLQ 记录上一帧选用的 pipeline（own/view），进 mx sum。
+static const char *NJPiMxFailViewClass = "-";
+static const char *NJPiMxLastPLQ = "-";
 
 // Ring of in-flight wraps: same lifetime contract as the GPU path — the display
 // layer releases the wrapped sample at an arbitrary later time, so the pool
@@ -3249,7 +3259,7 @@ static void NJPiMxRegisterReasons(void) {
     // 其余是实现内部原因，报告里会原样列出。
     const char *reasons[] = { "no_view", "no_tex", "no_pool", "fmt",
                               "no_metal", "no_img", "no_pb", "no_texref",
-                              "no_cb", "no_enc", "wrap", "other" };
+                              "no_cb", "no_enc", "no_ivar", "wrap", "other" };
     for (NSUInteger index = 0; index < NJP_MX_MAX_REASONS; index++) {
         NJPiMxReasonNames[index] = index < sizeof(reasons) / sizeof(reasons[0])
                                      ? reasons[index] : NULL;
@@ -3269,14 +3279,15 @@ static void NJPiMxNoteFailure(const char *reason, CMSampleBufferRef sampleBuffer
     NJPiMxReasonHits[slot] += 1;
     if (NJPiMxReasonHits[slot] <= 20) {
         CVImageBufferRef imageBuffer = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
-        NJPiPDiag("mx fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu route=%lu",
+        NJPiPDiag("mx fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu route=%lu cls=%s",
                   reason,
                   NJPiMxReasonHits[slot],
                   imageBuffer ? 1 : 0,
                   imageBuffer ? NJPiMxFourcc(CVPixelBufferGetPixelFormatType(imageBuffer)) : "-",
                   imageBuffer ? (unsigned long)CVPixelBufferGetWidth(imageBuffer) : 0,
                   imageBuffer ? (unsigned long)CVPixelBufferGetHeight(imageBuffer) : 0,
-                  (unsigned long)NJPiMxRoute);
+                  (unsigned long)NJPiMxRoute,
+                  NJPiMxFailViewClass);
     }
 }
 
@@ -3341,11 +3352,15 @@ static void NJPiMxSummaryTick(void) {
     static const char *routeNames[] = { "none", "pass", "image" };
     const char *routeName = NJPiMxRoute < sizeof(routeNames) / sizeof(routeNames[0])
                                     ? routeNames[NJPiMxRoute] : "?";
+    // setup=ok 曾误导（它不反映视图实例）：现在直接报 view=0/1（是否已从视图自己的
+    // 方法捕获到实例）与 plq=（上一帧选用的 pipeline）。
     NJPiPDiag("mx sum win=%llu out=%llu fail=%llu ms=%.2f msmax=%.2f route=%s "
-              "exchg=%llu rendchg=%llu setup=%s fails=%s",
+              "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s fails=%s",
               inDelta, okDelta, failTotal, avgMilliseconds, maxMilliseconds, routeName,
               NJPiMxExtChanges, NJPiMxRendChanges,
-              NJPiMxSetupFailure ?: "ok", counts.UTF8String ?: "-");
+              NJPiMxSetupFailure ?: "ok",
+              NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ,
+              counts.UTF8String ?: "-");
     NJPiMxMaxDurationNs = 0;
     NJPiMxDurationNs = 0;
 }
@@ -3424,6 +3439,16 @@ static void NJPiMxRememberDanmakuService(id service) {
 // 找到正在播放的 cron 视图；把它的真实类名带出来（V1/V2 由 Memex AB
 // v8.27.player.enable_mixed_render_main_thread 决定，只能运行时确认）。
 static id NJPiMxFindCronView(const char **viewClass) {
+    // 优先用「挂视图自己的方法」捕获的实例（被调过 = 存在性有直接证据）；没有才退回
+    // 对象链——链上的实例不保证正在被供帧（真机第二轮 no_tex/no_img 的教训，见 capture 区）。
+    id captured = NJPiMCapturedView();
+    if (captured) {
+        if (viewClass) {
+            *viewClass = object_getClassName(captured);
+        }
+        NJPiMxFailViewClass = *viewClass;
+        return captured;
+    }
     NSArray *services;
     @synchronized (NJPiMxDanmakuServices()) {
         services = [NJPiMxDanmakuServices() allObjects];
@@ -3444,6 +3469,7 @@ static id NJPiMxFindCronView(const char **viewClass) {
         if (viewClass) {
             *viewClass = object_getClassName(renderView);
         }
+        NJPiMxFailViewClass = *viewClass;
         return renderView;
     }
     return nil;
@@ -3563,6 +3589,134 @@ static id<MTLTexture> NJPiMxViewTexture(id view, NSString *ivarName) {
         return nil;
     }
     return (id<MTLTexture>)value;
+}
+
+// ── 用「挂视图自己的方法」捕获实例 ────────────────────────────────────────
+// 真机第二轮（包 80135d6）确证：对象链能拿到一个视图实例（fails 里只有 no_tex=634/
+// no_img=634，没有 no_view），但它的两张贴图永远为 nil——很可能拿到的是隐藏主播放器
+// 的闲置实例，不是正在被供帧的那个。所以这里改抓法：挂视图自己必然被调的方法抓 self，
+// 方法归属按 8.89 头转储（tmp/re89/objc-headers.txt）：基类 BFCCRONRenderBaseView 只有
+// -updateGpuState；-setExternalPixelBuffer:（V1 参数 BFCCRONPixelBuffer*、V2 为 id）与
+// -_updateSyncForTimeStep: 在 V1/V2 各自实现。证据强度分档：setExternalPixelBuffer:
+// 被调 = 该实例正在被喂视频帧（最高）；updateGpuState 次之（PiP 后台 display link 会
+// 被暂停）；_updateSyncForTimeStep: 最弱（我们自己的自驱也会触发，只说明实例可用）。
+// 热路径纪律：方法体里只做一次指针比较，相等立即返回；首次见到某实例才做一次 ivar
+// 探测（封顶 3 次）并打一行 mx view。实例只持一个强引用，didStop / sbg / sbgc /
+// pip dealloc 清空（NJPiMxForgetCapturedViews），不保留已释放实例。
+static id NJPiMCapturedViewInstance = nil;
+static const char *NJPiMCapturedVia = NULL;
+static void *NJPiMSeenViews[4];          // 只存指针做去重比较，永不解引用
+static NSUInteger NJPiMSeenCount = 0;
+static NSUInteger NJPiMCaptureLogs = 0;
+
+static id NJPiMCapturedView(void) {
+    return NJPiMCapturedViewInstance;
+}
+
+static void NJPiMxForgetCapturedViews(const char *why) {
+    if (!NJPiMCapturedViewInstance) {
+        return;
+    }
+    NJPiPDiag("mx view forget why=%s cls=%s addr=%p", why,
+              object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
+    NJPiMCapturedViewInstance = nil;
+    NJPiMCapturedVia = NULL;
+}
+
+// ivar 在不在实例的类链上（只查类结构，不读值、不分配）。
+static BOOL NJPiMIvarPresent(id view, const char *name) {
+    Class cls = view ? [view class] : Nil;
+    while (cls && cls != [UIView class]) {
+        if (class_getInstanceVariable(cls, name)) {
+            return YES;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return NO;
+}
+
+static BOOL NJPiMViewHasTextureIvars(id view) {
+    return NJPiMIvarPresent(view, "_externalTexture") || NJPiMIvarPresent(view, "_rendererTexture");
+}
+
+// 首次捕获 / 换实例 / 取帧失败时各一次（封顶 3 行）：把「ivar 在不在、值是否非空、
+// 方法在不在」直接打出来，回答该换哪条取帧路。字段名沿用既有约定。
+static void NJPiMProbeViewObjects(id view, const char *why) {
+    static NSUInteger probes = 0;
+    if (!view || probes >= 3) {
+        return;
+    }
+    probes += 1;
+    struct NJPiMxMetalObjects metal = { nil, nil, nil, nil, nil, nil, nil, nil };
+    NJPiMxDiscoverMetal(view, &metal);
+    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d",
+              why, object_getClassName(view), view,
+              NJPiMxViewTexture(view, @"_externalTexture") ? 1 : 0,
+              NJPiMxViewTexture(view, @"_rendererTexture") ? 1 : 0,
+              metal.device ? 1 : 0, metal.commandQueue ? 1 : 0,
+              metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
+              [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
+              NJPiMViewHasTextureIvars(view) ? 1 : 0);
+}
+
+static int NJPiMCaptureRank(const char *via) {
+    if (!via) {
+        return 0;
+    }
+    if (strcmp(via, "setExternalPixelBuffer:") == 0) {
+        return 3;
+    }
+    if (strcmp(via, "updateGpuState") == 0) {
+        return 2;
+    }
+    return 1; // _updateSyncForTimeStep:：含我们自己的自驱，证据最弱
+}
+
+static void NJPiMCaptureFromHook(id instance, const char *via) {
+    if (!instance) {
+        return;
+    }
+    if (instance == NJPiMCapturedViewInstance) {
+        return; // 最热路径：一次指针比较
+    }
+    int candidateRank = NJPiMCaptureRank(via);
+    int currentRank = NJPiMCapturedViewInstance ? NJPiMCaptureRank(NJPiMCapturedVia) : 0;
+    void *candidate = (__bridge void *)instance;
+    BOOL seen = NO;
+    for (NSUInteger index = 0; index < NJPiMSeenCount; index++) {
+        if (NJPiMSeenViews[index] == candidate) {
+            seen = YES;
+            break;
+        }
+    }
+    if (seen && candidateRank < currentRank) {
+        return; // 已评估过、又不构成升级：完全静默
+    }
+    if (NJPiMSeenCount < sizeof(NJPiMSeenViews) / sizeof(NJPiMSeenViews[0])) {
+        NJPiMSeenViews[NJPiMSeenCount++] = candidate;
+    }
+    if (candidateRank < currentRank) {
+        // 证据更弱的新实例：只观测、不接管（同一 App 里可能不止一个 cron 视图）。
+        if (NJPiMCaptureLogs < 3) {
+            NJPiMCaptureLogs += 1;
+            NJPiPDiag("mx view extra cls=%s addr=%p sel=%s keep=%s@%p",
+                      object_getClassName(instance), instance, via,
+                      object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
+        }
+        NJPiMProbeViewObjects(instance, via);
+        return;
+    }
+    id previous = NJPiMCapturedViewInstance;
+    NJPiMCapturedViewInstance = instance;
+    NJPiMCapturedVia = via;
+    NJPiMxFailViewClass = object_getClassName(instance);
+    if (NJPiMCaptureLogs < 3) {
+        NJPiMCaptureLogs += 1;
+        NJPiPDiag("mx view cls=%s addr=%p sel=%s old=%p",
+                  object_getClassName(instance), instance, via, previous);
+    }
+    NJPiMProbeViewObjects(instance, via);
 }
 
 // 自驱弹幕时钟：和 GPU 路同一个理由（PiP 后台时 display link 被系统暂停，
@@ -3801,7 +3955,16 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
     id<MTLTexture> externalTexture = NJPiMxViewTexture(view, @"_externalTexture");
     id<MTLTexture> rendererTexture = NJPiMxViewTexture(view, @"_rendererTexture");
     if (!externalTexture) {
-        NJPiMxNoteFailure("no_tex", original);
+        // 区分两种失败（真机第二轮只有笼统的 no_tex）：ivar 在类链上但值为 nil → no_tex
+        // （等供帧即可）；ivar 根本不存在 → no_ivar（取帧路必须换成 getMixedImage /
+        // getRendererImage / wrapper copyPixelBuffer，再读 ivar 没有意义）。
+        if (NJPiMViewHasTextureIvars(view)) {
+            NJPiMProbeViewObjects(view, "no_tex");
+            NJPiMxNoteFailure("no_tex", original);
+        } else {
+            NJPiMProbeViewObjects(view, "no_ivar");
+            NJPiMxNoteFailure("no_ivar", original);
+        }
         return nil;
     }
     static __unsafe_unretained id<MTLTexture> lastExternalTexture = nil;
@@ -3844,13 +4007,14 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
         NJPiMxNoteFailure("no_metal", original);
         return nil;
     }
+    NJPiMxLastPLQ = useOwnPipeline ? "own" : "view";
     if (!NJPiMxViewLogged) {
         NJPiMxViewLogged = YES;
         // 视图实例 + 两张贴图是否拿到 + 视图自己的 Metal 对象是否拿到 + 本帧选用的
         // pipeline（plq=own 我们编译的 / view 视图自己的）。V1/V2 的真实类名在这里
         // 报出（AB key v8.27.player.enable_mixed_render_main_thread 只能运行时确认）。
-        NJPiPDiag("mx view cls=%s ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d plq=%s",
-                  viewClass,
+        NJPiPDiag("mx view cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d plq=%s",
+                  viewClass, view,
                   externalTexture ? 1 : 0, rendererTexture ? 1 : 0,
                   metal.device ? 1 : 0, metal.commandQueue ? 1 : 0,
                   metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
@@ -3977,6 +4141,9 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
     id mixed = ((NJPiMxGetImageIMP)implementation)(view, selector);
     Class uiImageClass = NSClassFromString(@"UIImage");
     if (!mixed || !uiImageClass || ![mixed isKindOfClass:uiImageClass]) {
+        // getMixedImage 内部就是靠那两张贴图做离屏 pass 的；它返回 nil 大概率还是
+        // 贴图没被供出来。探测一次把证据固定下来（封顶 3 行，不会刷屏）。
+        NJPiMProbeViewObjects(view, "no_img");
         NJPiMxNoteFailure("no_img", original);
         return nil;
     }
@@ -4441,6 +4608,11 @@ static void NJPiMxFlushNow(void) {
     });
 }
 
+// 注：BFCCRON 渲染视图的捕获钩子不放在这里——`%hook` 会被 logos 在 C 预处理之前
+// 展开，放进 #if 里会变成未初始化的 _ungrouped 组（本文件只有 %init(App)，没有
+// 裸 %init），logos 直接报 non-initialized hook group。正确写法见下面 %group App
+// 里 BBPlayerDanmakuVoutView 旁边的三个 BFCCRON 钩子：hook 常驻，只把调用那一句
+// 包进 #if。capture 辅助函数本身（NJPiMCaptureFromHook 等）仍在本开关内。
 #endif // NJ_PIP_MIXED_OFFSCREEN_ENABLED
 
 static void NJPiPDiagHeartbeat(void) {
@@ -5217,6 +5389,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDiag("sbg dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("sbg");
 #endif
     %orig;
 }
@@ -5261,6 +5434,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDiag("sbgc dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("sbgc");
 #endif
     %orig;
 }
@@ -5291,6 +5465,64 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 #endif
 }
 
+%end
+
+// ── 捕获 cron 渲染视图实例（配合上面 NJ_PIP_MIXED_OFFSCREEN_ENABLED 内的 capture 区）──
+// 三个方法的归属按 8.89 头转储核实：基类只有 updateGpuState（V1/V2 的调用路径都
+// 经过它之前的实现，挂基类可同时覆盖）；setExternalPixelBuffer:/_updateSyncForTimeStep:
+// 在 V1/V2 各自实现（V1 参数 BFCCRONPixelBuffer*、V2 id——都按 id 接，arm64 ABI
+// 一致；我们不读参数，只取 self）。_updateSyncForTimeStep: 按 double 声明：头转储
+// 写 (id) 是启发式误标，反汇编确证是 double（V1 @0x11484c16c、V2 @0x11484e19c），
+// 同样不读值、只透传。类不存在时 logos 生成的初始化自动跳过，不影响其余 hook。
+@interface BFCCRONRenderBaseView : UIView
+- (void)updateGpuState;
+@end
+@interface BFCCRONRenderView : BFCCRONRenderBaseView
+- (void)setExternalPixelBuffer:(id)arg0;
+- (void)_updateSyncForTimeStep:(double)seconds;
+@end
+@interface BFCCRONRenderViewV2 : BFCCRONRenderBaseView
+- (void)setExternalPixelBuffer:(id)arg0;
+- (void)_updateSyncForTimeStep:(double)seconds;
+@end
+
+%hook BFCCRONRenderBaseView
+- (void)updateGpuState {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "updateGpuState");
+#endif
+    %orig;
+}
+%end
+
+%hook BFCCRONRenderView
+- (void)setExternalPixelBuffer:(id)arg0 {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "setExternalPixelBuffer:");
+#endif
+    %orig(arg0);
+}
+- (void)_updateSyncForTimeStep:(double)seconds {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+#endif
+    %orig(seconds);
+}
+%end
+
+%hook BFCCRONRenderViewV2
+- (void)setExternalPixelBuffer:(id)arg0 {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "setExternalPixelBuffer:");
+#endif
+    %orig(arg0);
+}
+- (void)_updateSyncForTimeStep:(double)seconds {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+#endif
+    %orig(seconds);
+}
 %end
 
 // Bilibili 8.89 can enqueue through either the display layer compatibility API
@@ -5474,6 +5706,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiPDiag("pip dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("pip");
 #endif
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
     [overlayState invalidate];

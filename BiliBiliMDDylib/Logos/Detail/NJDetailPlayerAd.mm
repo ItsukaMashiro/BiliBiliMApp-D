@@ -249,6 +249,10 @@ static void NJPiPDiagFlushLocked(void);
 
 
 static void NJPiMxFlushNow(void);
+
+
+static void NJPiMxForgetCapturedViews(const char *why);
+static id NJPiMCapturedView(void);
 #endif
 #if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 
@@ -1905,6 +1909,8 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     
     NJPiMxFlushNow();
+    
+    NJPiMxForgetCapturedViews("didStop");
 #endif
     [self.state restoreDanmaku];
     if ([self.downstream respondsToSelector:_cmd]) {
@@ -3217,6 +3223,10 @@ static id<MTLRenderPipelineState> NJPiMxOwnPipelineBlend = nil;
 static const char *NJPiMxSetupFailure = NULL;
 
 
+static const char *NJPiMxFailViewClass = "-";
+static const char *NJPiMxLastPLQ = "-";
+
+
 
 
 #define NJP_MX_RING_COUNT 4
@@ -3250,7 +3260,7 @@ static void NJPiMxRegisterReasons(void) {
     
     const char *reasons[] = { "no_view", "no_tex", "no_pool", "fmt",
                               "no_metal", "no_img", "no_pb", "no_texref",
-                              "no_cb", "no_enc", "wrap", "other" };
+                              "no_cb", "no_enc", "no_ivar", "wrap", "other" };
     for (NSUInteger index = 0; index < NJP_MX_MAX_REASONS; index++) {
         NJPiMxReasonNames[index] = index < sizeof(reasons) / sizeof(reasons[0])
                                      ? reasons[index] : NULL;
@@ -3270,14 +3280,15 @@ static void NJPiMxNoteFailure(const char *reason, CMSampleBufferRef sampleBuffer
     NJPiMxReasonHits[slot] += 1;
     if (NJPiMxReasonHits[slot] <= 20) {
         CVImageBufferRef imageBuffer = sampleBuffer ? CMSampleBufferGetImageBuffer(sampleBuffer) : NULL;
-        NJPiPDiag("mx fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu route=%lu",
+        NJPiPDiag("mx fail reason=%s n=%llu pb=%d fmt=%s size=%lux%lu route=%lu cls=%s",
                   reason,
                   NJPiMxReasonHits[slot],
                   imageBuffer ? 1 : 0,
                   imageBuffer ? NJPiMxFourcc(CVPixelBufferGetPixelFormatType(imageBuffer)) : "-",
                   imageBuffer ? (unsigned long)CVPixelBufferGetWidth(imageBuffer) : 0,
                   imageBuffer ? (unsigned long)CVPixelBufferGetHeight(imageBuffer) : 0,
-                  (unsigned long)NJPiMxRoute);
+                  (unsigned long)NJPiMxRoute,
+                  NJPiMxFailViewClass);
     }
 }
 
@@ -3342,11 +3353,15 @@ static void NJPiMxSummaryTick(void) {
     static const char *routeNames[] = { "none", "pass", "image" };
     const char *routeName = NJPiMxRoute < sizeof(routeNames) / sizeof(routeNames[0])
                                     ? routeNames[NJPiMxRoute] : "?";
+    
+    
     NJPiPDiag("mx sum win=%llu out=%llu fail=%llu ms=%.2f msmax=%.2f route=%s "
-              "exchg=%llu rendchg=%llu setup=%s fails=%s",
+              "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s fails=%s",
               inDelta, okDelta, failTotal, avgMilliseconds, maxMilliseconds, routeName,
               NJPiMxExtChanges, NJPiMxRendChanges,
-              NJPiMxSetupFailure ?: "ok", counts.UTF8String ?: "-");
+              NJPiMxSetupFailure ?: "ok",
+              NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ,
+              counts.UTF8String ?: "-");
     NJPiMxMaxDurationNs = 0;
     NJPiMxDurationNs = 0;
 }
@@ -3425,6 +3440,16 @@ static void NJPiMxRememberDanmakuService(id service) {
 
 
 static id NJPiMxFindCronView(const char **viewClass) {
+    
+    
+    id captured = NJPiMCapturedView();
+    if (captured) {
+        if (viewClass) {
+            *viewClass = object_getClassName(captured);
+        }
+        NJPiMxFailViewClass = *viewClass;
+        return captured;
+    }
     NSArray *services;
     @synchronized (NJPiMxDanmakuServices()) {
         services = [NJPiMxDanmakuServices() allObjects];
@@ -3445,6 +3470,7 @@ static id NJPiMxFindCronView(const char **viewClass) {
         if (viewClass) {
             *viewClass = object_getClassName(renderView);
         }
+        NJPiMxFailViewClass = *viewClass;
         return renderView;
     }
     return nil;
@@ -3564,6 +3590,134 @@ static id<MTLTexture> NJPiMxViewTexture(id view, NSString *ivarName) {
         return nil;
     }
     return (id<MTLTexture>)value;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+
+static id NJPiMCapturedViewInstance = nil;
+static const char *NJPiMCapturedVia = NULL;
+static void *NJPiMSeenViews[4];          
+static NSUInteger NJPiMSeenCount = 0;
+static NSUInteger NJPiMCaptureLogs = 0;
+
+static id NJPiMCapturedView(void) {
+    return NJPiMCapturedViewInstance;
+}
+
+static void NJPiMxForgetCapturedViews(const char *why) {
+    if (!NJPiMCapturedViewInstance) {
+        return;
+    }
+    NJPiPDiag("mx view forget why=%s cls=%s addr=%p", why,
+              object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
+    NJPiMCapturedViewInstance = nil;
+    NJPiMCapturedVia = NULL;
+}
+
+
+static BOOL NJPiMIvarPresent(id view, const char *name) {
+    Class cls = view ? [view class] : Nil;
+    while (cls && cls != [UIView class]) {
+        if (class_getInstanceVariable(cls, name)) {
+            return YES;
+        }
+        cls = class_getSuperclass(cls);
+    }
+    return NO;
+}
+
+static BOOL NJPiMViewHasTextureIvars(id view) {
+    return NJPiMIvarPresent(view, "_externalTexture") || NJPiMIvarPresent(view, "_rendererTexture");
+}
+
+
+
+static void NJPiMProbeViewObjects(id view, const char *why) {
+    static NSUInteger probes = 0;
+    if (!view || probes >= 3) {
+        return;
+    }
+    probes += 1;
+    struct NJPiMxMetalObjects metal = { nil, nil, nil, nil, nil, nil, nil, nil };
+    NJPiMxDiscoverMetal(view, &metal);
+    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d",
+              why, object_getClassName(view), view,
+              NJPiMxViewTexture(view, @"_externalTexture") ? 1 : 0,
+              NJPiMxViewTexture(view, @"_rendererTexture") ? 1 : 0,
+              metal.device ? 1 : 0, metal.commandQueue ? 1 : 0,
+              metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
+              [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
+              NJPiMViewHasTextureIvars(view) ? 1 : 0);
+}
+
+static int NJPiMCaptureRank(const char *via) {
+    if (!via) {
+        return 0;
+    }
+    if (strcmp(via, "setExternalPixelBuffer:") == 0) {
+        return 3;
+    }
+    if (strcmp(via, "updateGpuState") == 0) {
+        return 2;
+    }
+    return 1; 
+}
+
+static void NJPiMCaptureFromHook(id instance, const char *via) {
+    if (!instance) {
+        return;
+    }
+    if (instance == NJPiMCapturedViewInstance) {
+        return; 
+    }
+    int candidateRank = NJPiMCaptureRank(via);
+    int currentRank = NJPiMCapturedViewInstance ? NJPiMCaptureRank(NJPiMCapturedVia) : 0;
+    void *candidate = (__bridge void *)instance;
+    BOOL seen = NO;
+    for (NSUInteger index = 0; index < NJPiMSeenCount; index++) {
+        if (NJPiMSeenViews[index] == candidate) {
+            seen = YES;
+            break;
+        }
+    }
+    if (seen && candidateRank < currentRank) {
+        return; 
+    }
+    if (NJPiMSeenCount < sizeof(NJPiMSeenViews) / sizeof(NJPiMSeenViews[0])) {
+        NJPiMSeenViews[NJPiMSeenCount++] = candidate;
+    }
+    if (candidateRank < currentRank) {
+        
+        if (NJPiMCaptureLogs < 3) {
+            NJPiMCaptureLogs += 1;
+            NJPiPDiag("mx view extra cls=%s addr=%p sel=%s keep=%s@%p",
+                      object_getClassName(instance), instance, via,
+                      object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
+        }
+        NJPiMProbeViewObjects(instance, via);
+        return;
+    }
+    id previous = NJPiMCapturedViewInstance;
+    NJPiMCapturedViewInstance = instance;
+    NJPiMCapturedVia = via;
+    NJPiMxFailViewClass = object_getClassName(instance);
+    if (NJPiMCaptureLogs < 3) {
+        NJPiMCaptureLogs += 1;
+        NJPiPDiag("mx view cls=%s addr=%p sel=%s old=%p",
+                  object_getClassName(instance), instance, via, previous);
+    }
+    NJPiMProbeViewObjects(instance, via);
 }
 
 
@@ -3802,7 +3956,16 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
     id<MTLTexture> externalTexture = NJPiMxViewTexture(view, @"_externalTexture");
     id<MTLTexture> rendererTexture = NJPiMxViewTexture(view, @"_rendererTexture");
     if (!externalTexture) {
-        NJPiMxNoteFailure("no_tex", original);
+        
+        
+        
+        if (NJPiMViewHasTextureIvars(view)) {
+            NJPiMProbeViewObjects(view, "no_tex");
+            NJPiMxNoteFailure("no_tex", original);
+        } else {
+            NJPiMProbeViewObjects(view, "no_ivar");
+            NJPiMxNoteFailure("no_ivar", original);
+        }
         return nil;
     }
     static __unsafe_unretained id<MTLTexture> lastExternalTexture = nil;
@@ -3845,13 +4008,14 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
         NJPiMxNoteFailure("no_metal", original);
         return nil;
     }
+    NJPiMxLastPLQ = useOwnPipeline ? "own" : "view";
     if (!NJPiMxViewLogged) {
         NJPiMxViewLogged = YES;
         
         
         
-        NJPiPDiag("mx view cls=%s ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d plq=%s",
-                  viewClass,
+        NJPiPDiag("mx view cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d plq=%s",
+                  viewClass, view,
                   externalTexture ? 1 : 0, rendererTexture ? 1 : 0,
                   metal.device ? 1 : 0, metal.commandQueue ? 1 : 0,
                   metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
@@ -3978,6 +4142,9 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
     id mixed = ((NJPiMxGetImageIMP)implementation)(view, selector);
     Class uiImageClass = NSClassFromString(@"UIImage");
     if (!mixed || !uiImageClass || ![mixed isKindOfClass:uiImageClass]) {
+        
+        
+        NJPiMProbeViewObjects(view, "no_img");
         NJPiMxNoteFailure("no_img", original);
         return nil;
     }
@@ -4441,6 +4608,11 @@ static void NJPiMxFlushNow(void) {
         NJPiPDiagFlushLocked();
     });
 }
+
+
+
+
+
 
 #endif 
 
@@ -5028,11 +5200,11 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 
-@class BAPICommunityServiceDmV1Command; @class BBPlayerOperationTagService; @class BBPlayerGotoStoryWidget; @class BAPIAppViewuniteV1ViewProgressReply; @class BAPICommunityServiceDmV1DmViewReply; @class AVSampleBufferDisplayLayer; @class BBPlayerUpTagWidget; @class AVPictureInPictureController; @class BBPlayerPortraitScreenBottomWidget; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBPlayerFlexContainerWidget; @class BBPlayerDanmakuVoutView; @class BBPlayerDanmakuService; @class BBSBPiPManager; @class AVSampleBufferVideoRenderer; @class BBPlayerBizGotoStoryWidget; 
+@class BBPlayerDanmakuService; @class BBPlayerUpTagWidget; @class BBPlayerPortraitScreenBottomWidget; @class BFCCRONRenderView; @class AVSampleBufferVideoRenderer; @class AVSampleBufferDisplayLayer; @class AVPictureInPictureController; @class BBPlayerFlexContainerWidget; @class BAPICommunityServiceDmV1Command; @class BAPICommunityServiceDmV1DmViewReply; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBPlayerDanmakuVoutView; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerGotoStoryWidget; @class BBPlayerBizGotoStoryWidget; @class BBSBPiPManager; @class BFCCRONRenderBaseView; @class BFCCRONRenderViewV2; @class BBPlayerOperationTagService; 
 
 
-#line 5007 "BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
-static BBPlayerDanmakuService* (*_logos_orig$App$BBPlayerDanmakuService$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerDanmakuService* _logos_method$App$BBPlayerDanmakuService$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStart)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStart(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStop)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStop(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static void _logos_method$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static UIView * (*_logos_orig$App$BBPlayerDanmakuService$view)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static UIView * _logos_method$App$BBPlayerDanmakuService$view(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static BBSBPiPManager* (*_logos_orig$App$BBSBPiPManager$init)(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BBSBPiPManager* _logos_method$App$BBSBPiPManager$init(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BOOL (*_logos_orig$App$BBSBPiPManager$needsBindingPlayerContainer)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static BOOL _logos_method$App$BBSBPiPManager$needsBindingPlayerContainer(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$prepareToStart)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$prepareToStart(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopPreparing)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stopPreparing(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$start)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$start(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stop)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stop(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopWithReason$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$stopWithReason$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$setPictureInPictureStatus$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$setPictureInPictureStatus$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$dealloc)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$dealloc(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static _TtC18BBPictureInPicture15PlayerContainer* (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$init)(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static _TtC18BBPictureInPicture15PlayerContainer* _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$init(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuVoutView$setupRenderer$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void (*_logos_orig$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithPlayerLayer$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithPlayerLayer$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$startPictureInPicture)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$startPictureInPicture(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithContentSource$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithContentSource$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$setContentSource$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void _logos_method$App$AVPictureInPictureController$setContentSource$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void (*_logos_orig$App$AVPictureInPictureController$setDelegate$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static void _logos_method$App$AVPictureInPictureController$setDelegate$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static id<AVPictureInPictureControllerDelegate> (*_logos_orig$App$AVPictureInPictureController$delegate)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static id<AVPictureInPictureControllerDelegate> _logos_method$App$AVPictureInPictureController$delegate(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$AVPictureInPictureController$dealloc)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$dealloc(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static BBPlayerUpTagWidget* (*_logos_orig$App$BBPlayerUpTagWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerUpTagWidget* _logos_method$App$BBPlayerUpTagWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static BBPlayerBizGotoStoryWidget* (*_logos_orig$App$BBPlayerBizGotoStoryWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerBizGotoStoryWidget* _logos_method$App$BBPlayerBizGotoStoryWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* (*_logos_orig$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$)(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* _logos_method$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static NSArray * (*_logos_orig$App$BBPlayerOperationTagService$tagModels)(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSArray * _logos_method$App$BBPlayerOperationTagService$tagModels(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSSet<NSNumber *> * _logos_method$App$BBPlayerOperationTagService$nj_filterTypes(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets)(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static BAPICommunityServiceDmV1DmViewReply* (*_logos_orig$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPICommunityServiceDmV1DmViewReply* _logos_method$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* (*_logos_orig$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; 
+#line 5179 "BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
+static BBPlayerDanmakuService* (*_logos_orig$App$BBPlayerDanmakuService$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerDanmakuService* _logos_method$App$BBPlayerDanmakuService$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStart)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStart(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStop)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStop(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static void _logos_method$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static UIView * (*_logos_orig$App$BBPlayerDanmakuService$view)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static UIView * _logos_method$App$BBPlayerDanmakuService$view(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static BBSBPiPManager* (*_logos_orig$App$BBSBPiPManager$init)(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BBSBPiPManager* _logos_method$App$BBSBPiPManager$init(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BOOL (*_logos_orig$App$BBSBPiPManager$needsBindingPlayerContainer)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static BOOL _logos_method$App$BBSBPiPManager$needsBindingPlayerContainer(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$prepareToStart)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$prepareToStart(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopPreparing)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stopPreparing(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$start)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$start(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stop)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stop(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopWithReason$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$stopWithReason$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$setPictureInPictureStatus$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$setPictureInPictureStatus$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$dealloc)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$dealloc(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static _TtC18BBPictureInPicture15PlayerContainer* (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$init)(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static _TtC18BBPictureInPicture15PlayerContainer* _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$init(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuVoutView$setupRenderer$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderBaseView$updateGpuState)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderBaseView* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BFCCRONRenderBaseView$updateGpuState(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderBaseView* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BFCCRONRenderView$setExternalPixelBuffer$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BFCCRONRenderView$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderView$_updateSyncForTimeStep$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, double); static void _logos_method$App$BFCCRONRenderView$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, double); static void (*_logos_orig$App$BFCCRONRenderViewV2$setExternalPixelBuffer$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BFCCRONRenderViewV2$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, double); static void _logos_method$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, double); static void (*_logos_orig$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void (*_logos_orig$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithPlayerLayer$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithPlayerLayer$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$startPictureInPicture)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$startPictureInPicture(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithContentSource$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithContentSource$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$setContentSource$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void _logos_method$App$AVPictureInPictureController$setContentSource$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void (*_logos_orig$App$AVPictureInPictureController$setDelegate$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static void _logos_method$App$AVPictureInPictureController$setDelegate$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static id<AVPictureInPictureControllerDelegate> (*_logos_orig$App$AVPictureInPictureController$delegate)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static id<AVPictureInPictureControllerDelegate> _logos_method$App$AVPictureInPictureController$delegate(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$AVPictureInPictureController$dealloc)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$dealloc(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static BBPlayerUpTagWidget* (*_logos_orig$App$BBPlayerUpTagWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerUpTagWidget* _logos_method$App$BBPlayerUpTagWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static BBPlayerBizGotoStoryWidget* (*_logos_orig$App$BBPlayerBizGotoStoryWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerBizGotoStoryWidget* _logos_method$App$BBPlayerBizGotoStoryWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* (*_logos_orig$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$)(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* _logos_method$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static NSArray * (*_logos_orig$App$BBPlayerOperationTagService$tagModels)(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSArray * _logos_method$App$BBPlayerOperationTagService$tagModels(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSSet<NSNumber *> * _logos_method$App$BBPlayerOperationTagService$nj_filterTypes(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets)(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static BAPICommunityServiceDmV1DmViewReply* (*_logos_orig$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPICommunityServiceDmV1DmViewReply* _logos_method$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* (*_logos_orig$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; 
 
 @interface BBPlayerDanmakuService : NSObject
 - (instancetype)initWithContext:(id)context;
@@ -5245,6 +5417,7 @@ static void _logos_method$App$BBSBPiPManager$dealloc(_LOGOS_SELF_TYPE_NORMAL BBS
     NJPiPDiag("sbg dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("sbg");
 #endif
     _logos_orig$App$BBSBPiPManager$dealloc(self, _cmd);
 }
@@ -5289,6 +5462,7 @@ static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc(
     NJPiPDiag("sbgc dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("sbgc");
 #endif
     _logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc(self, _cmd);
 }
@@ -5319,6 +5493,64 @@ static void _logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$(_LOGOS_SELF
 #endif
 }
 
+
+
+
+
+
+
+
+
+
+@interface BFCCRONRenderBaseView : UIView
+- (void)updateGpuState;
+@end
+@interface BFCCRONRenderView : BFCCRONRenderBaseView
+- (void)setExternalPixelBuffer:(id)arg0;
+- (void)_updateSyncForTimeStep:(double)seconds;
+@end
+@interface BFCCRONRenderViewV2 : BFCCRONRenderBaseView
+- (void)setExternalPixelBuffer:(id)arg0;
+- (void)_updateSyncForTimeStep:(double)seconds;
+@end
+
+
+static void _logos_method$App$BFCCRONRenderBaseView$updateGpuState(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderBaseView* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "updateGpuState");
+#endif
+    _logos_orig$App$BFCCRONRenderBaseView$updateGpuState(self, _cmd);
+}
+
+
+
+static void _logos_method$App$BFCCRONRenderView$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, id arg0) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "setExternalPixelBuffer:");
+#endif
+    _logos_orig$App$BFCCRONRenderView$setExternalPixelBuffer$(self, _cmd, arg0);
+}
+static void _logos_method$App$BFCCRONRenderView$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, double seconds) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+#endif
+    _logos_orig$App$BFCCRONRenderView$_updateSyncForTimeStep$(self, _cmd, seconds);
+}
+
+
+
+static void _logos_method$App$BFCCRONRenderViewV2$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, id arg0) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "setExternalPixelBuffer:");
+#endif
+    _logos_orig$App$BFCCRONRenderViewV2$setExternalPixelBuffer$(self, _cmd, arg0);
+}
+static void _logos_method$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, double seconds) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+#endif
+    _logos_orig$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(self, _cmd, seconds);
+}
 
 
 
@@ -5502,6 +5734,7 @@ static void _logos_method$App$AVPictureInPictureController$dealloc(_LOGOS_SELF_T
     NJPiPDiag("pip dealloc");
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMxFlushNow();
+    NJPiMxForgetCapturedViews("pip");
 #endif
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
     [overlayState invalidate];
@@ -5718,7 +5951,7 @@ static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1
  
 
 
-static __attribute__((constructor)) void _logosLocalCtor_5379675c(int __unused argc, char __unused **argv, char __unused **envp) {
+static __attribute__((constructor)) void _logosLocalCtor_1590142d(int __unused argc, char __unused **argv, char __unused **envp) {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] module loaded master=%d pip=%d",
                      NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
@@ -5767,6 +6000,6 @@ static __attribute__((constructor)) void _logosLocalCtor_5379675c(int __unused a
         NJPiPDiagFlush();
     }];
     if (NJ_MASTER_SWITCH_VALUE) {
-        {Class _logos_class$App$BBPlayerDanmakuService = objc_getClass("BBPlayerDanmakuService"); { MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerDanmakuService$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$initWithContext$);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(serviceOnStart), (IMP)&_logos_method$App$BBPlayerDanmakuService$serviceOnStart, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$serviceOnStart);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(serviceOnStop), (IMP)&_logos_method$App$BBPlayerDanmakuService$serviceOnStop, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$serviceOnStop);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(loadDMViewWithContextExtra:completeBlock:), (IMP)&_logos_method$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(view), (IMP)&_logos_method$App$BBPlayerDanmakuService$view, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$view);}Class _logos_class$App$BBSBPiPManager = objc_getClass("BBSBPiPManager"); { MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(init), (IMP)&_logos_method$App$BBSBPiPManager$init, (IMP*)&_logos_orig$App$BBSBPiPManager$init);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(needsBindingPlayerContainer), (IMP)&_logos_method$App$BBSBPiPManager$needsBindingPlayerContainer, (IMP*)&_logos_orig$App$BBSBPiPManager$needsBindingPlayerContainer);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(bindGraftData:shareId:dataSource:completion:), (IMP)&_logos_method$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$, (IMP*)&_logos_orig$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(bindGraftData:ugcDataSourceAdapter:completion:), (IMP)&_logos_method$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$, (IMP*)&_logos_orig$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(prepareToStart), (IMP)&_logos_method$App$BBSBPiPManager$prepareToStart, (IMP*)&_logos_orig$App$BBSBPiPManager$prepareToStart);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stopPreparing), (IMP)&_logos_method$App$BBSBPiPManager$stopPreparing, (IMP*)&_logos_orig$App$BBSBPiPManager$stopPreparing);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(start), (IMP)&_logos_method$App$BBSBPiPManager$start, (IMP*)&_logos_orig$App$BBSBPiPManager$start);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stop), (IMP)&_logos_method$App$BBSBPiPManager$stop, (IMP*)&_logos_orig$App$BBSBPiPManager$stop);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stopWithReason:), (IMP)&_logos_method$App$BBSBPiPManager$stopWithReason$, (IMP*)&_logos_orig$App$BBSBPiPManager$stopWithReason$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(setPictureInPictureStatus:), (IMP)&_logos_method$App$BBSBPiPManager$setPictureInPictureStatus$, (IMP*)&_logos_orig$App$BBSBPiPManager$setPictureInPictureStatus$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, sel_registerName("dealloc"), (IMP)&_logos_method$App$BBSBPiPManager$dealloc, (IMP*)&_logos_orig$App$BBSBPiPManager$dealloc);}Class _logos_class$App$_TtC18BBPictureInPicture15PlayerContainer = objc_getClass("_TtC18BBPictureInPicture15PlayerContainer"); { MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(init), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$init, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$init);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(director_didPrepared), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(director_didComplete), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, sel_registerName("dealloc"), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc);}Class _logos_class$App$BBPlayerDanmakuVoutView = objc_getClass("BBPlayerDanmakuVoutView"); { MSHookMessageEx(_logos_class$App$BBPlayerDanmakuVoutView, @selector(setupRenderer:), (IMP)&_logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$, (IMP*)&_logos_orig$App$BBPlayerDanmakuVoutView$setupRenderer$);}Class _logos_class$App$AVSampleBufferDisplayLayer = objc_getClass("AVSampleBufferDisplayLayer"); { MSHookMessageEx(_logos_class$App$AVSampleBufferDisplayLayer, @selector(enqueueSampleBuffer:), (IMP)&_logos_method$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$, (IMP*)&_logos_orig$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$);}Class _logos_class$App$AVSampleBufferVideoRenderer = objc_getClass("AVSampleBufferVideoRenderer"); { MSHookMessageEx(_logos_class$App$AVSampleBufferVideoRenderer, @selector(enqueueSampleBuffer:), (IMP)&_logos_method$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$, (IMP*)&_logos_orig$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$);}Class _logos_class$App$AVPictureInPictureController = objc_getClass("AVPictureInPictureController"); { MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(initWithPlayerLayer:), (IMP)&_logos_method$App$AVPictureInPictureController$initWithPlayerLayer$, (IMP*)&_logos_orig$App$AVPictureInPictureController$initWithPlayerLayer$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(startPictureInPicture), (IMP)&_logos_method$App$AVPictureInPictureController$startPictureInPicture, (IMP*)&_logos_orig$App$AVPictureInPictureController$startPictureInPicture);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(initWithContentSource:), (IMP)&_logos_method$App$AVPictureInPictureController$initWithContentSource$, (IMP*)&_logos_orig$App$AVPictureInPictureController$initWithContentSource$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(setContentSource:), (IMP)&_logos_method$App$AVPictureInPictureController$setContentSource$, (IMP*)&_logos_orig$App$AVPictureInPictureController$setContentSource$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(setDelegate:), (IMP)&_logos_method$App$AVPictureInPictureController$setDelegate$, (IMP*)&_logos_orig$App$AVPictureInPictureController$setDelegate$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(delegate), (IMP)&_logos_method$App$AVPictureInPictureController$delegate, (IMP*)&_logos_orig$App$AVPictureInPictureController$delegate);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, sel_registerName("dealloc"), (IMP)&_logos_method$App$AVPictureInPictureController$dealloc, (IMP*)&_logos_orig$App$AVPictureInPictureController$dealloc);}Class _logos_class$App$BBPlayerUpTagWidget = objc_getClass("BBPlayerUpTagWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerUpTagWidget, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerUpTagWidget$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerUpTagWidget$initWithContext$);}Class _logos_class$App$BBPlayerPortraitScreenBottomWidget = objc_getClass("BBPlayerPortraitScreenBottomWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerPortraitScreenBottomWidget, @selector(setupFirstControlConstraints), (IMP)&_logos_method$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints, (IMP*)&_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints);}{ MSHookMessageEx(_logos_class$App$BBPlayerPortraitScreenBottomWidget, @selector(setupSecondControlConstraints), (IMP)&_logos_method$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints, (IMP*)&_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints);}Class _logos_class$App$BBPlayerBizGotoStoryWidget = objc_getClass("BBPlayerBizGotoStoryWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerBizGotoStoryWidget, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerBizGotoStoryWidget$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerBizGotoStoryWidget$initWithContext$);}Class _logos_class$App$BBPlayerGotoStoryWidget = objc_getClass("BBPlayerGotoStoryWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerGotoStoryWidget, @selector(initWithContext:flexConfiguration:), (IMP)&_logos_method$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$, (IMP*)&_logos_orig$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$);}Class _logos_class$App$BBPlayerOperationTagService = objc_getClass("BBPlayerOperationTagService"); { MSHookMessageEx(_logos_class$App$BBPlayerOperationTagService, @selector(tagModels), (IMP)&_logos_method$App$BBPlayerOperationTagService$tagModels, (IMP*)&_logos_orig$App$BBPlayerOperationTagService$tagModels);}{ char _typeEncoding[1024]; unsigned int i = 0; memcpy(_typeEncoding + i, @encode(NSSet<NSNumber *> *), strlen(@encode(NSSet<NSNumber *> *))); i += strlen(@encode(NSSet<NSNumber *> *)); _typeEncoding[i] = '@'; i += 1; _typeEncoding[i] = ':'; i += 1; _typeEncoding[i] = '\0'; class_addMethod(_logos_class$App$BBPlayerOperationTagService, @selector(nj_filterTypes), (IMP)&_logos_method$App$BBPlayerOperationTagService$nj_filterTypes, _typeEncoding); }Class _logos_class$App$BBPlayerFlexContainerWidget = objc_getClass("BBPlayerFlexContainerWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerFlexContainerWidget, @selector(didLayoutSubWidgets), (IMP)&_logos_method$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets, (IMP*)&_logos_orig$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets);}Class _logos_class$App$BAPICommunityServiceDmV1DmViewReply = objc_getClass("BAPICommunityServiceDmV1DmViewReply"); { MSHookMessageEx(_logos_class$App$BAPICommunityServiceDmV1DmViewReply, @selector(initWithData:extensionRegistry:error:), (IMP)&_logos_method$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$, (IMP*)&_logos_orig$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$);}Class _logos_class$App$BAPIAppViewuniteV1ViewProgressReply = objc_getClass("BAPIAppViewuniteV1ViewProgressReply"); { MSHookMessageEx(_logos_class$App$BAPIAppViewuniteV1ViewProgressReply, @selector(initWithData:extensionRegistry:error:), (IMP)&_logos_method$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$, (IMP*)&_logos_orig$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$);}}
+        {Class _logos_class$App$BBPlayerDanmakuService = objc_getClass("BBPlayerDanmakuService"); { MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerDanmakuService$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$initWithContext$);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(serviceOnStart), (IMP)&_logos_method$App$BBPlayerDanmakuService$serviceOnStart, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$serviceOnStart);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(serviceOnStop), (IMP)&_logos_method$App$BBPlayerDanmakuService$serviceOnStop, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$serviceOnStop);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(loadDMViewWithContextExtra:completeBlock:), (IMP)&_logos_method$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$);}{ MSHookMessageEx(_logos_class$App$BBPlayerDanmakuService, @selector(view), (IMP)&_logos_method$App$BBPlayerDanmakuService$view, (IMP*)&_logos_orig$App$BBPlayerDanmakuService$view);}Class _logos_class$App$BBSBPiPManager = objc_getClass("BBSBPiPManager"); { MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(init), (IMP)&_logos_method$App$BBSBPiPManager$init, (IMP*)&_logos_orig$App$BBSBPiPManager$init);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(needsBindingPlayerContainer), (IMP)&_logos_method$App$BBSBPiPManager$needsBindingPlayerContainer, (IMP*)&_logos_orig$App$BBSBPiPManager$needsBindingPlayerContainer);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(bindGraftData:shareId:dataSource:completion:), (IMP)&_logos_method$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$, (IMP*)&_logos_orig$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(bindGraftData:ugcDataSourceAdapter:completion:), (IMP)&_logos_method$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$, (IMP*)&_logos_orig$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(prepareToStart), (IMP)&_logos_method$App$BBSBPiPManager$prepareToStart, (IMP*)&_logos_orig$App$BBSBPiPManager$prepareToStart);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stopPreparing), (IMP)&_logos_method$App$BBSBPiPManager$stopPreparing, (IMP*)&_logos_orig$App$BBSBPiPManager$stopPreparing);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(start), (IMP)&_logos_method$App$BBSBPiPManager$start, (IMP*)&_logos_orig$App$BBSBPiPManager$start);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stop), (IMP)&_logos_method$App$BBSBPiPManager$stop, (IMP*)&_logos_orig$App$BBSBPiPManager$stop);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(stopWithReason:), (IMP)&_logos_method$App$BBSBPiPManager$stopWithReason$, (IMP*)&_logos_orig$App$BBSBPiPManager$stopWithReason$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, @selector(setPictureInPictureStatus:), (IMP)&_logos_method$App$BBSBPiPManager$setPictureInPictureStatus$, (IMP*)&_logos_orig$App$BBSBPiPManager$setPictureInPictureStatus$);}{ MSHookMessageEx(_logos_class$App$BBSBPiPManager, sel_registerName("dealloc"), (IMP)&_logos_method$App$BBSBPiPManager$dealloc, (IMP*)&_logos_orig$App$BBSBPiPManager$dealloc);}Class _logos_class$App$_TtC18BBPictureInPicture15PlayerContainer = objc_getClass("_TtC18BBPictureInPicture15PlayerContainer"); { MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(init), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$init, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$init);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(director_didPrepared), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, @selector(director_didComplete), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete);}{ MSHookMessageEx(_logos_class$App$_TtC18BBPictureInPicture15PlayerContainer, sel_registerName("dealloc"), (IMP)&_logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc, (IMP*)&_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc);}Class _logos_class$App$BBPlayerDanmakuVoutView = objc_getClass("BBPlayerDanmakuVoutView"); { MSHookMessageEx(_logos_class$App$BBPlayerDanmakuVoutView, @selector(setupRenderer:), (IMP)&_logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$, (IMP*)&_logos_orig$App$BBPlayerDanmakuVoutView$setupRenderer$);}Class _logos_class$App$BFCCRONRenderBaseView = objc_getClass("BFCCRONRenderBaseView"); { MSHookMessageEx(_logos_class$App$BFCCRONRenderBaseView, @selector(updateGpuState), (IMP)&_logos_method$App$BFCCRONRenderBaseView$updateGpuState, (IMP*)&_logos_orig$App$BFCCRONRenderBaseView$updateGpuState);}Class _logos_class$App$BFCCRONRenderView = objc_getClass("BFCCRONRenderView"); { MSHookMessageEx(_logos_class$App$BFCCRONRenderView, @selector(setExternalPixelBuffer:), (IMP)&_logos_method$App$BFCCRONRenderView$setExternalPixelBuffer$, (IMP*)&_logos_orig$App$BFCCRONRenderView$setExternalPixelBuffer$);}{ MSHookMessageEx(_logos_class$App$BFCCRONRenderView, @selector(_updateSyncForTimeStep:), (IMP)&_logos_method$App$BFCCRONRenderView$_updateSyncForTimeStep$, (IMP*)&_logos_orig$App$BFCCRONRenderView$_updateSyncForTimeStep$);}Class _logos_class$App$BFCCRONRenderViewV2 = objc_getClass("BFCCRONRenderViewV2"); { MSHookMessageEx(_logos_class$App$BFCCRONRenderViewV2, @selector(setExternalPixelBuffer:), (IMP)&_logos_method$App$BFCCRONRenderViewV2$setExternalPixelBuffer$, (IMP*)&_logos_orig$App$BFCCRONRenderViewV2$setExternalPixelBuffer$);}{ MSHookMessageEx(_logos_class$App$BFCCRONRenderViewV2, @selector(_updateSyncForTimeStep:), (IMP)&_logos_method$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$, (IMP*)&_logos_orig$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$);}Class _logos_class$App$AVSampleBufferDisplayLayer = objc_getClass("AVSampleBufferDisplayLayer"); { MSHookMessageEx(_logos_class$App$AVSampleBufferDisplayLayer, @selector(enqueueSampleBuffer:), (IMP)&_logos_method$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$, (IMP*)&_logos_orig$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$);}Class _logos_class$App$AVSampleBufferVideoRenderer = objc_getClass("AVSampleBufferVideoRenderer"); { MSHookMessageEx(_logos_class$App$AVSampleBufferVideoRenderer, @selector(enqueueSampleBuffer:), (IMP)&_logos_method$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$, (IMP*)&_logos_orig$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$);}Class _logos_class$App$AVPictureInPictureController = objc_getClass("AVPictureInPictureController"); { MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(initWithPlayerLayer:), (IMP)&_logos_method$App$AVPictureInPictureController$initWithPlayerLayer$, (IMP*)&_logos_orig$App$AVPictureInPictureController$initWithPlayerLayer$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(startPictureInPicture), (IMP)&_logos_method$App$AVPictureInPictureController$startPictureInPicture, (IMP*)&_logos_orig$App$AVPictureInPictureController$startPictureInPicture);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(initWithContentSource:), (IMP)&_logos_method$App$AVPictureInPictureController$initWithContentSource$, (IMP*)&_logos_orig$App$AVPictureInPictureController$initWithContentSource$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(setContentSource:), (IMP)&_logos_method$App$AVPictureInPictureController$setContentSource$, (IMP*)&_logos_orig$App$AVPictureInPictureController$setContentSource$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(setDelegate:), (IMP)&_logos_method$App$AVPictureInPictureController$setDelegate$, (IMP*)&_logos_orig$App$AVPictureInPictureController$setDelegate$);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, @selector(delegate), (IMP)&_logos_method$App$AVPictureInPictureController$delegate, (IMP*)&_logos_orig$App$AVPictureInPictureController$delegate);}{ MSHookMessageEx(_logos_class$App$AVPictureInPictureController, sel_registerName("dealloc"), (IMP)&_logos_method$App$AVPictureInPictureController$dealloc, (IMP*)&_logos_orig$App$AVPictureInPictureController$dealloc);}Class _logos_class$App$BBPlayerUpTagWidget = objc_getClass("BBPlayerUpTagWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerUpTagWidget, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerUpTagWidget$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerUpTagWidget$initWithContext$);}Class _logos_class$App$BBPlayerPortraitScreenBottomWidget = objc_getClass("BBPlayerPortraitScreenBottomWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerPortraitScreenBottomWidget, @selector(setupFirstControlConstraints), (IMP)&_logos_method$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints, (IMP*)&_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints);}{ MSHookMessageEx(_logos_class$App$BBPlayerPortraitScreenBottomWidget, @selector(setupSecondControlConstraints), (IMP)&_logos_method$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints, (IMP*)&_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints);}Class _logos_class$App$BBPlayerBizGotoStoryWidget = objc_getClass("BBPlayerBizGotoStoryWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerBizGotoStoryWidget, @selector(initWithContext:), (IMP)&_logos_method$App$BBPlayerBizGotoStoryWidget$initWithContext$, (IMP*)&_logos_orig$App$BBPlayerBizGotoStoryWidget$initWithContext$);}Class _logos_class$App$BBPlayerGotoStoryWidget = objc_getClass("BBPlayerGotoStoryWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerGotoStoryWidget, @selector(initWithContext:flexConfiguration:), (IMP)&_logos_method$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$, (IMP*)&_logos_orig$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$);}Class _logos_class$App$BBPlayerOperationTagService = objc_getClass("BBPlayerOperationTagService"); { MSHookMessageEx(_logos_class$App$BBPlayerOperationTagService, @selector(tagModels), (IMP)&_logos_method$App$BBPlayerOperationTagService$tagModels, (IMP*)&_logos_orig$App$BBPlayerOperationTagService$tagModels);}{ char _typeEncoding[1024]; unsigned int i = 0; memcpy(_typeEncoding + i, @encode(NSSet<NSNumber *> *), strlen(@encode(NSSet<NSNumber *> *))); i += strlen(@encode(NSSet<NSNumber *> *)); _typeEncoding[i] = '@'; i += 1; _typeEncoding[i] = ':'; i += 1; _typeEncoding[i] = '\0'; class_addMethod(_logos_class$App$BBPlayerOperationTagService, @selector(nj_filterTypes), (IMP)&_logos_method$App$BBPlayerOperationTagService$nj_filterTypes, _typeEncoding); }Class _logos_class$App$BBPlayerFlexContainerWidget = objc_getClass("BBPlayerFlexContainerWidget"); { MSHookMessageEx(_logos_class$App$BBPlayerFlexContainerWidget, @selector(didLayoutSubWidgets), (IMP)&_logos_method$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets, (IMP*)&_logos_orig$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets);}Class _logos_class$App$BAPICommunityServiceDmV1DmViewReply = objc_getClass("BAPICommunityServiceDmV1DmViewReply"); { MSHookMessageEx(_logos_class$App$BAPICommunityServiceDmV1DmViewReply, @selector(initWithData:extensionRegistry:error:), (IMP)&_logos_method$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$, (IMP*)&_logos_orig$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$);}Class _logos_class$App$BAPIAppViewuniteV1ViewProgressReply = objc_getClass("BAPIAppViewuniteV1ViewProgressReply"); { MSHookMessageEx(_logos_class$App$BAPIAppViewuniteV1ViewProgressReply, @selector(initWithData:extensionRegistry:error:), (IMP)&_logos_method$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$, (IMP*)&_logos_orig$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$);}}
     }
 }
