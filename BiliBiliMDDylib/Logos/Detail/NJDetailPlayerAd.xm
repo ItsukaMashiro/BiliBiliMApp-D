@@ -3522,12 +3522,14 @@ static void NJPiMxDiscoverMetal(id view, struct NJPiMxMetalObjects *out) {
 }
 
 // 两张贴图：名字是静态确证的（§1.2 的 setFragmentTexture:atIndex: 操作数）。
-static id NJPiMxViewTexture(id view, NSString *ivarName) {
+// 返回类型必须是协议限定类型：裸 id 上调 pixelFormat/device 会撞上多个同名不同签
+// 的方法声明（run 40063065730 的 :3805 就是这么炸的）。
+static id<MTLTexture> NJPiMxViewTexture(id view, NSString *ivarName) {
     id value = NJPiMxValueForKey(view, ivarName);
     if (!NJPiMxValueConforms(value, @protocol(MTLTexture))) {
         return nil;
     }
-    return value;
+    return (id<MTLTexture>)value;
 }
 
 // 自驱弹幕时钟：和 GPU 路同一个理由（PiP 后台时 display link 被系统暂停，
@@ -3763,14 +3765,14 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
                               const char *viewClass) {
     struct NJPiMxMetalObjects metal = { nil, nil, nil, nil, nil, nil, nil, nil };
     NJPiMxDiscoverMetal(view, &metal);
-    id externalTexture = NJPiMxViewTexture(view, @"_externalTexture");
-    id rendererTexture = NJPiMxViewTexture(view, @"_rendererTexture");
+    id<MTLTexture> externalTexture = NJPiMxViewTexture(view, @"_externalTexture");
+    id<MTLTexture> rendererTexture = NJPiMxViewTexture(view, @"_rendererTexture");
     if (!externalTexture) {
         NJPiMxNoteFailure("no_tex", original);
         return nil;
     }
-    static __unsafe_unretained id lastExternalTexture = nil;
-    static __unsafe_unretained id lastRendererTexture = nil;
+    static __unsafe_unretained id<MTLTexture> lastExternalTexture = nil;
+    static __unsafe_unretained id<MTLTexture> lastRendererTexture = nil;
     static BOOL texturesSeen = NO;
     if (!texturesSeen || externalTexture != lastExternalTexture) {
         NJPiMxExtChanges += 1;
@@ -3850,8 +3852,12 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
     if (!targetImage) {
         return nil;
     }
-    id<MTLTexture> targetTexture = NJPiMxTargetTexture(targetImage, device);
+    CVMetalTextureRef targetTextureRef = NULL;
+    id<MTLTexture> targetTexture = NJPiMxTargetTexture(targetImage, device, &targetTextureRef);
     if (!targetTexture) {
+        if (targetTextureRef) {
+            CVMetalTextureReleaseRef(targetTextureRef);
+        }
         CVPixelBufferRelease(targetImage);
         return nil;
     }
@@ -3906,6 +3912,12 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
     }
     [encoder endEncoding];
     CVMetalTextureCacheFlush(NJPiMxTextureCache, 0);
+    // 与 GPU 路同一条生命周期规则：CoreVideo 的纹理桥必须活过 GPU 工作，
+    // 引用移交给 commandBuffer 的完成回调；环形缓冲让像素本体活到被换出。
+    CFRetain(targetTextureRef);
+    [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+        CFRelease(targetTextureRef);
+    }];
     [commandBuffer commit]; // GPU work is async; the ring below keeps the pixels alive
     id wrapped = NJPiMxWrapProduced(targetImage, sourceImage, original);
     CVPixelBufferRelease(targetImage);
@@ -3935,7 +3947,9 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
         NJPiMxNoteFailure("no_img", original);
         return nil;
     }
-    CGImageRef cgImage = (CGImageRef)[mixed valueForKey:@"CGImage"];
+    // 用 UIImage 的类型化属性拿 CGImage（+0，同步绘制即可）；KVC 拿会触发
+    // id→C 指针的桥接报错（run 40063065730 :3938）。
+    CGImageRef cgImage = ((UIImage *)mixed).CGImage;
     if (!cgImage) {
         NJPiMxNoteFailure("no_img", original);
         return nil;
