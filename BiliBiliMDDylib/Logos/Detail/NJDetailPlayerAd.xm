@@ -2349,7 +2349,240 @@ static id NJPiGpuValueForKey(id object, NSString *key) {
     }
 }
 
+// 在线路径（8.89 真机）里弹幕渲染对象不在视图树上：`-[BBPlayerDanmakuService view]`
+// 返回的是 BBPlayerChronosContainerView，它既没有 `rendererWrapper` 也没有
+// `copyPixelBuffer`，所以「从被跟踪的 view 出发 + KVC」这套探测在线上必然落空
+// （真机日志里从来没有出现过 gpu dmsrc=…）。对象图（8.89 class dump：
+// tmp/re89/objc-headers.txt:1445047 / :1440714 / :1440666 / :1441057 / :1443891 / :1484715）：
+//   -[BBPlayerDanmakuService context]        -> BBPlayerContext
+//     （DanmakuService 自身没声明这个 getter，它继承自 BBPlayerObject:1440714 的
+//       `@property context` / `- (BBPlayerContext *)context`；现读而不是存下来，
+//       播放器复用会换绑 context）
+//   -[BBPlayerContext chronos]               -> BBPlayerChronos
+//   -[BBPlayerChronos chronosView]           -> BFCCRONRenderView / BFCCRONRenderViewV2
+//   -[BFCCRONRenderBaseView rendererWrapper] -> BFCChronosRendererWrapper
+//                                              （公开 getter，取代 valueForKey:@"rendererWrapper"）
+// 每一环只用 respondsToSelector: + 类型化 IMP；任何一环失败都退回下面的旧路径。
+// 这些类不存在于本工程 SDK，因此不补 @interface：一律 id + SEL + 类型化 IMP，
+// 与上面的 copyPixelBuffer 用同一种调用方式（补 @interface 反而要为本文件不导入的
+// SDK 类型写声明，属于新增编译风险）。
+typedef id (*NJPiGpuObjectReturnIMP)(id, SEL);
+
+static id NJPiGpuObjectGetter(id target, SEL selector) {
+    if (!target) {
+        return nil;
+    }
+    if (![target respondsToSelector:selector]) {
+        return nil;
+    }
+    IMP implementation = [target methodForSelector:selector];
+    if (!implementation) {
+        return nil;
+    }
+    return ((NJPiGpuObjectReturnIMP)implementation)(target, selector);
+}
+
+// 取帧发生在视频帧入队的线程上，那时手上没有播放器对象，所以只在服务创建时用弱引用
+// 记下 BBPlayerDanmakuService 本身（不延长生命周期；最多 8 个，超过说明已经漏掉了释放）。
+// context 不在这里存：播放器复用（PVP → 详情页）会换绑 context，存对象会在第一环就拿到
+// 失效的那个；下面每次都从服务上现读 -context（继承自 BBPlayerObject，
+// objc-headers.txt:1440714 块内 `@property context` / `- (BBPlayerContext *)context`）。
+static NSHashTable *NJPiGpuDanmakuServices(void) {
+    static NSHashTable *services;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        services = [NSHashTable weakObjectsHashTable];
+    });
+    return services;
+}
+
+static void NJPiGpuRememberDanmakuService(id service) {
+    if (!service) {
+        return;
+    }
+    @synchronized (NJPiGpuDanmakuServices()) {
+        if (NJPiGpuDanmakuServices().count >= 8) {
+            return;
+        }
+        [NJPiGpuDanmakuServices() addObject:service];
+    }
+}
+
+// 录制/下载播放那类路径不用 BFCCRONRenderView：8.89 转储里 `BBPlayerDanmakuVoutView`
+// 是个 NSObject（objc-headers.txt:1404291），自己持有 `BFCChronosRendererWrapper *_rendererWrapper`
+// 这个 ivar（没有 getter，所以这条路只能用 KVC），并且它没有自己的 init ——
+// `-setupRenderer:` 才是 ivar 被装上的时刻，登记发生在下面那个 hook 里。
+static NSHashTable *NJPiGpuDanmakuVouts(void) {
+    static NSHashTable *vouts;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        vouts = [NSHashTable weakObjectsHashTable];
+    });
+    return vouts;
+}
+
+static void NJPiGpuRememberDanmakuVout(id vout) {
+    if (!vout) {
+        return;
+    }
+    @synchronized (NJPiGpuDanmakuVouts()) {
+        if (NJPiGpuDanmakuVouts().count >= 8) {
+            return;
+        }
+        [NJPiGpuDanmakuVouts() addObject:vout];
+    }
+}
+
+// 沿对象图找在线路径的 BFCChronosRendererWrapper；途经对象的真实类名带出来做诊断
+// （route 名只能说明「走的是对象图这条路」，是哪个渲染视图要看 rv=）。
+static id NJPiGpuOnlineRendererWrapper(const char **renderViewClass, const char **wrapperClass) {
+    NSArray *services;
+    @synchronized (NJPiGpuDanmakuServices()) {
+        services = [NJPiGpuDanmakuServices() allObjects];
+    }
+    for (id service in services) {
+        id context = NJPiGpuObjectGetter(service, @selector(context));
+        if (!context) {
+            continue;
+        }
+        id chronos = NJPiGpuObjectGetter(context, @selector(chronos));
+        if (!chronos) {
+            continue;
+        }
+        id renderView = NJPiGpuObjectGetter(chronos, @selector(chronosView));
+        if (!renderView) {
+            continue;
+        }
+        id wrapper = NJPiGpuObjectGetter(renderView, @selector(rendererWrapper));
+        if (!wrapper) {
+            continue;
+        }
+        if (renderViewClass) {
+            *renderViewClass = object_getClassName(renderView);
+        }
+        if (wrapperClass) {
+            *wrapperClass = object_getClassName(wrapper);
+        }
+        return wrapper;
+    }
+    return nil;
+}
+
+// PiP 里 B 站自己的弹幕时钟不推进（display link 被暂停），只调 copyPixelBuffer 会反复
+// 拿到同一帧。-[BFCChronosRendererWrapper updateSyncForTimeStep:] 的参数是「秒」
+// （实现里 ×1e9 换成纳秒），所以按两次取帧之间的真实秒差自驱一次。Δt 必须有上限：
+// 切后台再回前台时秒差可能是几十秒，直接喂进去会让弹幕一次性跳到最新。
+typedef void (*NJPiGpuUpdateSyncIMP)(id, SEL, double);
+#define NJP_GPU_DRIVE_CLAMP_SECONDS 1.0
+#define NJP_GPU_DRIVE_ONE_FRAME (1.0 / 30.0)
+
+static void NJPiGpuDriveChronos(id wrapper) {
+    SEL selector = @selector(updateSyncForTimeStep:);
+    if (!wrapper) {
+        return;
+    }
+    if (![wrapper respondsToSelector:selector]) {
+        return;
+    }
+    IMP implementation = [wrapper methodForSelector:selector];
+    if (!implementation) {
+        return;
+    }
+    if (NJPiGpuTimebase.den == 0) {
+        mach_timebase_info(&NJPiGpuTimebase);
+    }
+    static __unsafe_unretained id drivenWrapper = nil;
+    static uint64_t lastTick = 0;
+    uint64_t now = mach_absolute_time();
+    double seconds = 0.0;
+    if (lastTick != 0 && drivenWrapper == wrapper) {
+        seconds = NJPiGpuNanoseconds((unsigned long long)(now - lastTick)) / 1e9;
+        if (seconds > NJP_GPU_DRIVE_CLAMP_SECONDS) {
+            seconds = NJP_GPU_DRIVE_ONE_FRAME;
+        }
+    }
+    lastTick = now;
+    drivenWrapper = wrapper;
+    ((NJPiGpuUpdateSyncIMP)implementation)(wrapper, selector, seconds);
+}
+
+// 取到帧之后的统一处理：来源（route）只在变化时打印一次；只有 BGRA 能被 blend pass
+// 直接采样，其它格式仍按现有约定记 fmt 失败并退回未合成的视频帧。
+static char NJPiGpuLastDanmakuRoute[64] = "";
+
+static CVPixelBufferRef NJPiGpuAcceptDanmakuBuffer(CVPixelBufferRef pixelBuffer,
+                                                   const char *route,
+                                                   const char *ownerClass,
+                                                   const char *detail,
+                                                   CVImageBufferRef sourceImage) {
+    if (!pixelBuffer) {
+        return NULL;
+    }
+    if (strcmp(NJPiGpuLastDanmakuRoute, route) != 0) {
+        snprintf(NJPiGpuLastDanmakuRoute, sizeof(NJPiGpuLastDanmakuRoute), "%s", route);
+        NJPiPDiag("gpu dmsrc=%s dm=%s%s frame=%lux%lu dmsize=%lux%lu",
+                  route,
+                  ownerClass,
+                  detail ? detail : "",
+                  (unsigned long)CVPixelBufferGetWidth(sourceImage),
+                  (unsigned long)CVPixelBufferGetHeight(sourceImage),
+                  (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
+                  (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
+    }
+    OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
+    if (format != kCVPixelFormatType_32BGRA) {
+        // Only a BGRA source can be sampled by the blend pass without another
+        // conversion step; report it and fall back to the raw video frame.
+        NJPiGpuNoteFailure("fmt", NULL);
+        NJPiPDiag("gpu fail reason=fmt dmfmt=%s size=%lux%lu",
+                  NJPiGpuFourcc(format),
+                  (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
+                  (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
+        CVPixelBufferRelease(pixelBuffer);
+        return NULL;
+    }
+    return pixelBuffer;
+}
+
 static CVPixelBufferRef NJPiGpuDanmakuPixelBuffer(CVImageBufferRef sourceImage) {
+    // 1) 在线路径：对象图 + 自驱时间（见上面的注释）。
+    const char *renderViewClass = "unknown";
+    const char *wrapperClass = "unknown";
+    id wrapper = NJPiGpuOnlineRendererWrapper(&renderViewClass, &wrapperClass);
+    if (wrapper) {
+        NJPiGpuDriveChronos(wrapper);
+        char detail[128];
+        snprintf(detail, sizeof(detail), " rv=%s", renderViewClass);
+        CVPixelBufferRef pixelBuffer = NJPiGpuAcceptDanmakuBuffer(
+            NJPiGpuCallCopyPixelBuffer(wrapper),
+            "online.bfccronrenderview",
+            wrapperClass,
+            detail,
+            sourceImage);
+        if (pixelBuffer) {
+            return pixelBuffer;
+        }
+    }
+    // 2) 录制/下载路径：登记过的 BBPlayerDanmakuVoutView -> _rendererWrapper（KVC，
+    //    这个类没有 getter）。在线路径不会走到这里：它没有 vout 对象。
+    NSArray *vouts;
+    @synchronized (NJPiGpuDanmakuVouts()) {
+        vouts = [NJPiGpuDanmakuVouts() allObjects];
+    }
+    for (id vout in vouts) {
+        id voutWrapper = NJPiGpuValueForKey(vout, @"rendererWrapper");
+        CVPixelBufferRef pixelBuffer = NJPiGpuAcceptDanmakuBuffer(NJPiGpuCallCopyPixelBuffer(voutWrapper),
+                                                                  "record.danmakuvout",
+                                                                  object_getClassName(vout),
+                                                                  NULL,
+                                                                  sourceImage);
+        if (pixelBuffer) {
+            return pixelBuffer;
+        }
+    }
+    // 3) 旧路径保留为 fallback：从被跟踪的 view 走 KVC。在线路径命中不了它
+    //    （`-[BBPlayerDanmakuService view]` 给的是容器视图），能命中的只有把渲染器
+    //    挂在 view 上的那类，所以整条 fallback 统一记成 record.danmakuvout。
     NSArray<NJPiPOverlayState *> *states;
     @synchronized (NJPiPOverlayStates()) {
         states = [NJPiPOverlayStates() allObjects];
@@ -2364,49 +2597,21 @@ static CVPixelBufferRef NJPiGpuDanmakuPixelBuffer(CVImageBufferRef sourceImage) 
         // (CAMetalLayer.delegate is the renderer in the BFCMetalLayerRender pattern),
         // and the wrapper ivar behind each of them.
         id holders[] = { danmakuView, danmakuLayer.delegate };
-        const char *holderNames[] = { "view", "layer-delegate" };
         for (NSUInteger index = 0; index < 2; index++) {
             id holder = holders[index];
             if (!holder) {
                 continue;
             }
             CVPixelBufferRef pixelBuffer = NJPiGpuCallCopyPixelBuffer(holder);
-            char route[64];
-            snprintf(route, sizeof(route), "%s", holderNames[index]);
             if (!pixelBuffer) {
-                id wrapper = NJPiGpuValueForKey(holder, @"rendererWrapper");
-                pixelBuffer = NJPiGpuCallCopyPixelBuffer(wrapper);
-                if (pixelBuffer) {
-                    snprintf(route, sizeof(route), "%s.rendererWrapper", holderNames[index]);
-                }
+                id fallbackWrapper = NJPiGpuValueForKey(holder, @"rendererWrapper");
+                pixelBuffer = NJPiGpuCallCopyPixelBuffer(fallbackWrapper);
             }
-            if (!pixelBuffer) {
-                continue;
+            pixelBuffer = NJPiGpuAcceptDanmakuBuffer(pixelBuffer, "record.danmakuvout",
+                                                     object_getClassName(holder), NULL, sourceImage);
+            if (pixelBuffer) {
+                return pixelBuffer;
             }
-            static char lastRoute[64] = "";
-            if (strcmp(lastRoute, route) != 0) {
-                snprintf(lastRoute, sizeof(lastRoute), "%s", route);
-                NJPiPDiag("gpu dmsrc=%s dm=%s frame=%lux%lu dmsize=%lux%lu",
-                          route,
-                          object_getClassName(holder),
-                          (unsigned long)CVPixelBufferGetWidth(sourceImage),
-                          (unsigned long)CVPixelBufferGetHeight(sourceImage),
-                          (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
-                          (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
-            }
-            OSType format = CVPixelBufferGetPixelFormatType(pixelBuffer);
-            if (format != kCVPixelFormatType_32BGRA) {
-                // Only a BGRA source can be sampled by the blend pass without another
-                // conversion step; report it and fall back to the raw video frame.
-                NJPiGpuNoteFailure("fmt", NULL);
-                NJPiPDiag("gpu fail reason=fmt dmfmt=%s size=%lux%lu",
-                          NJPiGpuFourcc(format),
-                          (unsigned long)CVPixelBufferGetWidth(pixelBuffer),
-                          (unsigned long)CVPixelBufferGetHeight(pixelBuffer));
-                CVPixelBufferRelease(pixelBuffer);
-                return NULL;
-            }
-            return pixelBuffer;
         }
     }
     return NULL;
@@ -3460,6 +3665,11 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPTrace] DanmakuService init self=%p result=%p context=%p contextClass=%{public}s thread=%{public}s",
                      self, result, context, NJPiPClassName(context), NSThread.currentThread.description.UTF8String);
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
+    // GPU 合成那条路要的是对象图的第一环（服务本体）；context 不在这里存，
+    // 取帧时从 self 现读 -context，播放器复用换绑后自然就跟着换。
+    NJPiGpuRememberDanmakuService(self);
+#endif
     return result;
 }
 
@@ -3687,21 +3897,26 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 %end
 
-@interface BBPlayerDanmakuVoutView : UIView
+@interface BBPlayerDanmakuVoutView : NSObject
+- (void)setupRenderer:(id)renderer;
 @end
 
+// 这个类在 8.89 转储里是 NSObject（tmp/re89/objc-headers.txt:1404291），不是 UIView，
+// 所以原来那个 -didMoveToWindow hook 永远不会被调用（UIKit 不会给 NSObject 发这个方法），
+// 它想做的「拿到 vout 对象时登记」也就从来没发生过。这里改成登记在它真正发生的时刻：
+// -setupRenderer: 是把 BFCChronosRendererWrapper 装进 _rendererWrapper 的地方。
+// 在线路径不依赖这里（走上面的对象图），这里只给录制/下载那条 fallback 用。
+// 整块包在开关里：GPU 合成关掉时连这个 hook 都不安装，保持默认配置零行为变化。
+#if NJ_PIP_GPU_COMPOSITE_ENABLED
 %hook BBPlayerDanmakuVoutView
 
-- (void)didMoveToWindow {
+- (void)setupRenderer:(id)renderer {
     %orig;
-    NJRegisterPiPDanmakuView(self);
-    if (self.window) {
-        NJRememberAttachedPiPDanmakuView(self);
-        NJPrewarmTrackedPiPControllersWithSourceView(self);
-    }
+    NJPiGpuRememberDanmakuVout(self);
 }
 
 %end
+#endif
 
 // Bilibili 8.89 can enqueue through either the display layer compatibility API
 // or its iOS 17+ renderer.  A thread-local depth guard ensures one mirror enqueue
