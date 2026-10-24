@@ -2035,10 +2035,10 @@ static unsigned long long NJPiGpuFailTotal(void) {
 
 // mach_absolute_time() ticks are not nanoseconds; convert with the process timebase.
 static double NJPiGpuNanoseconds(unsigned long long ticks) {
-    if (NJPiGpuTimebase.den == 0) {
+    if (NJPiGpuTimebase.denom == 0) {
         return 0.0;
     }
-    return (double)ticks * (double)NJPiGpuTimebase.numer / (double)NJPiGpuTimebase.den;
+    return (double)ticks * (double)NJPiGpuTimebase.numer / (double)NJPiGpuTimebase.denom;
 }
 
 static void NJPiGpuSummaryTick(void) {
@@ -2252,8 +2252,10 @@ static void NJPiGpuSetup(void) {
         }
         CVPixelBufferRelease(probe);
     }
-    NJPiPDiag("gpu init device=%s lowPower=%d texcache=ok",
-              NJPiGpuDevice.name.UTF8String ?: "-", (int)NJPiGpuDevice.isLowPowerDevice);
+    // lowPower field dropped on purpose: the diagnostic does not need it, and the SDK
+    // used by CI does not expose it as an ObjC property on id<MTLDevice>.
+    NJPiPDiag("gpu init device=%s texcache=ok",
+              NJPiGpuDevice.name.UTF8String ?: "-");
 }
 
 // Target pixel buffer pool: same width/height as the incoming frame. The pixel
@@ -2666,17 +2668,16 @@ static void NJPiGpuYuvMatrix(OSType sourceFormat, BOOL bt709, float *matrix) {
 
 // The matrix a buffer asks for, read from its own attachments (never assumed).
 static BOOL NJPiGpuWantsBT709(CVImageBufferRef image) {
-    CFDictionaryRef attachments = CVBufferCopyAttachments(image, kCVImageBufferYCbCrMatrixKey);
-    if (!attachments) {
-        return NO;
-    }
-    CFTypeRef value = CFDictionaryGetValue(attachments, kCVImageBufferYCbCrMatrixKey);
+    // Read only the YCbCr-matrix attachment to pick the shader matrix.
+    // CVBufferGetAttachment is a "Get": the returned CFTypeRef is NOT owned by us, so
+    // it must NOT be CFReleased — read it immediately, guarded by a CFString type check.
+    // (The whole-frame "Copy" path that preserves attachments lives in the wrap below.)
+    CFTypeRef value = CVBufferGetAttachment(image, kCVImageBufferYCbCrMatrixKey, NULL);
     BOOL bt709 = NO;
     if (value && CFGetTypeID(value) == CFStringGetTypeID()) {
-        bt709 = CFStringCompare((CFStringRef)value, kCVImageBufferYCbCrMatrix_ITU_R_709_6, 0)
+        bt709 = CFStringCompare((CFStringRef)value, kCVImageBufferYCbCrMatrix_ITU_R_709_2, 0)
                 == kCFCompareEqualTo;
     }
-    CFRelease(attachments);
     return bt709;
 }
 
@@ -2824,6 +2825,19 @@ static id NJPiGpuComposite(id originalSampleObject) {
                 NJPiGpuMaxDurationNs = (unsigned long long)elapsedNs;
             }
         }
+        // Carry the incoming frame's attachment metadata (colour primaries, transfer
+        // function, YCbCr matrix, etc.) onto the target image buffer, so the format
+        // description built from it below — and the sample created from that buffer —
+        // describe the same colour space as the incoming frame.
+        // CoreVideo plural API is CVBufferGetAttachments (a "Get": the returned
+        // CFDictionaryRef is NOT owned by us, so it must NOT be CFReleased) paired with
+        // CVBufferSetAttachments. Asking for the ShouldPropagate mode returns exactly the
+        // metadata that is meant to carry onto derived frames. It may legitimately come
+        // back empty, so only set it when there is at least one attachment.
+        CFDictionaryRef sourceImageAttachments = CVBufferGetAttachments(sourceImage, kCVAttachmentMode_ShouldPropagate);
+        if (sourceImageAttachments && CFDictionaryGetCount(sourceImageAttachments) > 0) {
+            CVBufferSetAttachments(targetImage, sourceImageAttachments, kCVAttachmentMode_ShouldPropagate);
+        }
         // Timeline stays untouched: the timing and the per-sample attachments of the
         // incoming sample are copied verbatim onto the wrapped one.
         CMVideoFormatDescriptionRef formatDescription = NULL;
@@ -2838,8 +2852,12 @@ static id NJPiGpuComposite(id originalSampleObject) {
             timing.presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(original);
             timing.decodeTimeStamp = kCMTimeInvalid;
         }
-        OSStatus status = CMSampleBufferCreate(kCFAllocatorDefault, targetImage, true, NULL, NULL,
-                                              formatDescription, 1, 1, &timing, 0, NULL, &wrapped);
+        // Build the sample directly from the target image buffer — the correct API for a
+        // pixel-buffer-backed sample (CMSampleBufferCreate wants a CMBlockBuffer, not a
+        // CVPixelBuffer). CreateReadyWithImageBuffer retains formatDescription, so our own
+        // +1 reference is still released just below: the retain/release stays balanced.
+        OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, targetImage,
+                                                                  formatDescription, &timing, &wrapped);
         CFRelease(formatDescription);
         if (status != noErr || !wrapped) {
             NJPiGpuNoteFailure("wrap", original);
