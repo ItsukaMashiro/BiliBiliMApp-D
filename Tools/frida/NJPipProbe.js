@@ -64,13 +64,37 @@
  *   Volume: every new state line is throttled to ≤ 1 per 5s per key, hot paths
  *   stay count-only, so total output stays well under 200 lines/minute.
  *
+ * v4 (nj-pip-probe-4): the ONLINE danmaku render chain, which the v2/v3
+ * targets never reached (they only ever saw the recording path's
+ * BBPlayerDanmakuVoutView). 8.89 statics put the online renderer behind the
+ * player context, and no probe line had ever confirmed it:
+ *   H1) cron_chain: once per PiP entry, walk the live BBPlayerDanmakuService →
+ *       context → chronos → chronosView → rendererWrapper chain and report one
+ *       line per hop (class + address), ending with copy/sync = whether the
+ *       final object answers copyPixelBuffer / updateSyncForTimeStep:. A
+ *       failure names the hop that broke. H1 itself never calls the renderer.
+ *   H2) cron_dm_poll: only while PiP is active and H1 resolved, ask that
+ *       wrapper for a frame every 2s (copyPixelBuffer ONLY — updateSync would
+ *       advance the engine's own clock) and compare the returned pointer with
+ *       the previous one: changed=1 means a new danmaku buffer appeared, a
+ *       repeated pointer means the image is frozen. Lines go out on a state
+ *       change plus one keep-alive per 30s. The +1 buffer is released with
+ *       CFRelease on every poll; the wrapper is retained only for the duration
+ *       of the poll. stopPictureInPicture ends the poll.
+ *   H3) ext_pixelbuf: count -[BFCCRONRenderBaseView setExternalPixelBuffer:]
+ *       (the door a decoded-video buffer would be pushed through) and report at
+ *       most one line per 30s, only when the count moved. If the class has no
+ *       such selector, one hook_miss line says so and nothing else happens.
+ *   H1/H2/H3 measure only: no argument, return value or object state is changed,
+ *   and every path is wrapped so nothing throws into the host.
+ *
  * No Node.js APIs, no require, no process — Frida/ObjC bridge + NativeFunction only.
  */
 (function () {
   'use strict';
 
-  var PROBE_VERSION = 'nj-pip-probe-3';
-  var PROBE_V = 3;
+  var PROBE_VERSION = 'nj-pip-probe-4';
+  var PROBE_V = 4;
   var MAX_LINE = 400;
 
   // ---------------------------------------------------------------------------
@@ -440,6 +464,8 @@
   try {
     globalThis.njDumpState = dumpState;
     globalThis.njProbeLog = log;
+    globalThis.njCronResolve = resolveCronChain; // v4 H1: re-resolve on demand
+    globalThis.njCronPoll = function (on) { if (on) startCronPoll(); else stopCronPoll(); };
   } catch (e) {}
 
   // ---------------------------------------------------------------------------
@@ -1335,6 +1361,326 @@
     }
   }
 
+  // --- v4 H1/H2: the online chronos danmaku chain ---------------------------
+  // Static forensics (HANDOFF 15.11) says the online danmaku renderer is NOT
+  // reachable through -[BBPlayerDanmakuService view] (that returns a
+  // BBPlayerChronosContainerView); it is reached through the player context:
+  //   service.context → BBPlayerContext -chronos → BBPlayerChronos -chronosView
+  //   → BFCCRONRenderView / …V2 -rendererWrapper → BFCChronosRendererWrapper
+  // H1 walks that chain once per PiP entry and reports every hop (a failure
+  // names the hop that broke). H2 then asks that wrapper for a frame every 2s
+  // while PiP is active, to see whether the danmaku layer is still producing
+  // new buffers. H1 never calls into the renderer; H2 calls ONLY
+  // -copyPixelBuffer — never -updateSyncForTimeStep:, which would advance the
+  // engine's own clock. The +1 buffer that -copyPixelBuffer returns is handed
+  // straight to CFRelease here, so nothing is kept and nothing leaks.
+  var CRON_HOPS = ['context', 'chronos', 'chronosView', 'rendererWrapper'];
+  var CRON_POLL_MS = 2000;
+  var CRON_POLL_CAP_MS = 900000; // stop asking after 15 min of one PiP session
+  var CRON_KEEPALIVE_MS = 30000; // one "same buffer" line per 30s while polling
+
+  var objcRetain = null, objcRelease = null, cfRelease = null;
+  var CVPixelBufferGetWidth = null, CVPixelBufferGetHeight = null;
+  try {
+    var rA = findExport('libobjc.A.dylib', 'objc_retain');
+    var rB = findExport('libobjc.A.dylib', 'objc_release');
+    var rC = findExport('CoreFoundation', 'CFRelease');
+    if (rA && rB && rC) {
+      objcRetain = new NativeFunction(rA, 'pointer', ['pointer']);
+      objcRelease = new NativeFunction(rB, 'pointer', ['pointer']);
+      cfRelease = new NativeFunction(rC, 'void', ['pointer']);
+    }
+  } catch (e) {
+    objcRetain = null; objcRelease = null; cfRelease = null;
+  }
+  try {
+    var wA = findExport('CoreVideo', 'CVPixelBufferGetWidth');
+    var wB = findExport('CoreVideo', 'CVPixelBufferGetHeight');
+    if (wA) CVPixelBufferGetWidth = new NativeFunction(wA, 'uint', ['pointer']);
+    if (wB) CVPixelBufferGetHeight = new NativeFunction(wB, 'uint', ['pointer']);
+  } catch (e2) {
+    CVPixelBufferGetWidth = null; CVPixelBufferGetHeight = null;
+  }
+
+  // resolved chain; `wrapper` is a pointer this probe retained itself (H1 keeps
+  // it alive only while H2 is polling, and releases it when PiP stops)
+  var cron = {
+    resolved: false, polling: false, pipActive: false, timer: null,
+    wrapper: null, copyFn: null, copySel: null,
+    state: null, lastKeepAliveAt: 0, polls: 0, startedAt: 0
+  };
+
+  function cronReleaseWrapper() {
+    try {
+      if (cron.wrapper !== null && objcRelease !== null) objcRelease(cron.wrapper);
+    } catch (e) {}
+    cron.wrapper = null;
+    cron.copyFn = null;
+    cron.copySel = null;
+    cron.resolved = false;
+    cron.state = null;
+  }
+
+  // one hop of the chain: a no-argument getter, guarded by respondsToSelector:
+  function cronHop(receiver, hop) {
+    try {
+      if (receiver === null || receiver === undefined) return { ok: false, why: 'nil-recv' };
+      if (typeof receiver.respondsToSelector_ !== 'function') return { ok: false, why: 'no-bridge' };
+      if (!receiver.respondsToSelector_(hop)) return { ok: false, why: 'no-sel' };
+      var v = receiver[hop]();
+      if (v === null || v === undefined) return { ok: false, why: 'nil' };
+      if (typeof v.isNull === 'function' && v.isNull()) return { ok: false, why: 'nil' };
+      return {
+        ok: true, obj: v, cls: classNameOf(v),
+        addr: (v.handle !== undefined) ? v.handle.toString() : null
+      };
+    } catch (e) {
+      return { ok: false, why: 'error', err: trunc(e.message || ('' + e), 90) };
+    }
+  }
+
+  function resolveCronChain(reason) {
+    try {
+      cronReleaseWrapper();
+      var cls = findClass('BBPlayerDanmakuService');
+      if (cls === null) {
+        log('cron_chain', { step: 0, hop: 'service', present: 0, reason: reason });
+        return false;
+      }
+      var insts = [];
+      try { insts = ObjC.chooseSync(cls); } catch (e0) { insts = []; }
+      var svc = null;
+      for (var i = 0; i < insts.length && i < 4; i++) {
+        try {
+          if (insts[i] && !insts[i].isNull()) { svc = insts[i]; break; }
+        } catch (e1) {}
+      }
+      if (svc === null) {
+        log('cron_chain', { step: 0, hop: 'service', found: 0, fail: 'no-instance', reason: reason });
+        return false;
+      }
+      log('cron_chain', { step: 0, hop: 'service', n: insts.length, cls: classNameOf(svc), addr: svc.handle.toString() });
+      var cur = svc;
+      for (var h = 0; h < CRON_HOPS.length; h++) {
+        var r = cronHop(cur, CRON_HOPS[h]);
+        if (!r.ok) {
+          log('cron_chain', { step: h + 1, hop: CRON_HOPS[h], fail: r.why, err: r.err || null });
+          return false;
+        }
+        log('cron_chain', { step: h + 1, hop: CRON_HOPS[h], cls: r.cls, addr: r.addr });
+        cur = r.obj;
+      }
+      var hasCopy = false, hasSync = false;
+      try { hasCopy = !!cur.respondsToSelector_('copyPixelBuffer'); } catch (e2) {}
+      try { hasSync = !!cur.respondsToSelector_('updateSyncForTimeStep:'); } catch (e3) {}
+      log('cron_chain', {
+        step: CRON_HOPS.length + 1, hop: 'ready', cls: classNameOf(cur),
+        addr: cur.handle.toString(), copy: hasCopy ? 1 : 0, sync: hasSync ? 1 : 0
+      });
+      if (!hasCopy) return false;
+      if (objcRetain === null || cfRelease === null) {
+        // without CFRelease the +1 buffer of every poll would leak, and without
+        // objc_retain the pointer below could die under us: measure nothing.
+        log('cron_poll', { off: 1, why: (objcRetain === null) ? 'no-objc-retain' : 'no-cfrelease' });
+        return false;
+      }
+      var imp = null;
+      try {
+        var m = cur.copyPixelBuffer;
+        if (m && m.implementation) imp = m.implementation;
+      } catch (e4) { imp = null; }
+      if (imp === null) {
+        log('cron_poll', { off: 1, why: 'no-imp' });
+        return false;
+      }
+      var kept = null;
+      try { kept = objcRetain(cur.handle); } catch (e5) { kept = null; }
+      if (kept === null || kept.isNull()) {
+        log('cron_poll', { off: 1, why: 'retain-failed' });
+        return false;
+      }
+      cron.wrapper = kept;
+      cron.copySel = ObjC.selector('copyPixelBuffer');
+      cron.copyFn = new NativeFunction(imp, 'pointer', ['pointer', 'pointer']);
+      cron.resolved = true;
+      return true;
+    } catch (e) {
+      log('cron_chain', { step: -1, hop: 'resolve', error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // H2: is the danmaku engine still producing frames? Pointer identity only —
+  // same pointer twice means the compositor handed back the same buffer, which
+  // is the cheap, non-invasive signal for "the image is frozen".
+  function cronPollTick() {
+    try {
+      if (!cron.resolved || cron.wrapper === null || cron.copyFn === null) return;
+      if (Date.now() - cron.startedAt > CRON_POLL_CAP_MS) {
+        log('cron_poll', { stop: 1, reason: 'cap', n: cron.polls });
+        stopCronPoll();
+        return;
+      }
+      var buf = cron.copyFn(cron.wrapper, cron.copySel);
+      cron.polls++;
+      var isNil = (buf === null || buf === undefined || buf.isNull());
+      var st = isNil ? '' : buf.toString();
+      var changed = (st !== '' && st !== cron.state) ? 1 : 0;
+      var now = Date.now();
+      var keepAlive = (!changed && st === cron.state && now - cron.lastKeepAliveAt >= CRON_KEEPALIVE_MS);
+      if (changed || st !== cron.state || keepAlive) {
+        var d = { n: cron.polls, changed: changed, ptr: (st === '' ? null : st) };
+        if (!isNil) {
+          if (CVPixelBufferGetWidth !== null) { try { d.w = CVPixelBufferGetWidth(buf); } catch (e1) {} }
+          if (CVPixelBufferGetHeight !== null) { try { d.h = CVPixelBufferGetHeight(buf); } catch (e2) {} }
+        }
+        log('cron_dm_poll', d);
+        if (keepAlive) cron.lastKeepAliveAt = now;
+      }
+      cron.state = st;
+      if (!isNil && cfRelease !== null) cfRelease(buf); // the -copy method owes us one
+    } catch (e) {
+      log('cron_dm_poll', { error: trunc(e.message || ('' + e), 120) });
+    }
+  }
+
+  function cronPollTickOnMain() {
+    // the renderer is driven from the main thread by its own display link, so
+    // the probe asks for a frame there too instead of from the JS thread
+    try {
+      if (typeof ObjC !== 'undefined' && typeof ObjC.schedule === 'function' && ObjC.mainQueue) {
+        ObjC.schedule(ObjC.mainQueue, function () { cronPollTick(); });
+        return;
+      }
+    } catch (e) {}
+    cronPollTick();
+  }
+
+  function startCronPoll() {
+    if (cron.polling) return;
+    cron.polling = true;
+    cron.startedAt = Date.now();
+    cron.lastKeepAliveAt = 0;
+    cron.timer = setInterval(function () {
+      try { cronPollTickOnMain(); } catch (e) {}
+    }, CRON_POLL_MS);
+  }
+
+  function stopCronPoll() {
+    try {
+      if (cron.timer !== undefined && cron.timer !== null) clearInterval(cron.timer);
+    } catch (e) {}
+    cron.timer = null;
+    cron.polling = false;
+    cron.polls = 0;
+    cronReleaseWrapper();
+  }
+
+  // H1/H2 trigger: PiP really starting / stopping. Two extra interceptors on a
+  // method the v2 config already hooks is supported (see routeHook).
+  function cronStartHook(className, cls, selName) {
+    var key = 'cronstart ' + className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      Interceptor.attach(m.implementation, {
+        onEnter: function () {
+          try {
+            st.n++;
+            var first = !cron.pipActive;
+            cron.pipActive = true;
+            if (!first) return;
+            if (resolveCronChain('pip_start')) startCronPoll();
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'cronstart' });
+      return true;
+    } catch (e2) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e2.message || ('' + e2), 120) });
+      return false;
+    }
+  }
+
+  function cronStopHook(className, cls, selName) {
+    var key = 'cronstop ' + className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      Interceptor.attach(m.implementation, {
+        onEnter: function () {
+          try {
+            st.n++;
+            if (!cron.pipActive) return;
+            cron.pipActive = false;
+            stopCronPoll();
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'cronstop' });
+      return true;
+    } catch (e2) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e2.message || ('' + e2), 120) });
+      return false;
+    }
+  }
+
+  // --- v4 H3: is the decoded video fed into the Metal danmaku view? ---------
+  // -[BFCCRONRenderBaseView setExternalPixelBuffer:] is the door an external
+  // (decoded video) buffer would be pushed through. Only a call counter; one
+  // line per 30s at most, and only when the count moved (or once, to say that
+  // a mounted hook has seen nothing at all).
+  var extpb = { attached: false, n: 0, cls: null, reported: -1, zeroSaid: false };
+
+  function extpbHook(className, cls, selName) {
+    var key = 'extpb ' + className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) {
+          try {
+            extpb.n++;
+            if (extpb.cls === null) extpb.cls = objInfo(args[0]);
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      extpb.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'extpb' });
+      return true;
+    } catch (e2) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e2.message || ('' + e2), 120) });
+      return false;
+    }
+  }
+
+  var extpbTimer = null;
+  function startExtpbTicker() {
+    if (extpbTimer !== null) return;
+    extpbTimer = setInterval(function () {
+      try {
+        if (extpb.n === extpb.reported) return;
+        if (extpb.n === 0 && extpb.zeroSaid) return;
+        if (extpb.n === 0 && !extpb.attached) return;
+        if (extpb.n === 0) extpb.zeroSaid = true;
+        extpb.reported = extpb.n;
+        log('ext_pixelbuf', { count: extpb.n, cls: (extpb.cls === null) ? null : extpb.cls.cls, addr: (extpb.cls === null) ? null : extpb.cls.addr });
+      } catch (e) {}
+    }, 30000);
+  }
+
   // mounted hook points, reported by probe_boot / probe_ready
   function mountedCount() {
     var n = 0;
@@ -1390,7 +1736,13 @@
     { cls: 'AVPlayerItem', sel: '- setCustomVideoCompositor:', mode: 'route', route: 'avplayer' },
     { cls: 'AVPlayerLayer', sel: '- setVideoGravity:', mode: 'route', route: 'avplayer' },
     // v3 G5: the PiP host view's backing layer class + instance count
-    { cls: 'BBPictureInPicture.PlayerView', sel: '+ layerClass', mode: 'pvp' }
+    { cls: 'BBPictureInPicture.PlayerView', sel: '+ layerClass', mode: 'pvp' },
+    // v4 H1/H2: resolve the online chronos danmaku chain when PiP really
+    // starts; the 2s frame-alive poll runs only between start and stop.
+    { cls: 'AVPictureInPictureController', sel: '- startPictureInPicture', mode: 'cronstart' },
+    { cls: 'AVPictureInPictureController', sel: '- stopPictureInPicture', mode: 'cronstop' },
+    // v4 H3: is a decoded-video buffer ever pushed into the Metal danmaku view?
+    { cls: 'BFCCRONRenderBaseView', sel: '- setExternalPixelBuffer:', mode: 'extpb' }
   ];
 
   var fxLastPending = null;
@@ -1401,11 +1753,12 @@
     for (var i = 0; i < FX_METHODS.length; i++) {
       var e = FX_METHODS[i];
       var key = e.cls + ' ' + e.sel;
-      // route hooks live alongside (not instead of) a v2 hook on the same IMP,
-      // so they keep a separate bookkeeping key.
-      var dkey = (e.mode === 'route') ? ('route ' + key) : key;
+      // route / v4 hooks live alongside (not instead of) a v2 hook on the same
+      // IMP, so they keep a separate bookkeeping key.
+      var dual = (e.mode === 'route' || e.mode === 'cronstart' || e.mode === 'cronstop' || e.mode === 'extpb');
+      var dkey = dual ? (e.mode + ' ' + key) : key;
       if (counters[dkey] && counters[dkey].attached) continue;
-      if (e.mode !== 'route') {
+      if (!dual) {
         if (instCounters[key]) continue;
         if (instrumented[key]) continue;
         if (key === 'IJKSDLSampleBufferView + layerClass' && counters['layerclass IJKSDLSampleBufferView']) continue;
@@ -1437,6 +1790,9 @@
         else if (e.mode === 'pixfmt') ok = pixfmtHook(e.cls, cls, e.sel);
         else if (e.mode === 'route') ok = routeHook(e.cls, cls, e.sel, e.route);
         else if (e.mode === 'pvp') ok = pipPlayerViewProbe(e.cls);
+        else if (e.mode === 'cronstart') ok = cronStartHook(e.cls, cls, e.sel);
+        else if (e.mode === 'cronstop') ok = cronStopHook(e.cls, cls, e.sel);
+        else if (e.mode === 'extpb') ok = extpbHook(e.cls, cls, e.sel);
       } catch (err) { ok = false; }
       if (!ok) pending.push(key);
     }
@@ -1536,6 +1892,12 @@
     startLayerStateTicker(); // v3 G2: 5s state line per live AVSampleBufferDisplayLayer
   } catch (e) {
     log('setup_error', { step: 'layer_state_ticker', error: trunc(e.message || ('' + e), 150) });
+  }
+
+  try {
+    startExtpbTicker(); // v4 H3: 30s counter line for setExternalPixelBuffer:
+  } catch (e) {
+    log('setup_error', { step: 'extpb_ticker', error: trunc(e.message || ('' + e), 150) });
   }
 
   try {
