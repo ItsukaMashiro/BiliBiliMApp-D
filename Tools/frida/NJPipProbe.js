@@ -88,13 +88,32 @@
  *   H1/H2/H3 measure only: no argument, return value or object state is changed,
  *   and every path is wrapped so nothing throws into the host.
  *
+ * v5 (nj-pip-probe-5): the mixed-offscreen candidate (third PiP path,借官方
+ * 离屏混合渲染取帧). Same passive rules: measure only, never change arguments,
+ * returns or objects; everything wrapped.
+ *   I1) mx_probe: on the H1 chain walk, at the chronosView hop, one extra line
+ *       with the REAL cron view class name (BFCCRONRenderView vs …V2 — the
+ *       AB pick is runtime-only) plus responds bits for the three offscreen
+ *       entry points: gmi = -getMixedImage on the view, gri = -getRendererImage
+ *       on the view, omi = -offscreenMixedImage on the chronos object of the
+ *       same chain. Responds checks only; nothing is called, no image is made.
+ *       If the chain breaks after the view hop the line is still emitted.
+ *   I2) mx_alive: while the H2 poll runs, once per 30s ask the retained
+ *       chronos object for its current chronosView again (same getter H1
+ *       already walks) and compare the pointer with the one I1 saw:
+ *       same=0 means the app swapped views mid-PiP; win reports whether that
+ *       view has a window (window=0 means its own display link is paused, so
+ *       its textures would be frozen). The chronos pointer is retained by the
+ *       probe and released when the chain is released; the view pointer from
+ *       the re-read is never retained.
+ *
  * No Node.js APIs, no require, no process — Frida/ObjC bridge + NativeFunction only.
  */
 (function () {
   'use strict';
 
-  var PROBE_VERSION = 'nj-pip-probe-4';
-  var PROBE_V = 4;
+  var PROBE_VERSION = 'nj-pip-probe-5';
+  var PROBE_V = 5;
   var MAX_LINE = 400;
 
   // ---------------------------------------------------------------------------
@@ -1419,6 +1438,90 @@
     cron.copySel = null;
     cron.resolved = false;
     cron.state = null;
+    mxReleaseChronos(); // v5 I2: the retained chain object goes with the chain
+  }
+
+  // --- v5 I1/I2: the mixed-offscreen candidate -------------------------------
+  // The third PiP path replays the app's own offscreen mixed render, so the
+  // probe answers three static questions at the chain walk (which view class is
+  // live — the AB pick V1/V2 is runtime-only — and which offscreen entry points
+  // it answers) and one dynamic one (does that same view stay alive and
+  // windowed while PiP runs). Only respondsToSelector checks plus one extra
+  // no-argument getter per 30s through an object the probe retained; no image
+  // is ever made, nothing is called on the view itself.
+  var MX_ALIVE_MS = 30000;
+  var mx = { chronos: null, viewAddr: null, lastAliveAt: 0 };
+
+  function mxReleaseChronos() {
+    try {
+      if (mx.chronos !== null && objcRelease !== null) objcRelease(mx.chronos);
+    } catch (e) {}
+    mx.chronos = null;
+    mx.viewAddr = null;
+    mx.lastAliveAt = 0;
+  }
+
+  // I1: one line per chain walk, at the chronosView hop (also when that hop
+  // itself failed — a nil view is the finding then).
+  function mxProbeReport(viewR, chronosR, reason) {
+    try {
+      if (viewR === null) return;
+      var d = {
+        reason: reason,
+        view: viewR.ok ? 1 : 0,
+        cls: viewR.cls || null,
+        addr: viewR.addr || null,
+        v2: (viewR.cls && viewR.cls.indexOf('V2') >= 0) ? 1 : 0
+      };
+      if (viewR.ok) {
+        try { d.gmi = viewR.obj.respondsToSelector_('getMixedImage') ? 1 : 0; } catch (e0) { d.gmi = 0; }
+        try { d.gri = viewR.obj.respondsToSelector_('getRendererImage') ? 1 : 0; } catch (e1) { d.gri = 0; }
+      }
+      if (chronosR !== null && chronosR.ok) {
+        try { d.omi = chronosR.obj.respondsToSelector_('offscreenMixedImage') ? 1 : 0; } catch (e2) { d.omi = 0; }
+      } else {
+        d.omi = 0;
+      }
+      log('mx_probe', d);
+      // keep the chain's chronos object alive so I2 can re-read the view later
+      mxReleaseChronos();
+      if (viewR.ok && chronosR !== null && chronosR.ok && objcRetain !== null) {
+        var kept = null;
+        try { kept = objcRetain(chronosR.obj.handle); } catch (e3) { kept = null; }
+        if (kept !== null && !(typeof kept.isNull === 'function' && kept.isNull())) {
+          mx.chronos = kept;
+          mx.viewAddr = viewR.addr;
+          mx.lastAliveAt = 0;
+        }
+      }
+    } catch (e) {
+      try { log('mx_probe', { error: trunc(e.message || ('' + e), 120) }); } catch (e9) {}
+    }
+  }
+
+  // I2: through the retained chronos object, re-read the current view pointer
+  // (same getter H1 walks, once per 30s) and ask it for its window. same=0 or
+  // win=0 mean the view's own display link cannot be producing fresh textures.
+  function mxAliveTick() {
+    try {
+      if (mx.chronos === null || typeof ObjC === 'undefined') return;
+      var now = Date.now();
+      if (now - mx.lastAliveAt < MX_ALIVE_MS) return;
+      mx.lastAliveAt = now;
+      var r = cronHop(new ObjC.Object(mx.chronos), 'chronosView');
+      var d = { same: (r.ok && r.addr === mx.viewAddr) ? 1 : 0, view: r.ok ? 1 : 0 };
+      if (r.ok) {
+        var win = -1;
+        try {
+          var w = r.obj.window();
+          win = (w === null || w === undefined || (typeof w.isNull === 'function' && w.isNull())) ? 0 : 1;
+        } catch (e0) { win = -1; }
+        d.win = win;
+      }
+      log('mx_alive', d);
+    } catch (e) {
+      try { log('mx_alive', { error: trunc(e.message || ('' + e), 120) }); } catch (e9) {}
+    }
   }
 
   // one hop of the chain: a no-argument getter, guarded by respondsToSelector:
@@ -1461,13 +1564,17 @@
       }
       log('cron_chain', { step: 0, hop: 'service', n: insts.length, cls: classNameOf(svc), addr: svc.handle.toString() });
       var cur = svc;
+      var chronosR = null;
       for (var h = 0; h < CRON_HOPS.length; h++) {
         var r = cronHop(cur, CRON_HOPS[h]);
         if (!r.ok) {
           log('cron_chain', { step: h + 1, hop: CRON_HOPS[h], fail: r.why, err: r.err || null });
+          if (h === 2) mxProbeReport(r, chronosR, reason); // v5 I1: a nil view is the finding
           return false;
         }
         log('cron_chain', { step: h + 1, hop: CRON_HOPS[h], cls: r.cls, addr: r.addr });
+        if (h === 1) chronosR = r; // BBPlayerChronos: where offscreenMixedImage lives
+        if (h === 2) mxProbeReport(r, chronosR, reason); // v5 I1: the cron view hop
         cur = r.obj;
       }
       var hasCopy = false, hasSync = false;
@@ -1515,6 +1622,7 @@
   // is the cheap, non-invasive signal for "the image is frozen".
   function cronPollTick() {
     try {
+      mxAliveTick(); // v5 I2: piggybacks on this timer (self-throttled to 30s)
       if (!cron.resolved || cron.wrapper === null || cron.copyFn === null) return;
       if (Date.now() - cron.startedAt > CRON_POLL_CAP_MS) {
         log('cron_poll', { stop: 1, reason: 'cap', n: cron.polls });
