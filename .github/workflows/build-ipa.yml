@@ -170,14 +170,23 @@ jobs:
             --output "$RUNNER_TEMP/frida-gadget.dylib.xz" \
             "https://github.com/frida/frida/releases/download/17.24.3/frida-gadget-17.24.3-ios-universal.dylib.xz"
           xz -d "$RUNNER_TEMP/frida-gadget.dylib.xz"
-          install -m 0755 "$RUNNER_TEMP/frida-gadget.dylib" "$APP_PATH/FridaGadget.dylib"
-          lipo -archs "$APP_PATH/FridaGadget.dylib" | grep -qw arm64
+          # 注入库一律放 .app/Frameworks/：这个包里已经三个注入库
+          # （libellekit / BilibiliVideoTools / libBiliBiliMDDylib）都在 Frameworks/ 下、
+          # 以 @executable_path/Frameworks/... 被加载，真机能起；而放 .app 根目录的
+          # FridaGadget.dylib 不在这条路径上，本地重签环节（按 .app/Frameworks/*.dylib
+          # 逐个签嵌套库）也不会覆盖它 —— 未签名的嵌套库在加载瞬间就被内核杀掉，
+          # 现象就是「一打开就闪退、设备日志一条都没有」（插件 %ctor 根本没跑到）。
+          # 另外 gadget 自身的 LC_ID 就是 @executable_path/Frameworks/FridaGadget.dylib
+          # （已用本机解析下载到的 17.24.3 ios-universal 确认），路径对齐它。
+          mkdir -p "$APP_PATH/Frameworks"
+          install -m 0755 "$RUNNER_TEMP/frida-gadget.dylib" "$APP_PATH/Frameworks/FridaGadget.dylib"
+          lipo -archs "$APP_PATH/Frameworks/FridaGadget.dylib" | grep -qw arm64
 
-          cat > "$APP_PATH/FridaGadget.config" <<'GADGETCFG'
+          cat > "$APP_PATH/Frameworks/FridaGadget.config" <<'GADGETCFG'
           {"interaction": {"type": "script", "path": "NJPipProbe.js"}}
           GADGETCFG
           test -s Tools/frida/NJPipProbe.js
-          install -m 0644 Tools/frida/NJPipProbe.js "$APP_PATH/NJPipProbe.js"
+          install -m 0644 Tools/frida/NJPipProbe.js "$APP_PATH/Frameworks/NJPipProbe.js"
 
           git clone --depth 1 https://github.com/tyilo/insert_dylib "$RUNNER_TEMP/insert_dylib"
           # upstream keeps the single-file source at insert_dylib/main.c (C, not C++).
@@ -188,14 +197,14 @@ jobs:
           clang -O2 -o "$RUNNER_TEMP/insert_dylib_bin" \
             "$RUNNER_TEMP/insert_dylib/insert_dylib/main.c"
           "$RUNNER_TEMP/insert_dylib_bin" --all-yes --strip-codesig \
-            "@executable_path/FridaGadget.dylib" \
+            "@executable_path/Frameworks/FridaGadget.dylib" \
             "$APP_PATH/$APP_EXECUTABLE" "$APP_PATH/$APP_EXECUTABLE.patched"
           mv "$APP_PATH/$APP_EXECUTABLE.patched" "$APP_PATH/$APP_EXECUTABLE"
           chmod 0755 "$APP_PATH/$APP_EXECUTABLE"
 
           # Both injected libraries must be present as load commands.
           otool -l "$APP_PATH/$APP_EXECUTABLE" | grep -A2 'cmd LC_LOAD_DYLIB' \
-            | grep -F 'name @executable_path/FridaGadget.dylib'
+            | grep -F 'name @executable_path/Frameworks/FridaGadget.dylib'
           otool -l "$APP_PATH/$APP_EXECUTABLE" | grep -A2 'cmd LC_LOAD_DYLIB' \
             | grep -F 'libBiliBiliMDDylib.dylib'
 
