@@ -1,4 +1,4 @@
-#line 1 "BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
+#line 1 "BiliBiliMApp/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
 
 
 
@@ -3205,9 +3205,11 @@ static void NJPiGpuStart(void) {
 #pragma mark - Mixed offscreen: state and diagnostics
 
 
+
 #define NJP_MX_ROUTE_NONE 0
 #define NJP_MX_ROUTE_PASS 1
 #define NJP_MX_ROUTE_IMAGE 2
+#define NJP_MX_ROUTE_WRAP 3
 static NSUInteger NJPiMxRoute = NJP_MX_ROUTE_NONE;
 static BOOL NJPiMxInitLogged = NO;
 
@@ -3220,6 +3222,11 @@ static id<MTLCommandQueue> NJPiMxCommandQueue = nil;
 static id<MTLSamplerState> NJPiMxSampler = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineCopy = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineBlend = nil;
+
+
+
+static id<MTLRenderPipelineState> NJPiMxOwnPipelineYuv = nil;
+static id<MTLLibrary> NJPiMxLibrary = nil;
 static const char *NJPiMxSetupFailure = NULL;
 
 
@@ -3258,9 +3265,12 @@ static void NJPiMxRegisterReasons(void) {
     }
     
     
+    
+    
     const char *reasons[] = { "no_view", "no_tex", "no_pool", "fmt",
                               "no_metal", "no_img", "no_pb", "no_texref",
-                              "no_cb", "no_enc", "no_ivar", "wrap", "other" };
+                              "no_cb", "no_enc", "no_ivar", "no_dmsrc",
+                              "wrap", "other" };
     for (NSUInteger index = 0; index < NJP_MX_MAX_REASONS; index++) {
         NJPiMxReasonNames[index] = index < sizeof(reasons) / sizeof(reasons[0])
                                      ? reasons[index] : NULL;
@@ -3312,6 +3322,23 @@ static unsigned long long NJPiMxSummaryLastFail = 0;
 static unsigned long long NJPiMxExtChanges = 0;
 static unsigned long long NJPiMxRendChanges = 0;
 
+
+
+
+static unsigned long long NJPiMxWrapperCpbCalls = 0;
+static unsigned long long NJPiMxWrapperDrives = 0;
+static unsigned long long NJPiMxViewSyncObserved = 0;
+static volatile int NJPiMxSelfDriving = 0;
+
+static void NJPiMxNoteViewSyncObserved(void) {
+    if (!NJPiMxSelfDriving) {
+        NJPiMxViewSyncObserved += 1;
+    }
+}
+
+
+static const char *NJPiMxDmSourceName = "none";
+
 static unsigned long long NJPiMxFailTotal(void) {
     unsigned long long total = 0;
     for (NSUInteger index = 0; index < NJPiMxReasonCount; index++) {
@@ -3350,14 +3377,17 @@ static void NJPiMxSummaryTick(void) {
             [counts appendFormat:@",%s=%llu", NJPiMxReasonNames[index], NJPiMxReasonHits[index]];
         }
     }
-    static const char *routeNames[] = { "none", "pass", "image" };
+    static const char *routeNames[] = { "none", "pass", "image", "wrap" };
     const char *routeName = NJPiMxRoute < sizeof(routeNames) / sizeof(routeNames[0])
                                     ? routeNames[NJPiMxRoute] : "?";
     
     
     NJPiPDiag("mx sum win=%llu out=%llu fail=%llu ms=%.2f msmax=%.2f route=%s "
+              "dmsrc=%s cpb=%llu us=%llu ust=%llu "
               "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s fails=%s",
               inDelta, okDelta, failTotal, avgMilliseconds, maxMilliseconds, routeName,
+              NJPiMxDmSourceName,
+              NJPiMxWrapperCpbCalls, NJPiMxWrapperDrives, NJPiMxViewSyncObserved,
               NJPiMxExtChanges, NJPiMxRendChanges,
               NJPiMxSetupFailure ?: "ok",
               NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ,
@@ -3610,6 +3640,9 @@ static void *NJPiMSeenViews[4];
 static NSUInteger NJPiMSeenCount = 0;
 static NSUInteger NJPiMCaptureLogs = 0;
 
+static __weak id NJPiMxWrapperCached = nil;
+static void *NJPiMxWrapperOwner = NULL;   
+
 static id NJPiMCapturedView(void) {
     return NJPiMCapturedViewInstance;
 }
@@ -3622,6 +3655,8 @@ static void NJPiMxForgetCapturedViews(const char *why) {
               object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
     NJPiMCapturedViewInstance = nil;
     NJPiMCapturedVia = NULL;
+    NJPiMxWrapperCached = nil;
+    NJPiMxWrapperOwner = NULL;
 }
 
 
@@ -3642,15 +3677,153 @@ static BOOL NJPiMViewHasTextureIvars(id view) {
 
 
 
-static void NJPiMProbeViewObjects(id view, const char *why) {
-    static NSUInteger probes = 0;
-    if (!view || probes >= 3) {
+
+
+
+
+
+static id NJPiMxWrapperForView(id view) {
+    if (!view) {
+        return nil;
+    }
+    if (NJPiMxWrapperCached && NJPiMxWrapperOwner == (__bridge void *)view) {
+        return NJPiMxWrapperCached;
+    }
+    id wrapper = nil;
+    SEL getter = NSSelectorFromString(@"rendererWrapper");
+    if ([view respondsToSelector:getter]) {
+        wrapper = NJPiMxObjectGetter(view, getter);
+    }
+    if (!wrapper) {
+        wrapper = NJPiMxValueForKey(view, @"_rendererWrapper");
+    }
+    if (!wrapper) {
+        return nil;
+    }
+    if (![wrapper respondsToSelector:@selector(copyPixelBuffer)]
+        && ![wrapper respondsToSelector:NSSelectorFromString(@"updateSyncForTimeStep:")]) {
+        return nil; 
+    }
+    NJPiMxWrapperCached = wrapper;
+    NJPiMxWrapperOwner = (__bridge void *)view;
+    return wrapper;
+}
+
+
+
+
+
+static const char *NJPiMxIntrospectedClasses[4];
+static NSUInteger NJPiMxIntrospectedCount = 0;
+
+static void NJPiMxIntrospectOnce(id view, const char *why) {
+    if (!view) {
         return;
     }
-    probes += 1;
+    const char *className = object_getClassName(view);
+    for (NSUInteger index = 0; index < NJPiMxIntrospectedCount; index++) {
+        if (strcmp(NJPiMxIntrospectedClasses[index], className) == 0) {
+            return;
+        }
+    }
+    if (NJPiMxIntrospectedCount >=
+        sizeof(NJPiMxIntrospectedClasses) / sizeof(NJPiMxIntrospectedClasses[0])) {
+        return;
+    }
+    NJPiMxIntrospectedClasses[NJPiMxIntrospectedCount++] = className;
+    
+    NSMutableString *chain = [NSMutableString string];
+    NSUInteger totalIvars = 0;
+    Class classes[6];
+    NSUInteger classCount = 0;
+    Class cls = object_getClass(view);
+    while (cls && cls != [NSObject class] &&
+           classCount < sizeof(classes) / sizeof(classes[0])) {
+        classes[classCount++] = cls;
+        unsigned int ivarCount = 0;
+        Ivar *vars = class_copyIvarList(cls, &ivarCount);
+        totalIvars += ivarCount;
+        if (vars) {
+            free(vars);
+        }
+        if (chain.length) {
+            [chain appendString:@">"];
+        }
+        [chain appendString:NSStringFromClass(cls)];
+        cls = class_getSuperclass(cls);
+    }
+    NJPiPDiag("mx ivars cls=%s n=%lu chain=%s why=%s", className, (unsigned long)totalIvars,
+              chain.UTF8String ?: "-", why ?: "-");
+    
+    NSMutableString *part = [NSMutableString string];
+    NSUInteger partNumber = 1;
+    for (NSUInteger classIndex = 0; classIndex < classCount && partNumber <= 4; classIndex++) {
+        unsigned int ivarCount = 0;
+        Ivar *vars = class_copyIvarList(classes[classIndex], &ivarCount);
+        for (NSUInteger ivarIndex = 0;
+             vars && ivarIndex < ivarCount && partNumber <= 4; ivarIndex++) {
+            NSString *entry = [NSString stringWithFormat:@"%s:%s:%ld",
+                               ivar_getName(vars[ivarIndex]) ?: "-",
+                               ivar_getTypeEncoding(vars[ivarIndex]) ?: "-",
+                               (long)ivar_getOffset(vars[ivarIndex])];
+            if (part.length + entry.length + 1u > 380u) {
+                NJPiPDiag("mx ivars part%lu names=%s", (unsigned long)partNumber,
+                          part.UTF8String);
+                [part setString:@""];
+                partNumber += 1;
+            }
+            if (part.length) {
+                [part appendString:@","];
+            }
+            [part appendString:entry];
+        }
+        if (vars) {
+            free(vars);
+        }
+    }
+    if (partNumber <= 4 && part.length) {
+        NJPiPDiag("mx ivars part%lu names=%s", (unsigned long)partNumber, part.UTF8String);
+    }
+    
+    id wrapper = NJPiMxWrapperForView(view);
+    NJPiPDiag("mx caps cls=%s gmi=%d gri=%d rw=%d rwc=%s cpb=%d ust=%d _ust=%d setext=%d",
+              className,
+              [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"getRendererImage")] ? 1 : 0,
+              wrapper ? 1 : 0,
+              wrapper ? object_getClassName(wrapper) : "-",
+              wrapper && [wrapper respondsToSelector:@selector(copyPixelBuffer)] ? 1 : 0,
+              wrapper && [wrapper respondsToSelector:NSSelectorFromString(@"updateSyncForTimeStep:")] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"setExternalPixelBuffer:")] ? 1 : 0);
+}
+
+
+
+
+
+
+static void *NJPiMProbedViews[8];
+static NSUInteger NJPiMProbedCount = 0;
+
+static void NJPiMProbeViewObjects(id view, const char *why) {
+    if (!view) {
+        return;
+    }
+    void *candidate = (__bridge void *)view;
+    for (NSUInteger index = 0; index < NJPiMProbedCount; index++) {
+        if (NJPiMProbedViews[index] == candidate) {
+            return; 
+        }
+    }
+    if (NJPiMProbedCount >= sizeof(NJPiMProbedViews) / sizeof(NJPiMProbedViews[0])) {
+        return;
+    }
+    NJPiMProbedViews[NJPiMProbedCount++] = candidate;
     struct NJPiMxMetalObjects metal = { nil, nil, nil, nil, nil, nil, nil, nil };
     NJPiMxDiscoverMetal(view, &metal);
-    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d",
+    id wrapper = NJPiMxWrapperForView(view);
+    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d rw=%d",
               why, object_getClassName(view), view,
               NJPiMxViewTexture(view, @"_externalTexture") ? 1 : 0,
               NJPiMxViewTexture(view, @"_rendererTexture") ? 1 : 0,
@@ -3658,7 +3831,9 @@ static void NJPiMProbeViewObjects(id view, const char *why) {
               metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
               [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
               [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
-              NJPiMViewHasTextureIvars(view) ? 1 : 0);
+              NJPiMViewHasTextureIvars(view) ? 1 : 0,
+              wrapper ? 1 : 0);
+    NJPiMxIntrospectOnce(view, why);
 }
 
 static int NJPiMCaptureRank(const char *via) {
@@ -3753,7 +3928,64 @@ static void NJPiMxDriveViewChronos(id view) {
     }
     lastTick = now;
     drivenView = view;
+    
+    
+    NJPiMxSelfDriving = 1;
     ((NJPiMxViewSyncIMP)implementation)(view, selector, seconds);
+    NJPiMxSelfDriving = 0;
+}
+
+
+
+typedef CVImageBufferRef (*NJPiMxCopyPixelBufferIMP)(id, SEL);
+
+static CVImageBufferRef NJPiMxCallCopyPixelBuffer(id wrapper) {
+    SEL selector = @selector(copyPixelBuffer);
+    if (!wrapper || ![wrapper respondsToSelector:selector]) {
+        return NULL;
+    }
+    IMP implementation = [wrapper methodForSelector:selector];
+    if (!implementation) {
+        return NULL;
+    }
+    NJPiMxWrapperCpbCalls += 1;
+    return ((NJPiMxCopyPixelBufferIMP)implementation)(wrapper, selector);
+}
+
+
+
+
+typedef void (*NJPiMxWrapperSyncIMP)(id, SEL, double);
+
+static void NJPiMxDriveWrapperIfNeeded(id wrapper) {
+    if (NJPiMxViewSyncObserved != 0) {
+        return;
+    }
+    SEL selector = NSSelectorFromString(@"updateSyncForTimeStep:");
+    if (![wrapper respondsToSelector:selector]) {
+        return;
+    }
+    IMP implementation = [wrapper methodForSelector:selector];
+    if (!implementation) {
+        return;
+    }
+    if (NJPiMxTimebase.denom == 0) {
+        mach_timebase_info(&NJPiMxTimebase);
+    }
+    static __unsafe_unretained id drivenWrapper = nil;
+    static uint64_t lastTick = 0;
+    uint64_t now = mach_absolute_time();
+    double seconds = 0.0;
+    if (lastTick != 0 && drivenWrapper == wrapper) {
+        seconds = NJPiMxNanoseconds((unsigned long long)(now - lastTick)) / 1e9;
+        if (seconds > NJP_MX_DRIVE_CLAMP_SECONDS) {
+            seconds = NJP_MX_DRIVE_ONE_FRAME;
+        }
+    }
+    lastTick = now;
+    drivenWrapper = wrapper;
+    NJPiMxWrapperDrives += 1;
+    ((NJPiMxWrapperSyncIMP)implementation)(wrapper, selector, seconds);
 }
 
 #pragma mark - Mixed offscreen: our own Metal fallbacks
@@ -3781,6 +4013,20 @@ static const char *NJPiMxMetalSource =
 "                               sampler s [[sampler(0)]]) {\n"
 "    return plane.sample(s, in.texCoord);\n"
 "}\n"
+"fragment float4 nj_pip_mx_yuv(const NJPipMxVert in [[stage_in]],\n"
+"                              constant float *matrix [[buffer(0)]],\n"
+"                              texture2d<float> planeY [[texture(0)]],\n"
+"                              texture2d<float> planeUV [[texture(1)]],\n"
+"                              sampler s [[sampler(0)]]) {\n"
+"    float y = planeY.sample(s, in.texCoord).r;\n"
+"    float2 c = planeUV.sample(s, in.texCoord).rg - float2(0.5, 0.5);\n"
+"    float3 rgb;\n"
+"    for (int i = 0; i < 3; i += 1) {\n"
+"        rgb[i] = matrix[i * 4] * y + matrix[i * 4 + 1] * c.x\n"
+"               + matrix[i * 4 + 2] * c.y + matrix[i * 4 + 3];\n"
+"    }\n"
+"    return float4(rgb.b, rgb.g, rgb.r, 1.0);\n"
+"}\n"
 "fragment float4 nj_pip_mx_blend(const NJPipMxVert in [[stage_in]],\n"
 "                                texture2d<float> plane [[texture(0)]],\n"
 "                                sampler s [[sampler(0)]]) {\n"
@@ -3795,20 +4041,19 @@ static BOOL NJPiMxOwnPipelinesAvailable(void) {
         return NO;
     }
     NSError *error = nil;
-    static id<MTLLibrary> library = nil;
-    if (!library) {
-        library = [NJPiMxDevice newLibraryWithSource:[NSString stringWithUTF8String:NJPiMxMetalSource]
-                                             options:nil
-                                               error:&error];
+    if (!NJPiMxLibrary) {
+        NJPiMxLibrary = [NJPiMxDevice newLibraryWithSource:[NSString stringWithUTF8String:NJPiMxMetalSource]
+                                                   options:nil
+                                                     error:&error];
     }
-    if (!library) {
+    if (!NJPiMxLibrary) {
         NJPiMxSetupFailure = "no-library";
         NJPiPDiag("mx fail reason=no_metal no-library err=%s", error.localizedDescription.UTF8String ?: "-");
         return NO;
     }
-    id<MTLFunction> vertex = [library newFunctionWithName:@"nj_pip_mx_vertex"];
-    id<MTLFunction> copyFunction = [library newFunctionWithName:@"nj_pip_mx_copy"];
-    id<MTLFunction> blendFunction = [library newFunctionWithName:@"nj_pip_mx_blend"];
+    id<MTLFunction> vertex = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_vertex"];
+    id<MTLFunction> copyFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_copy"];
+    id<MTLFunction> blendFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_blend"];
     if (!vertex || !copyFunction || !blendFunction) {
         NJPiMxSetupFailure = "no-function";
         return NO;
@@ -3842,6 +4087,37 @@ static BOOL NJPiMxOwnPipelinesAvailable(void) {
     if (!NJPiMxOwnPipelineBlend) {
         NJPiMxSetupFailure = "no-pipeline-blend";
         NJPiPDiag("mx fail reason=no_metal no-pl-blend err=%s", pipelineError.localizedDescription.UTF8String ?: "-");
+        return NO;
+    }
+    return YES;
+}
+
+
+
+static BOOL NJPiMxOwnPipelineYuvAvailable(void) {
+    if (NJPiMxOwnPipelineYuv) {
+        return YES;
+    }
+    if (!NJPiMxOwnPipelinesAvailable()) {
+        return NO;
+    }
+    id<MTLFunction> vertex = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_vertex"];
+    id<MTLFunction> yuvFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_yuv"];
+    if (!vertex || !yuvFunction) {
+        NJPiMxNoteFailure("no_metal", NULL);
+        return NO;
+    }
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.label = @"njpip-mixed-yuv";
+    descriptor.vertexFunction = vertex;
+    descriptor.fragmentFunction = yuvFunction;
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    NSError *pipelineError = nil;
+    NJPiMxOwnPipelineYuv = [NJPiMxDevice newRenderPipelineStateWithDescriptor:descriptor
+                                                                       error:&pipelineError];
+    if (!NJPiMxOwnPipelineYuv) {
+        NJPiMxNoteFailure("no_metal", NULL);
+        NJPiPDiag("mx fail reason=no_metal no-pl-yuv err=%s", pipelineError.localizedDescription.UTF8String ?: "-");
         return NO;
     }
     return YES;
@@ -3937,6 +4213,77 @@ static id<MTLTexture> NJPiMxTargetTexture(CVPixelBufferRef target, id<MTLDevice>
     *outTextureRef = textureRef; 
                                  
                                  
+    return texture;
+}
+
+
+
+
+static BOOL NJPiMxIsYUV(OSType format) {
+    return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+}
+
+static void NJPiMxYuvMatrix(OSType sourceFormat, BOOL bt709, float *matrix) {
+    double kr = bt709 ? 0.2126 : 0.299;   
+    double kb = bt709 ? 0.0722 : 0.114;
+    double kg = 1.0 - kr - kb;
+    BOOL fullRange = sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    double yScale = fullRange ? 1.0 : 255.0 / 219.0;
+    double yOffset = fullRange ? 0.0 : -16.0 / 219.0;
+    double cScale = fullRange ? 1.0 : 255.0 / 224.0;
+    double rOnCr = 2.0 * (1.0 - kr);
+    double bOnCb = 2.0 * (1.0 - kb);
+    double gOnCb = -(2.0 * kb * (1.0 - kb)) / kg;
+    double gOnCr = -(2.0 * kr * (1.0 - kr)) / kg;
+    double rOnCrScaled = rOnCr * cScale;
+    double bOnCbScaled = bOnCb * cScale;
+    double gOnCbScaled = gOnCb * cScale;
+    double gOnCrScaled = gOnCr * cScale;
+    matrix[0] = (float)yScale; matrix[1] = 0.0f;                matrix[2] = (float)rOnCrScaled; matrix[3] = (float)(yOffset - 0.5 * rOnCrScaled);
+    matrix[4] = (float)yScale; matrix[5] = (float)gOnCbScaled;  matrix[6] = (float)gOnCrScaled; matrix[7] = (float)(yOffset - 0.5 * (gOnCbScaled + gOnCrScaled));
+    matrix[8] = (float)yScale; matrix[9] = (float)bOnCbScaled;  matrix[10] = 0.0f;              matrix[11] = (float)(yOffset - 0.5 * bOnCbScaled);
+    matrix[12] = 0.0f; matrix[13] = 0.0f; matrix[14] = 0.0f; matrix[15] = 1.0f;
+}
+
+static BOOL NJPiMxWantsBT709(CVImageBufferRef image) {
+    
+    CFTypeRef value = CVBufferGetAttachment(image, kCVImageBufferYCbCrMatrixKey, NULL);
+    BOOL bt709 = NO;
+    if (value && CFGetTypeID(value) == CFStringGetTypeID()) {
+        bt709 = CFStringCompare((CFStringRef)value, kCVImageBufferYCbCrMatrix_ITU_R_709_2, 0)
+                == kCFCompareEqualTo;
+    }
+    return bt709;
+}
+
+
+
+
+static id<MTLTexture> NJPiMxImportTexture(CVImageBufferRef image, MTLPixelFormat format,
+                                          size_t width, size_t height, size_t planeIndex,
+                                          CVMetalTextureRef *outTextureRef) {
+    if (!image || !NJPiMxDevice) {
+        return nil;
+    }
+    if (!NJPiMxTextureCache) {
+        CVReturn status = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, NJPiMxDevice,
+                                                    NULL, &NJPiMxTextureCache);
+        if (status != kCVReturnSuccess || !NJPiMxTextureCache) {
+            NJPiMxTextureCache = NULL;
+            NJPiMxNoteFailure("no_metal", NULL);
+            return nil;
+        }
+    }
+    CVMetalTextureRef textureRef = NULL;
+    if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiMxTextureCache, image,
+                                                  NULL, format, width, height, planeIndex,
+                                                  &textureRef) != kCVReturnSuccess || !textureRef) {
+        NJPiMxNoteFailure("no_texref", NULL);
+        return nil;
+    }
+    id<MTLTexture> texture = CVMetalTextureGetTexture(textureRef);
+    *outTextureRef = textureRef;
     return texture;
 }
 
@@ -4190,6 +4537,230 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
 
 
 
+
+
+
+
+
+
+
+
+
+
+
+static BOOL NJPiMxDmsrcDetailLogged = NO;
+
+static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
+                              const char *viewClass) {
+    OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
+    NSUInteger width = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger height = CVPixelBufferGetHeight(sourceImage);
+    
+    CVPixelBufferRef danmakuImage = NULL;
+    const char *dmSource = "none";
+    id wrapper = NJPiMxWrapperForView(view);
+    if (wrapper) {
+        NJPiMxDriveWrapperIfNeeded(wrapper);
+        danmakuImage = NJPiMxCallCopyPixelBuffer(wrapper); 
+        if (danmakuImage) {
+            OSType danmakuFormat = CVPixelBufferGetPixelFormatType(danmakuImage);
+            if (danmakuFormat != kCVPixelFormatType_32BGRA) {
+                
+                NJPiPDiag("mx fail reason=fmt dmsrc=wrapper dmfmt=%s dm=%lux%lu",
+                          NJPiMxFourcc(danmakuFormat),
+                          (unsigned long)CVPixelBufferGetWidth(danmakuImage),
+                          (unsigned long)CVPixelBufferGetHeight(danmakuImage));
+                NJPiMxNoteFailure("fmt", original);
+                CVPixelBufferRelease(danmakuImage);
+                danmakuImage = NULL;
+            } else {
+                dmSource = "wrapper";
+            }
+        } else {
+            
+            
+            
+            NJPiMxNoteFailure("no_tex", original);
+        }
+    }
+    if (!danmakuImage && [view respondsToSelector:NSSelectorFromString(@"getRendererImage")]) {
+        SEL getter = NSSelectorFromString(@"getRendererImage");
+        IMP implementation = [view methodForSelector:getter];
+        id image = implementation ? ((NJPiMxGetImageIMP)implementation)(view, getter) : nil;
+        Class uiImageClass = NSClassFromString(@"UIImage");
+        CGImageRef cgImage = (image && uiImageClass && [image isKindOfClass:uiImageClass])
+            ? ((UIImage *)image).CGImage : NULL;
+        if (cgImage) {
+            
+            size_t dmWidth = CGImageGetWidth(cgImage);
+            size_t dmHeight = CGImageGetHeight(cgImage);
+            NSDictionary<NSString *, id> *attributes = @{
+                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            };
+            if (dmWidth > 0 && dmHeight > 0
+                && CVPixelBufferCreate(kCFAllocatorDefault, dmWidth, dmHeight,
+                                       kCVPixelFormatType_32BGRA,
+                                       (__bridge CFDictionaryRef)attributes,
+                                       &danmakuImage) == kCVReturnSuccess
+                && danmakuImage
+                && CVPixelBufferLockBaseAddress(danmakuImage, 0) == kCVReturnSuccess) {
+                void *base = CVPixelBufferGetBaseAddress(danmakuImage);
+                size_t bytesPerRow = CVPixelBufferGetBytesPerRow(danmakuImage);
+                CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+                CGContextRef context = base && colorSpace
+                    ? CGBitmapContextCreate(base, dmWidth, dmHeight, 8, bytesPerRow, colorSpace,
+                                            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst)
+                    : NULL;
+                BOOL drew = NO;
+                if (context) {
+                    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)dmWidth, (CGFloat)dmHeight),
+                                       cgImage);
+                    CGContextRelease(context);
+                    drew = YES;
+                }
+                CVPixelBufferUnlockBaseAddress(danmakuImage, 0);
+                if (colorSpace) {
+                    CGColorSpaceRelease(colorSpace);
+                }
+                if (drew) {
+                    dmSource = "getRendererImage";
+                } else {
+                    CVPixelBufferRelease(danmakuImage);
+                    danmakuImage = NULL;
+                }
+            } else if (danmakuImage) {
+                CVPixelBufferRelease(danmakuImage);
+                danmakuImage = NULL;
+            }
+        }
+    }
+    if (!danmakuImage) {
+        if (!NJPiMxDmsrcDetailLogged) {
+            NJPiMxDmsrcDetailLogged = YES;
+            id detailWrapper = NJPiMxWrapperForView(view);
+            NJPiPDiag("mx fail detail reason=no_dmsrc cls=%s rw=%d rwc=%s cpb=%d gri=%d",
+                      viewClass, detailWrapper ? 1 : 0,
+                      detailWrapper ? object_getClassName(detailWrapper) : "-",
+                      detailWrapper && [detailWrapper respondsToSelector:@selector(copyPixelBuffer)] ? 1 : 0,
+                      [view respondsToSelector:NSSelectorFromString(@"getRendererImage")] ? 1 : 0);
+        }
+        NJPiMxNoteFailure("no_dmsrc", original);
+        return nil;
+    }
+    NJPiMxDmSourceName = dmSource;
+    
+    NJPiMxEnsureOwnDevice();
+    if (!NJPiMxDevice || !NJPiMxCommandQueue || !NJPiMxSampler) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil; 
+    }
+    BOOL yuv = NJPiMxIsYUV(sourceFormat);
+    if (!NJPiMxOwnPipelinesAvailable() || (yuv && !NJPiMxOwnPipelineYuvAvailable())) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil; 
+    }
+    CVPixelBufferRef targetImage = NJPiMxTargetBuffer(width, height);
+    if (!targetImage) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil;
+    }
+    CVMetalTextureRef targetTextureRef = NULL;
+    id<MTLTexture> targetTexture = NJPiMxTargetTexture(targetImage, NJPiMxDevice, &targetTextureRef);
+    CVMetalTextureRef videoYRef = NULL, videoUVRef = NULL, videoSingleRef = NULL;
+    CVMetalTextureRef danmakuRef = NULL;
+    id<MTLTexture> videoY = nil, videoUV = nil, videoSingle = nil, danmakuTexture = nil;
+    float matrix[16] = { 0 };
+    id<MTLCommandBuffer> commandBuffer = nil;
+    id wrapped = nil;
+    do {
+        if (!targetTexture) {
+            break;
+        }
+        if (yuv) {
+            videoY = NJPiMxImportTexture(sourceImage, MTLPixelFormatR8Unorm,
+                                         (size_t)width, (size_t)height, 0, &videoYRef);
+            videoUV = NJPiMxImportTexture(sourceImage, MTLPixelFormatRG8Unorm,
+                                          (width + 1) / 2, (height + 1) / 2, 1, &videoUVRef);
+            if (!videoY || !videoUV) {
+                break;
+            }
+            NJPiMxYuvMatrix(sourceFormat, NJPiMxWantsBT709(sourceImage), matrix);
+        } else {
+            videoSingle = NJPiMxImportTexture(sourceImage, MTLPixelFormatBGRA8Unorm,
+                                              (size_t)width, (size_t)height, 0, &videoSingleRef);
+            if (!videoSingle) {
+                break;
+            }
+        }
+        danmakuTexture = NJPiMxImportTexture(danmakuImage, MTLPixelFormatBGRA8Unorm,
+                                             CVPixelBufferGetWidth(danmakuImage),
+                                             CVPixelBufferGetHeight(danmakuImage), 0, &danmakuRef);
+        if (!danmakuTexture) {
+            break;
+        }
+        commandBuffer = [NJPiMxCommandQueue commandBuffer];
+        if (!commandBuffer) {
+            NJPiMxNoteFailure("no_cb", original);
+            break;
+        }
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = targetTexture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            NJPiMxNoteFailure("no_enc", original);
+            break;
+        }
+        [encoder setCullMode:MTLCullModeNone];
+        MTLViewport viewport = { 0.0, 0.0, (double)width, (double)height, 0.0, 1.0 };
+        [encoder setViewport:viewport];
+        [encoder setFragmentSamplerState:NJPiMxSampler atIndex:0];
+        if (yuv) {
+            [encoder setRenderPipelineState:NJPiMxOwnPipelineYuv];
+            [encoder setFragmentBytes:matrix length:sizeof(matrix) atIndex:0];
+            [encoder setFragmentTexture:videoY atIndex:0];
+            [encoder setFragmentTexture:videoUV atIndex:1];
+        } else {
+            [encoder setRenderPipelineState:NJPiMxOwnPipelineCopy];
+            [encoder setFragmentTexture:videoSingle atIndex:0];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder setRenderPipelineState:NJPiMxOwnPipelineBlend];
+        [encoder setFragmentTexture:danmakuTexture atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        CVMetalTextureCacheFlush(NJPiMxTextureCache, 0);
+        
+        
+        CFRetain(targetTextureRef);
+        if (videoYRef) { CFRetain(videoYRef); }
+        if (videoUVRef) { CFRetain(videoUVRef); }
+        if (videoSingleRef) { CFRetain(videoSingleRef); }
+        if (danmakuRef) { CFRetain(danmakuRef); }
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            CFRelease(targetTextureRef);
+            if (videoYRef) { CFRelease(videoYRef); }
+            if (videoUVRef) { CFRelease(videoUVRef); }
+            if (videoSingleRef) { CFRelease(videoSingleRef); }
+            if (danmakuRef) { CFRelease(danmakuRef); }
+        }];
+        [commandBuffer commit];
+        wrapped = NJPiMxWrapProduced(targetImage, sourceImage, original);
+    } while (0);
+    if (targetTextureRef) { CFRelease(targetTextureRef); }
+    if (videoYRef) { CFRelease(videoYRef); }
+    if (videoUVRef) { CFRelease(videoUVRef); }
+    if (videoSingleRef) { CFRelease(videoSingleRef); }
+    if (danmakuRef) { CFRelease(danmakuRef); }
+    CVPixelBufferRelease(targetImage);
+    CVPixelBufferRelease(danmakuImage);
+    return wrapped;
+}
+
+
+
 static id NJPiMxWrapProduced(CVPixelBufferRef targetImage, CVImageBufferRef sourceImage,
                              CMSampleBufferRef original) {
     CMSampleBufferRef wrapped = NULL;
@@ -4277,11 +4848,26 @@ static id NJPiMxComposite(id originalSampleObject) {
     
     
     
-    
-    NJPiMxDriveViewChronos(view);
     unsigned long long startedAt = mach_absolute_time();
     id wrapped = nil;
-    if (NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+    if (NJPiMxRoute != NJP_MX_ROUTE_PASS && NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+        wrapped = NJPiMxCompositeWrap(view, original, sourceImage, viewClass);
+        if (wrapped && NJPiMxRoute != NJP_MX_ROUTE_WRAP) {
+            NJPiMxRoute = NJP_MX_ROUTE_WRAP;
+            if (!NJPiMxInitLogged) {
+                NJPiMxInitLogged = YES;
+                NJPiPDiag("mx init route=wrap viewcls=%s dmsrc=%s pool=ok",
+                          viewClass, NJPiMxDmSourceName);
+            }
+        }
+    }
+    if (!wrapped && NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+        
+        
+        
+        
+        
+        NJPiMxDriveViewChronos(view);
         wrapped = NJPiMxCompositePass(view, original, sourceImage, viewClass);
         if (wrapped && NJPiMxRoute != NJP_MX_ROUTE_PASS) {
             NJPiMxRoute = NJP_MX_ROUTE_PASS;
@@ -5200,10 +5786,10 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 
-@class BBPlayerDanmakuService; @class BBPlayerUpTagWidget; @class BBPlayerPortraitScreenBottomWidget; @class BFCCRONRenderView; @class AVSampleBufferVideoRenderer; @class AVSampleBufferDisplayLayer; @class AVPictureInPictureController; @class BBPlayerFlexContainerWidget; @class BAPICommunityServiceDmV1Command; @class BAPICommunityServiceDmV1DmViewReply; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBPlayerDanmakuVoutView; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerGotoStoryWidget; @class BBPlayerBizGotoStoryWidget; @class BBSBPiPManager; @class BFCCRONRenderBaseView; @class BFCCRONRenderViewV2; @class BBPlayerOperationTagService; 
+@class BBPlayerOperationTagService; @class BAPICommunityServiceDmV1DmViewReply; @class BBPlayerDanmakuVoutView; @class AVPictureInPictureController; @class AVSampleBufferVideoRenderer; @class BBSBPiPManager; @class _TtC18BBPictureInPicture15PlayerContainer; @class BFCCRONRenderViewV2; @class BBPlayerDanmakuService; @class BBPlayerUpTagWidget; @class BBPlayerGotoStoryWidget; @class BAPICommunityServiceDmV1Command; @class BBPlayerFlexContainerWidget; @class BFCCRONRenderView; @class BFCCRONRenderBaseView; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerBizGotoStoryWidget; @class AVSampleBufferDisplayLayer; @class BBPlayerPortraitScreenBottomWidget; 
 
 
-#line 5179 "BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
+#line 5765 "BiliBiliMApp/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
 static BBPlayerDanmakuService* (*_logos_orig$App$BBPlayerDanmakuService$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerDanmakuService* _logos_method$App$BBPlayerDanmakuService$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerDanmakuService*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStart)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStart(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$serviceOnStop)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerDanmakuService$serviceOnStop(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static void _logos_method$App$BBPlayerDanmakuService$loadDMViewWithContextExtra$completeBlock$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL, id, id); static UIView * (*_logos_orig$App$BBPlayerDanmakuService$view)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static UIView * _logos_method$App$BBPlayerDanmakuService$view(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST, SEL); static BBSBPiPManager* (*_logos_orig$App$BBSBPiPManager$init)(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BBSBPiPManager* _logos_method$App$BBSBPiPManager$init(_LOGOS_SELF_TYPE_INIT BBSBPiPManager*, SEL) _LOGOS_RETURN_RETAINED; static BOOL (*_logos_orig$App$BBSBPiPManager$needsBindingPlayerContainer)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static BOOL _logos_method$App$BBSBPiPManager$needsBindingPlayerContainer(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$shareId$dataSource$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void _logos_method$App$BBSBPiPManager$bindGraftData$ugcDataSourceAdapter$completion$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, id, id, id); static void (*_logos_orig$App$BBSBPiPManager$prepareToStart)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$prepareToStart(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopPreparing)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stopPreparing(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$start)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$start(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stop)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$stop(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBSBPiPManager$stopWithReason$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$stopWithReason$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$setPictureInPictureStatus$)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void _logos_method$App$BBSBPiPManager$setPictureInPictureStatus$(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL, NSInteger); static void (*_logos_orig$App$BBSBPiPManager$dealloc)(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBSBPiPManager$dealloc(_LOGOS_SELF_TYPE_NORMAL BBSBPiPManager* _LOGOS_SELF_CONST, SEL); static _TtC18BBPictureInPicture15PlayerContainer* (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$init)(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static _TtC18BBPictureInPicture15PlayerContainer* _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$init(_LOGOS_SELF_TYPE_INIT _TtC18BBPictureInPicture15PlayerContainer*, SEL) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didPrepared(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$director_didComplete(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc)(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$_TtC18BBPictureInPicture15PlayerContainer$dealloc(_LOGOS_SELF_TYPE_NORMAL _TtC18BBPictureInPicture15PlayerContainer* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerDanmakuVoutView$setupRenderer$)(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BBPlayerDanmakuVoutView$setupRenderer$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuVoutView* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderBaseView$updateGpuState)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderBaseView* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BFCCRONRenderBaseView$updateGpuState(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderBaseView* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BFCCRONRenderView$setExternalPixelBuffer$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BFCCRONRenderView$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderView$_updateSyncForTimeStep$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, double); static void _logos_method$App$BFCCRONRenderView$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST, SEL, double); static void (*_logos_orig$App$BFCCRONRenderViewV2$setExternalPixelBuffer$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, id); static void _logos_method$App$BFCCRONRenderViewV2$setExternalPixelBuffer$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, id); static void (*_logos_orig$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$)(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, double); static void _logos_method$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST, SEL, double); static void (*_logos_orig$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferDisplayLayer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferDisplayLayer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void (*_logos_orig$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$)(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static void _logos_method$App$AVSampleBufferVideoRenderer$enqueueSampleBuffer$(_LOGOS_SELF_TYPE_NORMAL AVSampleBufferVideoRenderer* _LOGOS_SELF_CONST, SEL, CMSampleBufferRef); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithPlayerLayer$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithPlayerLayer$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPlayerLayer *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$startPictureInPicture)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$startPictureInPicture(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static AVPictureInPictureController* (*_logos_orig$App$AVPictureInPictureController$initWithContentSource$)(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static AVPictureInPictureController* _logos_method$App$AVPictureInPictureController$initWithContentSource$(_LOGOS_SELF_TYPE_INIT AVPictureInPictureController*, SEL, AVPictureInPictureControllerContentSource *) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$AVPictureInPictureController$setContentSource$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void _logos_method$App$AVPictureInPictureController$setContentSource$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, AVPictureInPictureControllerContentSource *); static void (*_logos_orig$App$AVPictureInPictureController$setDelegate$)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static void _logos_method$App$AVPictureInPictureController$setDelegate$(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL, id<AVPictureInPictureControllerDelegate>); static id<AVPictureInPictureControllerDelegate> (*_logos_orig$App$AVPictureInPictureController$delegate)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static id<AVPictureInPictureControllerDelegate> _logos_method$App$AVPictureInPictureController$delegate(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$AVPictureInPictureController$dealloc)(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$AVPictureInPictureController$dealloc(_LOGOS_SELF_TYPE_NORMAL AVPictureInPictureController* _LOGOS_SELF_CONST, SEL); static BBPlayerUpTagWidget* (*_logos_orig$App$BBPlayerUpTagWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerUpTagWidget* _logos_method$App$BBPlayerUpTagWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerUpTagWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupFirstControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints)(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerPortraitScreenBottomWidget$setupSecondControlConstraints(_LOGOS_SELF_TYPE_NORMAL BBPlayerPortraitScreenBottomWidget* _LOGOS_SELF_CONST, SEL); static BBPlayerBizGotoStoryWidget* (*_logos_orig$App$BBPlayerBizGotoStoryWidget$initWithContext$)(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerBizGotoStoryWidget* _logos_method$App$BBPlayerBizGotoStoryWidget$initWithContext$(_LOGOS_SELF_TYPE_INIT BBPlayerBizGotoStoryWidget*, SEL, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* (*_logos_orig$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$)(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static BBPlayerGotoStoryWidget* _logos_method$App$BBPlayerGotoStoryWidget$initWithContext$flexConfiguration$(_LOGOS_SELF_TYPE_INIT BBPlayerGotoStoryWidget*, SEL, id, id) _LOGOS_RETURN_RETAINED; static NSArray * (*_logos_orig$App$BBPlayerOperationTagService$tagModels)(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSArray * _logos_method$App$BBPlayerOperationTagService$tagModels(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static NSSet<NSNumber *> * _logos_method$App$BBPlayerOperationTagService$nj_filterTypes(_LOGOS_SELF_TYPE_NORMAL BBPlayerOperationTagService* _LOGOS_SELF_CONST, SEL); static void (*_logos_orig$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets)(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static void _logos_method$App$BBPlayerFlexContainerWidget$didLayoutSubWidgets(_LOGOS_SELF_TYPE_NORMAL BBPlayerFlexContainerWidget* _LOGOS_SELF_CONST, SEL); static BAPICommunityServiceDmV1DmViewReply* (*_logos_orig$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPICommunityServiceDmV1DmViewReply* _logos_method$App$BAPICommunityServiceDmV1DmViewReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPICommunityServiceDmV1DmViewReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* (*_logos_orig$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$)(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1ViewProgressReply$initWithData$extensionRegistry$error$(_LOGOS_SELF_TYPE_INIT BAPIAppViewuniteV1ViewProgressReply*, SEL, id, id, id *) _LOGOS_RETURN_RETAINED; 
 
 @interface BBPlayerDanmakuService : NSObject
@@ -5533,6 +6119,7 @@ static void _logos_method$App$BFCCRONRenderView$setExternalPixelBuffer$(_LOGOS_S
 static void _logos_method$App$BFCCRONRenderView$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderView* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, double seconds) {
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+    NJPiMxNoteViewSyncObserved();
 #endif
     _logos_orig$App$BFCCRONRenderView$_updateSyncForTimeStep$(self, _cmd, seconds);
 }
@@ -5548,6 +6135,7 @@ static void _logos_method$App$BFCCRONRenderViewV2$setExternalPixelBuffer$(_LOGOS
 static void _logos_method$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(_LOGOS_SELF_TYPE_NORMAL BFCCRONRenderViewV2* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, double seconds) {
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+    NJPiMxNoteViewSyncObserved();
 #endif
     _logos_orig$App$BFCCRONRenderViewV2$_updateSyncForTimeStep$(self, _cmd, seconds);
 }
@@ -5951,7 +6539,7 @@ static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1
  
 
 
-static __attribute__((constructor)) void _logosLocalCtor_1590142d(int __unused argc, char __unused **argv, char __unused **envp) {
+static __attribute__((constructor)) void _logosLocalCtor_87779e2b(int __unused argc, char __unused **argv, char __unused **envp) {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] module loaded master=%d pip=%d",
                      NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);

@@ -3203,10 +3203,12 @@ static void NJPiGpuStart(void) {
 
 #pragma mark - Mixed offscreen: state and diagnostics
 
-// 实现选择：0=还没选出来，1=pass（离屏重放视图的两张贴图），2=image（getMixedImage 退化）。
+// 实现选择：0=还没选出来，1=pass（离屏重放视图的两张贴图），2=image（getMixedImage 退化），
+// 3=wrap（视频层=正在入队的这一帧，弹幕层=wrapper 自己的 copyPixelBuffer，§15.21 新增、优先）。
 #define NJP_MX_ROUTE_NONE 0
 #define NJP_MX_ROUTE_PASS 1
 #define NJP_MX_ROUTE_IMAGE 2
+#define NJP_MX_ROUTE_WRAP 3
 static NSUInteger NJPiMxRoute = NJP_MX_ROUTE_NONE;
 static BOOL NJPiMxInitLogged = NO;
 
@@ -3219,6 +3221,11 @@ static id<MTLCommandQueue> NJPiMxCommandQueue = nil;
 static id<MTLSamplerState> NJPiMxSampler = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineCopy = nil;
 static id<MTLRenderPipelineState> NJPiMxOwnPipelineBlend = nil;
+// wrap 路（§15.21）把「手里这一帧」当视频层：420v/420f 需要一条 YUV→BGRA 的 copy
+// 通道。它只在 wrap 路被懒编译（NJPiMxOwnPipelineYuvAvailable），pass/image 路
+// 的可用性不因为它而变。
+static id<MTLRenderPipelineState> NJPiMxOwnPipelineYuv = nil;
+static id<MTLLibrary> NJPiMxLibrary = nil;
 static const char *NJPiMxSetupFailure = NULL;
 // mx fail 行附带最近一次确证过的视图类名（真机第二轮只有 no_tex/no_img，没有依据判断
 // 失败落在哪个实例上）；NJPiMxLastPLQ 记录上一帧选用的 pipeline（own/view），进 mx sum。
@@ -3256,10 +3263,13 @@ static void NJPiMxRegisterReasons(void) {
         return;
     }
     // 任务里点名的四类排在最前：no_view / no_tex / no_pool / fmt；
-    // 其余是实现内部原因，报告里会原样列出。
+    // 其余是实现内部原因，报告里会原样列出。no_dmsrc 是 §15.21 wrap 路的
+    // 「弹幕层拿不到」（wrapper 不存在/不响应 copyPixelBuffer 且 getRendererImage
+    // 也不可用），它和 no_tex（wrapper 在但这一帧没出图）是两种不同的下一步。
     const char *reasons[] = { "no_view", "no_tex", "no_pool", "fmt",
                               "no_metal", "no_img", "no_pb", "no_texref",
-                              "no_cb", "no_enc", "no_ivar", "wrap", "other" };
+                              "no_cb", "no_enc", "no_ivar", "no_dmsrc",
+                              "wrap", "other" };
     for (NSUInteger index = 0; index < NJP_MX_MAX_REASONS; index++) {
         NJPiMxReasonNames[index] = index < sizeof(reasons) / sizeof(reasons[0])
                                      ? reasons[index] : NULL;
@@ -3310,6 +3320,23 @@ static unsigned long long NJPiMxSummaryLastFail = 0;
 // official view is actually being fed. Observation only, pointer identity, no pixels read.
 static unsigned long long NJPiMxExtChanges = 0;
 static unsigned long long NJPiMxRendChanges = 0;
+// 弹幕层取源与补驱动观测（§15.21）：cpb=我们主动调 wrapper copyPixelBuffer 的次数；
+// us=我们替 wrapper 补驱动 updateSyncForTimeStep: 的次数（只有官方从未驱动过视图时
+// 才会非零，避免双驱动）；ust=视图自己的 _updateSyncForTimeStep: 被调用次数
+// （不含我们 pass 路的自驱——wrap 路不驱视图，这个字段因此只反映官方驱动）。
+static unsigned long long NJPiMxWrapperCpbCalls = 0;
+static unsigned long long NJPiMxWrapperDrives = 0;
+static unsigned long long NJPiMxViewSyncObserved = 0;
+static volatile int NJPiMxSelfDriving = 0;
+
+static void NJPiMxNoteViewSyncObserved(void) {
+    if (!NJPiMxSelfDriving) {
+        NJPiMxViewSyncObserved += 1;
+    }
+}
+
+// 最近一次成功产出帧实际用的弹幕源（进 mx sum 的 dmsrc= 字段）。
+static const char *NJPiMxDmSourceName = "none";
 
 static unsigned long long NJPiMxFailTotal(void) {
     unsigned long long total = 0;
@@ -3349,14 +3376,17 @@ static void NJPiMxSummaryTick(void) {
             [counts appendFormat:@",%s=%llu", NJPiMxReasonNames[index], NJPiMxReasonHits[index]];
         }
     }
-    static const char *routeNames[] = { "none", "pass", "image" };
+    static const char *routeNames[] = { "none", "pass", "image", "wrap" };
     const char *routeName = NJPiMxRoute < sizeof(routeNames) / sizeof(routeNames[0])
                                     ? routeNames[NJPiMxRoute] : "?";
     // setup=ok 曾误导（它不反映视图实例）：现在直接报 view=0/1（是否已从视图自己的
     // 方法捕获到实例）与 plq=（上一帧选用的 pipeline）。
     NJPiPDiag("mx sum win=%llu out=%llu fail=%llu ms=%.2f msmax=%.2f route=%s "
+              "dmsrc=%s cpb=%llu us=%llu ust=%llu "
               "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s fails=%s",
               inDelta, okDelta, failTotal, avgMilliseconds, maxMilliseconds, routeName,
+              NJPiMxDmSourceName,
+              NJPiMxWrapperCpbCalls, NJPiMxWrapperDrives, NJPiMxViewSyncObserved,
               NJPiMxExtChanges, NJPiMxRendChanges,
               NJPiMxSetupFailure ?: "ok",
               NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ,
@@ -3608,6 +3638,9 @@ static const char *NJPiMCapturedVia = NULL;
 static void *NJPiMSeenViews[4];          // 只存指针做去重比较，永不解引用
 static NSUInteger NJPiMSeenCount = 0;
 static NSUInteger NJPiMCaptureLogs = 0;
+// 弹幕层 wrapper 的弱缓存（§15.21 B）：只认当前捕获视图，换/清实例时一并清。
+static __weak id NJPiMxWrapperCached = nil;
+static void *NJPiMxWrapperOwner = NULL;   // 只比较指针确认归属，永不解引用
 
 static id NJPiMCapturedView(void) {
     return NJPiMCapturedViewInstance;
@@ -3621,6 +3654,8 @@ static void NJPiMxForgetCapturedViews(const char *why) {
               object_getClassName(NJPiMCapturedViewInstance), NJPiMCapturedViewInstance);
     NJPiMCapturedViewInstance = nil;
     NJPiMCapturedVia = NULL;
+    NJPiMxWrapperCached = nil;
+    NJPiMxWrapperOwner = NULL;
 }
 
 // ivar 在不在实例的类链上（只查类结构，不读值、不分配）。
@@ -3639,17 +3674,155 @@ static BOOL NJPiMViewHasTextureIvars(id view) {
     return NJPiMIvarPresent(view, "_externalTexture") || NJPiMIvarPresent(view, "_rendererTexture");
 }
 
-// 首次捕获 / 换实例 / 取帧失败时各一次（封顶 3 行）：把「ivar 在不在、值是否非空、
-// 方法在不在」直接打出来，回答该换哪条取帧路。字段名沿用既有约定。
-static void NJPiMProbeViewObjects(id view, const char *why) {
-    static NSUInteger probes = 0;
-    if (!view || probes >= 3) {
+// ── 弹幕层取源：视图挂的 renderer wrapper（§15.21 B）─────────────────────────
+// 取证链（HANDOFF 15.11 + Tools/Analysis/dmview-backend-2026-10-24.md）：
+// view → -rendererWrapper（ivar _rendererWrapper，BaseView init 起持有）→
+// BFCChronosRendererWrapper；它的 -copyPixelBuffer 就是弹幕帧的出处（视图自己的
+// _updateSyncForTimeStep: V1 @0x11484c16c / V2 @0x11484e19c 内部先驱动 wrapper
+// 再经它取帧做成 _rendererTexture）。取法两条：getter selector、KVC 读 ivar；
+// 只持弱引用，与捕获实例同一时机清空。
+static id NJPiMxWrapperForView(id view) {
+    if (!view) {
+        return nil;
+    }
+    if (NJPiMxWrapperCached && NJPiMxWrapperOwner == (__bridge void *)view) {
+        return NJPiMxWrapperCached;
+    }
+    id wrapper = nil;
+    SEL getter = NSSelectorFromString(@"rendererWrapper");
+    if ([view respondsToSelector:getter]) {
+        wrapper = NJPiMxObjectGetter(view, getter);
+    }
+    if (!wrapper) {
+        wrapper = NJPiMxValueForKey(view, @"_rendererWrapper");
+    }
+    if (!wrapper) {
+        return nil;
+    }
+    if (![wrapper respondsToSelector:@selector(copyPixelBuffer)]
+        && ![wrapper respondsToSelector:NSSelectorFromString(@"updateSyncForTimeStep:")]) {
+        return nil; // 链对但类不对：按取不到处理，让 mx caps 把真实类名暴露出来
+    }
+    NJPiMxWrapperCached = wrapper;
+    NJPiMxWrapperOwner = (__bridge void *)view;
+    return wrapper;
+}
+
+// ── 一次性能力/ivar 自省（§15.21 A）──────────────────────────────────────────
+// 每类首次见到实例时触发一次（封顶 4 类）：把类链 ivar 表和能力位打出来，把
+// 「每帧 no_tex/no_img」变成可读事实——贴图字段在哪一层、视图响应哪些方法、
+// wrapper 真实类名与能力。同结构按类去重；实例级取值是 probe 的职责。
+static const char *NJPiMxIntrospectedClasses[4];
+static NSUInteger NJPiMxIntrospectedCount = 0;
+
+static void NJPiMxIntrospectOnce(id view, const char *why) {
+    if (!view) {
         return;
     }
-    probes += 1;
+    const char *className = object_getClassName(view);
+    for (NSUInteger index = 0; index < NJPiMxIntrospectedCount; index++) {
+        if (strcmp(NJPiMxIntrospectedClasses[index], className) == 0) {
+            return;
+        }
+    }
+    if (NJPiMxIntrospectedCount >=
+        sizeof(NJPiMxIntrospectedClasses) / sizeof(NJPiMxIntrospectedClasses[0])) {
+        return;
+    }
+    NJPiMxIntrospectedClasses[NJPiMxIntrospectedCount++] = className;
+    // 沿类链向上走到 NSObject（不含），链用于定位字段出现在哪一层。
+    NSMutableString *chain = [NSMutableString string];
+    NSUInteger totalIvars = 0;
+    Class classes[6];
+    NSUInteger classCount = 0;
+    Class cls = object_getClass(view);
+    while (cls && cls != [NSObject class] &&
+           classCount < sizeof(classes) / sizeof(classes[0])) {
+        classes[classCount++] = cls;
+        unsigned int ivarCount = 0;
+        Ivar *vars = class_copyIvarList(cls, &ivarCount);
+        totalIvars += ivarCount;
+        if (vars) {
+            free(vars);
+        }
+        if (chain.length) {
+            [chain appendString:@">"];
+        }
+        [chain appendString:NSStringFromClass(cls)];
+        cls = class_getSuperclass(cls);
+    }
+    NJPiPDiag("mx ivars cls=%s n=%lu chain=%s why=%s", className, (unsigned long)totalIvars,
+              chain.UTF8String ?: "-", why ?: "-");
+    // ivar 分块打印（每行 ≤400 字符、最多 4 块），格式 名:类型编码:偏移。
+    NSMutableString *part = [NSMutableString string];
+    NSUInteger partNumber = 1;
+    for (NSUInteger classIndex = 0; classIndex < classCount && partNumber <= 4; classIndex++) {
+        unsigned int ivarCount = 0;
+        Ivar *vars = class_copyIvarList(classes[classIndex], &ivarCount);
+        for (NSUInteger ivarIndex = 0;
+             vars && ivarIndex < ivarCount && partNumber <= 4; ivarIndex++) {
+            NSString *entry = [NSString stringWithFormat:@"%s:%s:%ld",
+                               ivar_getName(vars[ivarIndex]) ?: "-",
+                               ivar_getTypeEncoding(vars[ivarIndex]) ?: "-",
+                               (long)ivar_getOffset(vars[ivarIndex])];
+            if (part.length + entry.length + 1u > 380u) {
+                NJPiPDiag("mx ivars part%lu names=%s", (unsigned long)partNumber,
+                          part.UTF8String);
+                [part setString:@""];
+                partNumber += 1;
+            }
+            if (part.length) {
+                [part appendString:@","];
+            }
+            [part appendString:entry];
+        }
+        if (vars) {
+            free(vars);
+        }
+    }
+    if (partNumber <= 4 && part.length) {
+        NJPiPDiag("mx ivars part%lu names=%s", (unsigned long)partNumber, part.UTF8String);
+    }
+    // 能力位：B 路弹幕源与降级顺序的直接判据（wrapper cpb → view getRendererImage）。
+    id wrapper = NJPiMxWrapperForView(view);
+    NJPiPDiag("mx caps cls=%s gmi=%d gri=%d rw=%d rwc=%s cpb=%d ust=%d _ust=%d setext=%d",
+              className,
+              [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"getRendererImage")] ? 1 : 0,
+              wrapper ? 1 : 0,
+              wrapper ? object_getClassName(wrapper) : "-",
+              wrapper && [wrapper respondsToSelector:@selector(copyPixelBuffer)] ? 1 : 0,
+              wrapper && [wrapper respondsToSelector:NSSelectorFromString(@"updateSyncForTimeStep:")] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
+              [view respondsToSelector:NSSelectorFromString(@"setExternalPixelBuffer:")] ? 1 : 0);
+}
+
+// 首次捕获 / 换实例 / 取帧失败时各一次：把「ivar 在不在、值是否非空、方法在不在」
+// 直接打出来，回答该换哪条取帧路。字段名沿用既有约定。
+// §15.21 修 bug：旧版是全局封顶 3 次，配额被捕获路径用光，导致 no_tex/no_img
+// 失败路径的 probe 一次都没打（真机 20261024 日志正是缺这段证据）。改成按实例
+// 去重（每台实例一次）+ 全局上限 8 台防实例抖动，并在同处触发按类的自省（mx ivars/mx caps）。
+static void *NJPiMProbedViews[8];
+static NSUInteger NJPiMProbedCount = 0;
+
+static void NJPiMProbeViewObjects(id view, const char *why) {
+    if (!view) {
+        return;
+    }
+    void *candidate = (__bridge void *)view;
+    for (NSUInteger index = 0; index < NJPiMProbedCount; index++) {
+        if (NJPiMProbedViews[index] == candidate) {
+            return; // 这台实例已经探过
+        }
+    }
+    if (NJPiMProbedCount >= sizeof(NJPiMProbedViews) / sizeof(NJPiMProbedViews[0])) {
+        return;
+    }
+    NJPiMProbedViews[NJPiMProbedCount++] = candidate;
     struct NJPiMxMetalObjects metal = { nil, nil, nil, nil, nil, nil, nil, nil };
     NJPiMxDiscoverMetal(view, &metal);
-    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d",
+    id wrapper = NJPiMxWrapperForView(view);
+    NJPiPDiag("mx view probe why=%s cls=%s addr=%p ext=%d rend=%d dev=%d q=%d pl=%d pass=%d img=%d sync=%d ivars=%d rw=%d",
               why, object_getClassName(view), view,
               NJPiMxViewTexture(view, @"_externalTexture") ? 1 : 0,
               NJPiMxViewTexture(view, @"_rendererTexture") ? 1 : 0,
@@ -3657,7 +3830,9 @@ static void NJPiMProbeViewObjects(id view, const char *why) {
               metal.pipelineState ? 1 : 0, metal.renderPass ? 1 : 0,
               [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
               [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
-              NJPiMViewHasTextureIvars(view) ? 1 : 0);
+              NJPiMViewHasTextureIvars(view) ? 1 : 0,
+              wrapper ? 1 : 0);
+    NJPiMxIntrospectOnce(view, why);
 }
 
 static int NJPiMCaptureRank(const char *via) {
@@ -3752,7 +3927,64 @@ static void NJPiMxDriveViewChronos(id view) {
     }
     lastTick = now;
     drivenView = view;
+    // 自驱标记：hook 里的 NJPiMxNoteViewSyncObserved 会因此不把这次算作官方驱动，
+    // wrap 路的「官方是否在驱动」判断才不会被我们自己的 pass 路污染。
+    NJPiMxSelfDriving = 1;
     ((NJPiMxViewSyncIMP)implementation)(view, selector, seconds);
+    NJPiMxSelfDriving = 0;
+}
+
+// ── wrap 路的 wrapper 取帧/补驱动（§15.21 B 专用）───────────────────────────
+// copyPixelBuffer 是 Create Rule（+1），调用方负责释放（GPU 路 @2385 注释同款）。
+typedef CVImageBufferRef (*NJPiMxCopyPixelBufferIMP)(id, SEL);
+
+static CVImageBufferRef NJPiMxCallCopyPixelBuffer(id wrapper) {
+    SEL selector = @selector(copyPixelBuffer);
+    if (!wrapper || ![wrapper respondsToSelector:selector]) {
+        return NULL;
+    }
+    IMP implementation = [wrapper methodForSelector:selector];
+    if (!implementation) {
+        return NULL;
+    }
+    NJPiMxWrapperCpbCalls += 1;
+    return ((NJPiMxCopyPixelBufferIMP)implementation)(wrapper, selector);
+}
+
+// 只有官方没在驱动时才补驱动：ust 在 hook 里累计（上面的自驱标记把它排除），
+// 非零说明 wrapper 正被视图的时钟驱动，就不再补，避免双驱动跳帧。
+// Δt 沿用视图自驱的同一钳制策略（上限 1s，超限按一帧）。
+typedef void (*NJPiMxWrapperSyncIMP)(id, SEL, double);
+
+static void NJPiMxDriveWrapperIfNeeded(id wrapper) {
+    if (NJPiMxViewSyncObserved != 0) {
+        return;
+    }
+    SEL selector = NSSelectorFromString(@"updateSyncForTimeStep:");
+    if (![wrapper respondsToSelector:selector]) {
+        return;
+    }
+    IMP implementation = [wrapper methodForSelector:selector];
+    if (!implementation) {
+        return;
+    }
+    if (NJPiMxTimebase.denom == 0) {
+        mach_timebase_info(&NJPiMxTimebase);
+    }
+    static __unsafe_unretained id drivenWrapper = nil;
+    static uint64_t lastTick = 0;
+    uint64_t now = mach_absolute_time();
+    double seconds = 0.0;
+    if (lastTick != 0 && drivenWrapper == wrapper) {
+        seconds = NJPiMxNanoseconds((unsigned long long)(now - lastTick)) / 1e9;
+        if (seconds > NJP_MX_DRIVE_CLAMP_SECONDS) {
+            seconds = NJP_MX_DRIVE_ONE_FRAME;
+        }
+    }
+    lastTick = now;
+    drivenWrapper = wrapper;
+    NJPiMxWrapperDrives += 1;
+    ((NJPiMxWrapperSyncIMP)implementation)(wrapper, selector, seconds);
 }
 
 #pragma mark - Mixed offscreen: our own Metal fallbacks
@@ -3780,6 +4012,20 @@ static const char *NJPiMxMetalSource =
 "                               sampler s [[sampler(0)]]) {\n"
 "    return plane.sample(s, in.texCoord);\n"
 "}\n"
+"fragment float4 nj_pip_mx_yuv(const NJPipMxVert in [[stage_in]],\n"
+"                              constant float *matrix [[buffer(0)]],\n"
+"                              texture2d<float> planeY [[texture(0)]],\n"
+"                              texture2d<float> planeUV [[texture(1)]],\n"
+"                              sampler s [[sampler(0)]]) {\n"
+"    float y = planeY.sample(s, in.texCoord).r;\n"
+"    float2 c = planeUV.sample(s, in.texCoord).rg - float2(0.5, 0.5);\n"
+"    float3 rgb;\n"
+"    for (int i = 0; i < 3; i += 1) {\n"
+"        rgb[i] = matrix[i * 4] * y + matrix[i * 4 + 1] * c.x\n"
+"               + matrix[i * 4 + 2] * c.y + matrix[i * 4 + 3];\n"
+"    }\n"
+"    return float4(rgb.b, rgb.g, rgb.r, 1.0);\n"
+"}\n"
 "fragment float4 nj_pip_mx_blend(const NJPipMxVert in [[stage_in]],\n"
 "                                texture2d<float> plane [[texture(0)]],\n"
 "                                sampler s [[sampler(0)]]) {\n"
@@ -3794,20 +4040,19 @@ static BOOL NJPiMxOwnPipelinesAvailable(void) {
         return NO;
     }
     NSError *error = nil;
-    static id<MTLLibrary> library = nil;
-    if (!library) {
-        library = [NJPiMxDevice newLibraryWithSource:[NSString stringWithUTF8String:NJPiMxMetalSource]
-                                             options:nil
-                                               error:&error];
+    if (!NJPiMxLibrary) {
+        NJPiMxLibrary = [NJPiMxDevice newLibraryWithSource:[NSString stringWithUTF8String:NJPiMxMetalSource]
+                                                   options:nil
+                                                     error:&error];
     }
-    if (!library) {
+    if (!NJPiMxLibrary) {
         NJPiMxSetupFailure = "no-library";
         NJPiPDiag("mx fail reason=no_metal no-library err=%s", error.localizedDescription.UTF8String ?: "-");
         return NO;
     }
-    id<MTLFunction> vertex = [library newFunctionWithName:@"nj_pip_mx_vertex"];
-    id<MTLFunction> copyFunction = [library newFunctionWithName:@"nj_pip_mx_copy"];
-    id<MTLFunction> blendFunction = [library newFunctionWithName:@"nj_pip_mx_blend"];
+    id<MTLFunction> vertex = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_vertex"];
+    id<MTLFunction> copyFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_copy"];
+    id<MTLFunction> blendFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_blend"];
     if (!vertex || !copyFunction || !blendFunction) {
         NJPiMxSetupFailure = "no-function";
         return NO;
@@ -3841,6 +4086,37 @@ static BOOL NJPiMxOwnPipelinesAvailable(void) {
     if (!NJPiMxOwnPipelineBlend) {
         NJPiMxSetupFailure = "no-pipeline-blend";
         NJPiPDiag("mx fail reason=no_metal no-pl-blend err=%s", pipelineError.localizedDescription.UTF8String ?: "-");
+        return NO;
+    }
+    return YES;
+}
+
+// YUV 管线是 wrap 路专用（真机的官方视频 sample 就是 420v），惰性编译：
+// 它的失败不参与 pass/image 路的可用性判断，只有 wrap 路用到时才检查。
+static BOOL NJPiMxOwnPipelineYuvAvailable(void) {
+    if (NJPiMxOwnPipelineYuv) {
+        return YES;
+    }
+    if (!NJPiMxOwnPipelinesAvailable()) {
+        return NO;
+    }
+    id<MTLFunction> vertex = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_vertex"];
+    id<MTLFunction> yuvFunction = [NJPiMxLibrary newFunctionWithName:@"nj_pip_mx_yuv"];
+    if (!vertex || !yuvFunction) {
+        NJPiMxNoteFailure("no_metal", NULL);
+        return NO;
+    }
+    MTLRenderPipelineDescriptor *descriptor = [[MTLRenderPipelineDescriptor alloc] init];
+    descriptor.label = @"njpip-mixed-yuv";
+    descriptor.vertexFunction = vertex;
+    descriptor.fragmentFunction = yuvFunction;
+    descriptor.colorAttachments[0].pixelFormat = MTLPixelFormatBGRA8Unorm;
+    NSError *pipelineError = nil;
+    NJPiMxOwnPipelineYuv = [NJPiMxDevice newRenderPipelineStateWithDescriptor:descriptor
+                                                                       error:&pipelineError];
+    if (!NJPiMxOwnPipelineYuv) {
+        NJPiMxNoteFailure("no_metal", NULL);
+        NJPiPDiag("mx fail reason=no_metal no-pl-yuv err=%s", pipelineError.localizedDescription.UTF8String ?: "-");
         return NO;
     }
     return YES;
@@ -3936,6 +4212,77 @@ static id<MTLTexture> NJPiMxTargetTexture(CVPixelBufferRef target, id<MTLDevice>
     *outTextureRef = textureRef; // same lifetime rule as the GPU path: the bridge must
                                  // outlive the GPU work; the caller moves it to the
                                  // command buffer's completion handler.
+    return texture;
+}
+
+// ── wrap 路的视频层导入（§15.21 B）──────────────────────────────────────────
+// 与 GPU 路的同名工具同体（那边在 NJ_PIP_GPU_COMPOSITE_ENABLED 里，两路各自关宏
+// 时不能依赖对方还在编译），这里复制一份给 mixed 路用。
+static BOOL NJPiMxIsYUV(OSType format) {
+    return format == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange
+        || format == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+}
+
+static void NJPiMxYuvMatrix(OSType sourceFormat, BOOL bt709, float *matrix) {
+    double kr = bt709 ? 0.2126 : 0.299;   // BT.601 default, BT.709 when the buffer says so
+    double kb = bt709 ? 0.0722 : 0.114;
+    double kg = 1.0 - kr - kb;
+    BOOL fullRange = sourceFormat == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    double yScale = fullRange ? 1.0 : 255.0 / 219.0;
+    double yOffset = fullRange ? 0.0 : -16.0 / 219.0;
+    double cScale = fullRange ? 1.0 : 255.0 / 224.0;
+    double rOnCr = 2.0 * (1.0 - kr);
+    double bOnCb = 2.0 * (1.0 - kb);
+    double gOnCb = -(2.0 * kb * (1.0 - kb)) / kg;
+    double gOnCr = -(2.0 * kr * (1.0 - kr)) / kg;
+    double rOnCrScaled = rOnCr * cScale;
+    double bOnCbScaled = bOnCb * cScale;
+    double gOnCbScaled = gOnCb * cScale;
+    double gOnCrScaled = gOnCr * cScale;
+    matrix[0] = (float)yScale; matrix[1] = 0.0f;                matrix[2] = (float)rOnCrScaled; matrix[3] = (float)(yOffset - 0.5 * rOnCrScaled);
+    matrix[4] = (float)yScale; matrix[5] = (float)gOnCbScaled;  matrix[6] = (float)gOnCrScaled; matrix[7] = (float)(yOffset - 0.5 * (gOnCbScaled + gOnCrScaled));
+    matrix[8] = (float)yScale; matrix[9] = (float)bOnCbScaled;  matrix[10] = 0.0f;              matrix[11] = (float)(yOffset - 0.5 * bOnCbScaled);
+    matrix[12] = 0.0f; matrix[13] = 0.0f; matrix[14] = 0.0f; matrix[15] = 1.0f;
+}
+
+static BOOL NJPiMxWantsBT709(CVImageBufferRef image) {
+    // Get（非 Copy）：返回的 CFTypeRef 不属于我们，不 CFRelease，读后立即用。
+    CFTypeRef value = CVBufferGetAttachment(image, kCVImageBufferYCbCrMatrixKey, NULL);
+    BOOL bt709 = NO;
+    if (value && CFGetTypeID(value) == CFStringGetTypeID()) {
+        bt709 = CFStringCompare((CFStringRef)value, kCVImageBufferYCbCrMatrix_ITU_R_709_2, 0)
+                == kCFCompareEqualTo;
+    }
+    return bt709;
+}
+
+// 把一个 CVImageBuffer 的某个平面桥接成 MTLTexture（wrap 路视频/弹幕层都用它）。
+// 生命周期规则与 NJPiMxTargetTexture 相同：ref 由调用方移进 command buffer 完成
+// 回调里释放，桥接活过 GPU 工作。
+static id<MTLTexture> NJPiMxImportTexture(CVImageBufferRef image, MTLPixelFormat format,
+                                          size_t width, size_t height, size_t planeIndex,
+                                          CVMetalTextureRef *outTextureRef) {
+    if (!image || !NJPiMxDevice) {
+        return nil;
+    }
+    if (!NJPiMxTextureCache) {
+        CVReturn status = CVMetalTextureCacheCreate(kCFAllocatorDefault, NULL, NJPiMxDevice,
+                                                    NULL, &NJPiMxTextureCache);
+        if (status != kCVReturnSuccess || !NJPiMxTextureCache) {
+            NJPiMxTextureCache = NULL;
+            NJPiMxNoteFailure("no_metal", NULL);
+            return nil;
+        }
+    }
+    CVMetalTextureRef textureRef = NULL;
+    if (CVMetalTextureCacheCreateTextureFromImage(kCFAllocatorDefault, NJPiMxTextureCache, image,
+                                                  NULL, format, width, height, planeIndex,
+                                                  &textureRef) != kCVReturnSuccess || !textureRef) {
+        NJPiMxNoteFailure("no_texref", NULL);
+        return nil;
+    }
+    id<MTLTexture> texture = CVMetalTextureGetTexture(textureRef);
+    *outTextureRef = textureRef;
     return texture;
 }
 
@@ -4187,6 +4534,230 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
     return wrapped;
 }
 
+// ── wrap 路（§15.21 B 主路）：视频层=正在入队的这一帧，弹幕层=wrapper 的 copyPixelBuffer ──
+// 真机的 reframing：视频层我们手里就有（mx src 行确证 fmt=420v size=852x480 正被
+// hook），只缺弹幕层。官方把两层在视图里一起烤，但那两张贴图（_externalTexture/
+// _rendererTexture）真机恒 nil（probe ext=0 rend=0），所以这条路不押任何私有 ivar。
+// 弹幕源优先级与降级：
+//   1) [view rendererWrapper] 缓存 → updateSyncForTimeStep:（仅当官方从未驱动，ust=0）
+//      → copyPixelBuffer（无参，+1）。这就是官方 _updateSyncForTimeStep: 内部走的同一条取帧路。
+//   2) 不可用 → [view getRendererImage]（V2 @0x11484e6b8 现做一次 offscreen pass，
+//      不读那两张贴图；代价高，仅作降级）。
+//   3) 都没有 → no_dmsrc，并打一行带能力位的 detail，直接可读。
+// 合成复用 pass 路那套自有 Metal 对象（NJPiMxDevice/Sampler/pipeline 族）：真机视频
+// 层是 420v，走 nj_pip_mx_yuv；再 source-over 叠弹幕层；产出照旧走 WrapProduced
+// （attachments/timing 逐字照抄，不新建第二个 PiP、不改 content source——15.19 原则）。
+static BOOL NJPiMxDmsrcDetailLogged = NO;
+
+static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
+                              const char *viewClass) {
+    OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
+    NSUInteger width = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger height = CVPixelBufferGetHeight(sourceImage);
+    // ── 弹幕层 ──
+    CVPixelBufferRef danmakuImage = NULL;
+    const char *dmSource = "none";
+    id wrapper = NJPiMxWrapperForView(view);
+    if (wrapper) {
+        NJPiMxDriveWrapperIfNeeded(wrapper);
+        danmakuImage = NJPiMxCallCopyPixelBuffer(wrapper); // +1
+        if (danmakuImage) {
+            OSType danmakuFormat = CVPixelBufferGetPixelFormatType(danmakuImage);
+            if (danmakuFormat != kCVPixelFormatType_32BGRA) {
+                // 与 GPU 路同一约束：blend 通道只采样 BGRA，别的明确报出。
+                NJPiPDiag("mx fail reason=fmt dmsrc=wrapper dmfmt=%s dm=%lux%lu",
+                          NJPiMxFourcc(danmakuFormat),
+                          (unsigned long)CVPixelBufferGetWidth(danmakuImage),
+                          (unsigned long)CVPixelBufferGetHeight(danmakuImage));
+                NJPiMxNoteFailure("fmt", original);
+                CVPixelBufferRelease(danmakuImage);
+                danmakuImage = NULL;
+            } else {
+                dmSource = "wrapper";
+            }
+        } else {
+            // wrapper 在但本帧没出图：还没被驱动、或弹幕当前为空帧。
+            // 是缺驱动还是没内容，看 mx sum 的 us/ust 区分（ust=0 且 us 增长仍 nil
+            // 才是真的没内容）。
+            NJPiMxNoteFailure("no_tex", original);
+        }
+    }
+    if (!danmakuImage && [view respondsToSelector:NSSelectorFromString(@"getRendererImage")]) {
+        SEL getter = NSSelectorFromString(@"getRendererImage");
+        IMP implementation = [view methodForSelector:getter];
+        id image = implementation ? ((NJPiMxGetImageIMP)implementation)(view, getter) : nil;
+        Class uiImageClass = NSClassFromString(@"UIImage");
+        CGImageRef cgImage = (image && uiImageClass && [image isKindOfClass:uiImageClass])
+            ? ((UIImage *)image).CGImage : NULL;
+        if (cgImage) {
+            // blit 进一份自有 BGRA 缓冲（blend 通道只采样 BGRA，同 image 路约束）。
+            size_t dmWidth = CGImageGetWidth(cgImage);
+            size_t dmHeight = CGImageGetHeight(cgImage);
+            NSDictionary<NSString *, id> *attributes = @{
+                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+                (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+            };
+            if (dmWidth > 0 && dmHeight > 0
+                && CVPixelBufferCreate(kCFAllocatorDefault, dmWidth, dmHeight,
+                                       kCVPixelFormatType_32BGRA,
+                                       (__bridge CFDictionaryRef)attributes,
+                                       &danmakuImage) == kCVReturnSuccess
+                && danmakuImage
+                && CVPixelBufferLockBaseAddress(danmakuImage, 0) == kCVReturnSuccess) {
+                void *base = CVPixelBufferGetBaseAddress(danmakuImage);
+                size_t bytesPerRow = CVPixelBufferGetBytesPerRow(danmakuImage);
+                CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+                CGContextRef context = base && colorSpace
+                    ? CGBitmapContextCreate(base, dmWidth, dmHeight, 8, bytesPerRow, colorSpace,
+                                            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst)
+                    : NULL;
+                BOOL drew = NO;
+                if (context) {
+                    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)dmWidth, (CGFloat)dmHeight),
+                                       cgImage);
+                    CGContextRelease(context);
+                    drew = YES;
+                }
+                CVPixelBufferUnlockBaseAddress(danmakuImage, 0);
+                if (colorSpace) {
+                    CGColorSpaceRelease(colorSpace);
+                }
+                if (drew) {
+                    dmSource = "getRendererImage";
+                } else {
+                    CVPixelBufferRelease(danmakuImage);
+                    danmakuImage = NULL;
+                }
+            } else if (danmakuImage) {
+                CVPixelBufferRelease(danmakuImage);
+                danmakuImage = NULL;
+            }
+        }
+    }
+    if (!danmakuImage) {
+        if (!NJPiMxDmsrcDetailLogged) {
+            NJPiMxDmsrcDetailLogged = YES;
+            id detailWrapper = NJPiMxWrapperForView(view);
+            NJPiPDiag("mx fail detail reason=no_dmsrc cls=%s rw=%d rwc=%s cpb=%d gri=%d",
+                      viewClass, detailWrapper ? 1 : 0,
+                      detailWrapper ? object_getClassName(detailWrapper) : "-",
+                      detailWrapper && [detailWrapper respondsToSelector:@selector(copyPixelBuffer)] ? 1 : 0,
+                      [view respondsToSelector:NSSelectorFromString(@"getRendererImage")] ? 1 : 0);
+        }
+        NJPiMxNoteFailure("no_dmsrc", original);
+        return nil;
+    }
+    NJPiMxDmSourceName = dmSource;
+    // ── 自有 Metal pass：视频层（yuv/copy）+ 弹幕层（blend）→ 池里的 BGRA ──
+    NJPiMxEnsureOwnDevice();
+    if (!NJPiMxDevice || !NJPiMxCommandQueue || !NJPiMxSampler) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil; // no_metal 已由 EnsureOwnDevice 记
+    }
+    BOOL yuv = NJPiMxIsYUV(sourceFormat);
+    if (!NJPiMxOwnPipelinesAvailable() || (yuv && !NJPiMxOwnPipelineYuvAvailable())) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil; // no_metal 已由可用性函数记
+    }
+    CVPixelBufferRef targetImage = NJPiMxTargetBuffer(width, height);
+    if (!targetImage) {
+        CVPixelBufferRelease(danmakuImage);
+        return nil;
+    }
+    CVMetalTextureRef targetTextureRef = NULL;
+    id<MTLTexture> targetTexture = NJPiMxTargetTexture(targetImage, NJPiMxDevice, &targetTextureRef);
+    CVMetalTextureRef videoYRef = NULL, videoUVRef = NULL, videoSingleRef = NULL;
+    CVMetalTextureRef danmakuRef = NULL;
+    id<MTLTexture> videoY = nil, videoUV = nil, videoSingle = nil, danmakuTexture = nil;
+    float matrix[16] = { 0 };
+    id<MTLCommandBuffer> commandBuffer = nil;
+    id wrapped = nil;
+    do {
+        if (!targetTexture) {
+            break;
+        }
+        if (yuv) {
+            videoY = NJPiMxImportTexture(sourceImage, MTLPixelFormatR8Unorm,
+                                         (size_t)width, (size_t)height, 0, &videoYRef);
+            videoUV = NJPiMxImportTexture(sourceImage, MTLPixelFormatRG8Unorm,
+                                          (width + 1) / 2, (height + 1) / 2, 1, &videoUVRef);
+            if (!videoY || !videoUV) {
+                break;
+            }
+            NJPiMxYuvMatrix(sourceFormat, NJPiMxWantsBT709(sourceImage), matrix);
+        } else {
+            videoSingle = NJPiMxImportTexture(sourceImage, MTLPixelFormatBGRA8Unorm,
+                                              (size_t)width, (size_t)height, 0, &videoSingleRef);
+            if (!videoSingle) {
+                break;
+            }
+        }
+        danmakuTexture = NJPiMxImportTexture(danmakuImage, MTLPixelFormatBGRA8Unorm,
+                                             CVPixelBufferGetWidth(danmakuImage),
+                                             CVPixelBufferGetHeight(danmakuImage), 0, &danmakuRef);
+        if (!danmakuTexture) {
+            break;
+        }
+        commandBuffer = [NJPiMxCommandQueue commandBuffer];
+        if (!commandBuffer) {
+            NJPiMxNoteFailure("no_cb", original);
+            break;
+        }
+        MTLRenderPassDescriptor *pass = [MTLRenderPassDescriptor renderPassDescriptor];
+        pass.colorAttachments[0].texture = targetTexture;
+        pass.colorAttachments[0].loadAction = MTLLoadActionDontCare;
+        pass.colorAttachments[0].storeAction = MTLStoreActionStore;
+        id<MTLRenderCommandEncoder> encoder = [commandBuffer renderCommandEncoderWithDescriptor:pass];
+        if (!encoder) {
+            NJPiMxNoteFailure("no_enc", original);
+            break;
+        }
+        [encoder setCullMode:MTLCullModeNone];
+        MTLViewport viewport = { 0.0, 0.0, (double)width, (double)height, 0.0, 1.0 };
+        [encoder setViewport:viewport];
+        [encoder setFragmentSamplerState:NJPiMxSampler atIndex:0];
+        if (yuv) {
+            [encoder setRenderPipelineState:NJPiMxOwnPipelineYuv];
+            [encoder setFragmentBytes:matrix length:sizeof(matrix) atIndex:0];
+            [encoder setFragmentTexture:videoY atIndex:0];
+            [encoder setFragmentTexture:videoUV atIndex:1];
+        } else {
+            [encoder setRenderPipelineState:NJPiMxOwnPipelineCopy];
+            [encoder setFragmentTexture:videoSingle atIndex:0];
+        }
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder setRenderPipelineState:NJPiMxOwnPipelineBlend];
+        [encoder setFragmentTexture:danmakuTexture atIndex:0];
+        [encoder drawPrimitives:MTLPrimitiveTypeTriangle vertexStart:0 vertexCount:3];
+        [encoder endEncoding];
+        CVMetalTextureCacheFlush(NJPiMxTextureCache, 0);
+        // 与 pass/GPU 路同一条生命周期规则：纹理桥引用移交给完成回调，
+        // 环形缓冲让像素本体活到被换出。
+        CFRetain(targetTextureRef);
+        if (videoYRef) { CFRetain(videoYRef); }
+        if (videoUVRef) { CFRetain(videoUVRef); }
+        if (videoSingleRef) { CFRetain(videoSingleRef); }
+        if (danmakuRef) { CFRetain(danmakuRef); }
+        [commandBuffer addCompletedHandler:^(id<MTLCommandBuffer> buffer) {
+            CFRelease(targetTextureRef);
+            if (videoYRef) { CFRelease(videoYRef); }
+            if (videoUVRef) { CFRelease(videoUVRef); }
+            if (videoSingleRef) { CFRelease(videoSingleRef); }
+            if (danmakuRef) { CFRelease(danmakuRef); }
+        }];
+        [commandBuffer commit];
+        wrapped = NJPiMxWrapProduced(targetImage, sourceImage, original);
+    } while (0);
+    if (targetTextureRef) { CFRelease(targetTextureRef); }
+    if (videoYRef) { CFRelease(videoYRef); }
+    if (videoUVRef) { CFRelease(videoUVRef); }
+    if (videoSingleRef) { CFRelease(videoSingleRef); }
+    if (danmakuRef) { CFRelease(danmakuRef); }
+    CVPixelBufferRelease(targetImage);
+    CVPixelBufferRelease(danmakuImage);
+    return wrapped;
+}
+
 // 产出的 CVPixelBuffer → CMSampleBuffer：与 GPU 路完全一致的尾部（时间轴逐字照抄、
 // 样本 attachments 全量拷贝、环形缓冲续命）。
 static id NJPiMxWrapProduced(CVPixelBufferRef targetImage, CVImageBufferRef sourceImage,
@@ -4272,15 +4843,30 @@ static id NJPiMxComposite(id originalSampleObject) {
         NJPiMxNoteFailure("no_view", original);
         return originalSampleObject;
     }
-    // 先自驱弹幕时钟，再取帧：V2 把 _rendererTexture 的更新排在 main queue，
-    // 本帧用到的贴图是上一次驱动的产物（晚一帧，30fps 下无感）；V1 的
-    // _updateSyncForTimeStep: 只把 copyPixelBuffer 结果存进 _cronRenderBufferRef，
-    // 贴图转换在它的 onDisplayLink 里（PiP 后台被暂停）——V1 上这两张贴图大概率
-    // 不新鲜，exchg/rendchg 会把这个结论直接记在日志里。
-    NJPiMxDriveViewChronos(view);
+    // §15.21 路线顺序：wrap（手里这帧 + wrapper 弹幕层，不依赖视图两张贴图）→
+    // pass（视图的两张贴图）→ image（官方 getMixedImage）。粘住已验证的路线。
+    // 自驱时钟只属于 pass 路（它要的是视图内部产出的贴图）：wrap 路不驱视图、
+    // 只按 ust 判断要不要补驱 wrapper，避免双驱动，也保证 ust 不被自驱污染。
     unsigned long long startedAt = mach_absolute_time();
     id wrapped = nil;
-    if (NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+    if (NJPiMxRoute != NJP_MX_ROUTE_PASS && NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+        wrapped = NJPiMxCompositeWrap(view, original, sourceImage, viewClass);
+        if (wrapped && NJPiMxRoute != NJP_MX_ROUTE_WRAP) {
+            NJPiMxRoute = NJP_MX_ROUTE_WRAP;
+            if (!NJPiMxInitLogged) {
+                NJPiMxInitLogged = YES;
+                NJPiPDiag("mx init route=wrap viewcls=%s dmsrc=%s pool=ok",
+                          viewClass, NJPiMxDmSourceName);
+            }
+        }
+    }
+    if (!wrapped && NJPiMxRoute != NJP_MX_ROUTE_IMAGE) {
+        // 先自驱弹幕时钟，再取帧：V2 把 _rendererTexture 的更新排在 main queue，
+        // 本帧用到的贴图是上一次驱动的产物（晚一帧，30fps 下无感）；V1 的
+        // _updateSyncForTimeStep: 只把 copyPixelBuffer 结果存进 _cronRenderBufferRef，
+        // 贴图转换在它的 onDisplayLink 里（PiP 后台被暂停）——V1 上这两张贴图大概率
+        // 不新鲜，exchg/rendchg 会把这个结论直接记在日志里。
+        NJPiMxDriveViewChronos(view);
         wrapped = NJPiMxCompositePass(view, original, sourceImage, viewClass);
         if (wrapped && NJPiMxRoute != NJP_MX_ROUTE_PASS) {
             NJPiMxRoute = NJP_MX_ROUTE_PASS;
@@ -5505,6 +6091,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)_updateSyncForTimeStep:(double)seconds {
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+    NJPiMxNoteViewSyncObserved();
 #endif
     %orig(seconds);
 }
@@ -5520,6 +6107,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)_updateSyncForTimeStep:(double)seconds {
 #if NJ_PIP_MIXED_OFFSCREEN_ENABLED
     NJPiMCaptureFromHook(self, "_updateSyncForTimeStep:");
+    NJPiMxNoteViewSyncObserved();
 #endif
     %orig(seconds);
 }
