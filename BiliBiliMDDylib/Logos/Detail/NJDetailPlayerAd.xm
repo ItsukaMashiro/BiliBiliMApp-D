@@ -3856,7 +3856,7 @@ static id NJPiMxCompositePass(id view, CMSampleBufferRef original, CVImageBuffer
     id<MTLTexture> targetTexture = NJPiMxTargetTexture(targetImage, device, &targetTextureRef);
     if (!targetTexture) {
         if (targetTextureRef) {
-            CVMetalTextureReleaseRef(targetTextureRef);
+            CFRelease(targetTextureRef); // CVMetalTextureRef 是 CF 类型；与 GPU 路完成回调同一释放方式
         }
         CVPixelBufferRelease(targetImage);
         return nil;
