@@ -29,13 +29,48 @@
  *      BFCChronosRendererWrapper instantiation (via state snapshots) and
  *      -copyPixelBuffer counts (never invoked by the probe itself).
  *
+ * v3 (nj-pip-probe-3): the runtime gates, read from one real-device run. All
+ * targets are ObjC method names (8.89 static forensics said where the gates
+ * are; the probe reads what they actually do):
+ *   G1) sbp_view_visible: -[IJKSDLSampleBufferView visible] — display_pixels_vtb:
+ *      calls [self visible] then cbz (no frames fed when NO). All calls are
+ *      counted; one line per 5s or on a value flip, with the layer addr + value.
+ *   G2) sbp_layer_state: every 5s, per live AVSampleBufferDisplayLayer:
+ *      status + isReadyForMoreMediaData + the enqueueSampleBuffer: frame rate
+ *      (delta of the v2 per-address counter). enqueueSmapleBuffer: consults
+ *      isReadyForMoreMediaData (tbz → frames skipped); that selector itself is
+ *      count-only here (hook_miss if the class lacks it).
+ *   G3) cron_gate: -[BFCCRONRenderBaseView updateGpuState] (reads
+ *      applicationState → setGpuAccessAllowed:NO), -updateDisplayLinkState
+ *      (no window / empty frame → setPaused:YES) and -didMoveToWindow: one
+ *      line per 5s per key: appState, gpuAllowed (ivar / setGpuAccessAllowed:
+ *      argument, best effort), paused, window?, frame w/h.
+ *   G4) dm_pixfmt: -[BFCChronosRendererWrapper copyPixelBuffer] keeps the v2
+ *      count; at most once per 5s the returned pointer is handed straight to
+ *      CVPixelBufferGetPixelFormatType — raw pointer only, never wrapped,
+ *      retained or released, so the buffer's lifetime is untouched — and the
+ *      fourcc is decoded to text.
+ *   G5) pip_route: -[BBPiPController setContentSource:],
+ *      -[BFCPlayerControllerV2 generateContentSourceWithCompletionHandler:]
+ *      and ContentSource -initWithSampleBufferDisplayLayer:playbackDelegate:
+ *      ⇒ sb; -[AVPlayerItem setCustomVideoCompositor:] and
+ *      -[AVPlayerLayer setVideoGravity:] ⇒ avplayer. One line per evidence
+ *      kind (30s repeat throttle). pip_playerview:
+ *      BBPictureInPicture.PlayerView +layerClass + live instance count.
+ *   G6) defensive: a v3 target whose class never appears, or whose class is
+ *      present while the selector is not, logs exactly one hook_miss line with
+ *      its name; nothing throws into the host. probe_boot reports the version
+ *      and the number of mounted hook points (probe_ready once polling ends).
+ *   Volume: every new state line is throttled to ≤ 1 per 5s per key, hot paths
+ *   stay count-only, so total output stays well under 200 lines/minute.
+ *
  * No Node.js APIs, no require, no process — Frida/ObjC bridge + NativeFunction only.
  */
 (function () {
   'use strict';
 
-  var PROBE_VERSION = 'nj-pip-probe-2';
-  var PROBE_V = 2;
+  var PROBE_VERSION = 'nj-pip-probe-3';
+  var PROBE_V = 3;
   var MAX_LINE = 400;
 
   // ---------------------------------------------------------------------------
@@ -293,7 +328,10 @@
     'BFCChronosRendererWrapper',
     'BBPlayerDMView',
     'BFCPlayerDMView',
-    'DMRenderLayerView'
+    'DMRenderLayerView',
+    // v3: the PiP host view — instance count over time (its layer class is
+    // reported once by the pvp probe)
+    'BBPictureInPicture.PlayerView'
   ];
 
   function snapshotOnePiP(o) {
@@ -896,6 +934,421 @@
     }, 30000);
   }
 
+  // ===========================================================================
+  // v3 forensics — the runtime gates that decide whether pixels reach the
+  // screen. Read-only: counts + one bounded state line per 5s per key. Every
+  // hook is defensive: a missing class or method logs exactly one hook_miss
+  // line naming it and never throws into the host app.
+  // ===========================================================================
+  var STATE_THROTTLE_MS = 5000;   // sbp_view_visible / sbp_layer_state / cron_gate
+  var ROUTE_THROTTLE_MS = 30000;  // pip_route repeats (kind changes always emit)
+
+  // exactly one hook_miss per target name
+  function hookMiss(key, why) {
+    var mk = 'hook_miss ' + key;
+    if (missingReported[mk]) return;
+    missingReported[mk] = true;
+    log('hook_miss', { key: key, why: trunc(why || 'target never appeared', 160) });
+  }
+
+  // v3 polling bookkeeping: keys whose class exists but whose selector does
+  // not are settled after 2 attempts (retrying cannot make a selector appear)
+  var selMiss = {};
+  var settled = {};
+
+  // --- G1: -[IJKSDLSampleBufferView visible] --------------------------------
+  // display_pixels_vtb: does [self visible] then cbz, i.e. when this returns
+  // NO the decoder pipeline is not fed at all. Count every call; emit at most
+  // one line per 5s, or immediately when the returned value flips.
+  function gateHook(className, cls, selName) {
+    var key = className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      var lastVal = null, lastAt = 0;
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) { this._njself = args[0]; },
+        onLeave: function (retval) {
+          try {
+            st.n++;
+            if (!st.addrs) st.addrs = {};
+            var a = this._njself.toString();
+            st.addrs[a] = (st.addrs[a] || 0) + 1;
+            var v = 0;
+            try { v = (retval.toUInt32 ? retval.toUInt32() : retval.toInt32()) & 1; } catch (e0) { v = -1; }
+            var now = Date.now();
+            var flip = (v !== lastVal);
+            if (!flip && now - lastAt < STATE_THROTTLE_MS) return;
+            lastVal = v; lastAt = now;
+            var d = { key: key, n: st.n, visible: v };
+            try {
+              var l = new ObjC.Object(this._njself).layer();
+              if (l !== null && l !== undefined) d.layer = { addr: l.handle.toString(), cls: l.class.toString() };
+            } catch (e1) { d.layer = 'err'; }
+            log('sbp_view_visible', d);
+          } catch (e2) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'gate' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // --- G2: the sample-buffer layer's own state ------------------------------
+  // The ready gate is -isReadyForMoreMediaData (counted through countHook);
+  // status is read off the live layer instances, together with the frame rate
+  // implied by the v2 per-address enqueueSampleBuffer: counter.
+  var ENQ_KEY = 'AVSampleBufferDisplayLayer - enqueueSampleBuffer:';
+  var layerStateLast = {}; // addr -> { n, at }
+  var layerStateTimer = null;
+
+  function startLayerStateTicker() {
+    if (layerStateTimer !== null) return;
+    layerStateTimer = setInterval(function () {
+      try {
+        var cls = findClass('AVSampleBufferDisplayLayer');
+        if (cls === null) return;
+        var insts = ObjC.chooseSync(cls);
+        if (insts.length === 0) return;
+        if (insts.length > 8) return; // too many to describe honestly; the cnt line already counts them
+        var enq = counters[ENQ_KEY];
+        var now = Date.now();
+        for (var i = 0; i < insts.length; i++) {
+          try {
+            var o = insts[i];
+            var addr = o.handle.toString();
+            var d = { addr: addr };
+            d.status = callNumber(o, 'status');
+            d.ready = callBool(o, 'isReadyForMoreMediaData');
+            var cur = (enq && enq.addrs && enq.addrs[addr]) ? enq.addrs[addr] : 0;
+            var prev = layerStateLast[addr];
+            if (prev === undefined) prev = { n: 0, at: now - 5000 };
+            var dt = (now - prev.at) / 1000;
+            d.enqTotal = cur;
+            d.enqFps = dt > 0 ? Math.round(((cur - prev.n) / dt) * 10) / 10 : null;
+            layerStateLast[addr] = { n: cur, at: now };
+            log('sbp_layer_state', d);
+          } catch (e0) {}
+        }
+      } catch (e) {}
+    }, STATE_THROTTLE_MS);
+  }
+
+  // --- G3: the Metal-render gates (BFCCRONRenderBaseView) -------------------
+  // updateGpuState reads applicationState and turns GPU access off in
+  // background; updateDisplayLinkState pauses the display link when the view
+  // has no window or an empty frame. Both are rare (app/view state changes),
+  // so one line per key per 5s is enough to see the ordering.
+  var GPU_IVARS = ['_gpuAccessAllowed', 'gpuAccessAllowed'];
+  var DL_IVARS = ['_displayLink', '_displaylink', 'displayLink'];
+
+  function appStateValue() {
+    try {
+      var ua = findClass('UIApplication');
+      if (ua === null) return null;
+      var app = ua.sharedApplication();
+      if (app === null || app === undefined) return null;
+      return Number(app.applicationState()); // 0 active, 1 inactive, 2 background
+    } catch (e) {
+      return null;
+    }
+  }
+
+  function readIvarBool(o, names) {
+    for (var i = 0; i < names.length; i++) {
+      try {
+        var iv = o.$ivars[names[i]];
+        if (iv === null || iv === undefined) continue;
+        if (typeof iv === 'number') return iv ? 1 : 0;
+        if (iv instanceof NativePointer) {
+          if (iv.isNull()) continue;
+          var n = iv.toInt32();
+          if (n >= 0 && n <= 1) return n;
+        }
+      } catch (e) {}
+    }
+    return null;
+  }
+
+  function displayLinkPaused(o) {
+    for (var i = 0; i < DL_IVARS.length; i++) {
+      try {
+        var dl = o.$ivars[DL_IVARS[i]];
+        if (dl === null || dl === undefined) continue;
+        if (dl instanceof NativePointer) {
+          if (dl.isNull()) continue;
+          try { dl = new ObjC.Object(dl); } catch (e0) { continue; }
+        }
+        try { if (typeof dl.isPaused === 'function') return dl.isPaused() ? 1 : 0; } catch (e1) {}
+        try {
+          if (typeof dl.respondsToSelector === 'function' && dl.respondsToSelector_('isPaused')) return dl.isPaused() ? 1 : 0;
+        } catch (e2) {}
+        try { if (typeof dl.paused === 'function') return dl.paused() ? 1 : 0; } catch (e3) {}
+      } catch (e4) {}
+    }
+    return null;
+  }
+
+  function viewFrameOf(o) {
+    try {
+      var f = o.frame();
+      if (f === null || f === undefined) return null;
+      var w = null, h = null;
+      if (typeof f === 'object') {
+        try { w = f.size.width; h = f.size.height; } catch (e0) {}
+        if (w === null || w === undefined) { try { w = f[2]; h = f[3]; } catch (e1) {} }
+      }
+      if (w === null || w === undefined || h === null || h === undefined) return null;
+      return { w: Math.round(Number(w) * 100) / 100, h: Math.round(Number(h) * 100) / 100 };
+    } catch (e) {
+      return null;
+    }
+  }
+
+  // setGpuAccessAllowed:'s argument is the ground truth for gpuAllowed; keep
+  // the last value so the cron_gate line can carry it. Count-only, no output.
+  var cronArgState = { gpuAllowed: null, have: false };
+
+  function gpusetHook(className, cls, selName) {
+    var key = className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      var argT = argTypeOf(m, 2);
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) {
+          try {
+            st.n++;
+            if (argT === 'B' || argT === 'c') {
+              var v = args[2].toInt32() & 1;
+              cronArgState.gpuAllowed = v;
+              cronArgState.have = true;
+            }
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'gpuset' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  function cronHook(className, cls, selName) {
+    var key = className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) { this._njself = args[0]; },
+        onLeave: function () {
+          try {
+            st.n++;
+            var now = Date.now();
+            if (st.lastAt !== undefined && now - st.lastAt < STATE_THROTTLE_MS) return;
+            st.lastAt = now;
+            var o = new ObjC.Object(this._njself);
+            var d = { key: key, n: st.n, appState: appStateValue() };
+            var iv = readIvarBool(o, GPU_IVARS);
+            d.gpuAllowed = (iv !== null) ? iv : (cronArgState.have ? cronArgState.gpuAllowed : null);
+            d.paused = displayLinkPaused(o);
+            try {
+              var w = o.window();
+              d.hasWindow = !(w === null || w === undefined || w.handle.isNull());
+            } catch (e0) { d.hasWindow = null; }
+            var f = viewFrameOf(o);
+            if (f !== null) { d.frameW = f.w; d.frameH = f.h; }
+            log('cron_gate', d);
+          } catch (e2) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'cron' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // --- G4: the danmaku texture's real pixel format --------------------------
+  // copyPixelBuffer returns the CVPixelBuffer the composer feeds; the static
+  // binary cannot say which fourcc it is. The pointer is only handed to the
+  // CoreVideo getter right here — no ObjC wrapper, no retain, no release — so
+  // the buffer's lifetime is exactly as the host left it. At most once per 5s.
+  var CVPixelBufferGetPixelFormatType = null;
+  try {
+    var cvfmtAddr = findExport('CoreVideo', 'CVPixelBufferGetPixelFormatType');
+    if (cvfmtAddr) CVPixelBufferGetPixelFormatType = new NativeFunction(cvfmtAddr, 'uint32', ['pointer']);
+  } catch (e) { CVPixelBufferGetPixelFormatType = null; }
+
+  function fourccStr(u) {
+    var s = '';
+    for (var sh = 24; sh >= 0; sh -= 8) {
+      var c = (u >>> sh) & 0xff;
+      s += (c >= 32 && c < 127) ? String.fromCharCode(c) : '?';
+    }
+    return s;
+  }
+
+  function pixfmtHook(className, cls, selName) {
+    var key = className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      var lastFmtAt = 0;
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) {
+          try {
+            if (st.n === 0) this._njself = args[0]; // one v2-style sample only
+          } catch (e) {}
+        },
+        onLeave: function (retval) {
+          try {
+            st.n++;
+            if (this._njself !== undefined) log('cnt1', { key: key, n: 1, self: objInfo(this._njself) });
+            if (retval === null || retval === undefined || retval.isNull()) return;
+            if (CVPixelBufferGetPixelFormatType === null) return;
+            var now = Date.now();
+            if (now - lastFmtAt < STATE_THROTTLE_MS) return;
+            lastFmtAt = now;
+            var u = CVPixelBufferGetPixelFormatType(retval);
+            log('dm_pixfmt', { key: key, n: st.n, pixfmt: fourccStr(u), raw: '0x' + u.toString(16) });
+          } catch (e) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'pixfmt' });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // --- G5: which PiP pipeline is actually in play ----------------------------
+  // Sample-buffer evidence (a ContentSource built on an SBDL, handed to the
+  // PiP controller) versus AVPlayer evidence (a custom video compositor or a
+  // video-gravity change on an AVPlayerLayer).
+  var pipRoute = { kind: null, evidence: [] };
+  var pipRouteLastAt = 0;
+
+  function routeEvidence(kind, key, selfAddr, detail) {
+    try {
+      var tag = kind + ':' + key;
+      if (pipRoute.evidence.indexOf(tag) === -1 && pipRoute.evidence.length < 12) pipRoute.evidence.push(tag);
+      var changed = (pipRoute.kind !== kind);
+      var now = Date.now();
+      if (!changed && now - pipRouteLastAt < ROUTE_THROTTLE_MS) return;
+      pipRoute.kind = kind;
+      pipRouteLastAt = now;
+      log('pip_route', {
+        route: kind, via: key, self: selfAddr,
+        arg: detail ? trunc(detail, 100) : null,
+        evidence: pipRoute.evidence.join('|')
+      });
+    } catch (e) {}
+  }
+
+  function routeHook(className, cls, selName, kind) {
+    // its own bookkeeping key: the same implementation may already carry a v2
+    // 'call' hook, and attaching a second interceptor to one IMP is supported.
+    var key = 'route ' + className + ' ' + selName;
+    var st = counters[key];
+    if (st && st.attached) return true;
+    try {
+      var m = cls[selName];
+      if (!m || !m.implementation) return false;
+      if (!st) st = counters[key] = { n: 0, attached: false };
+      Interceptor.attach(m.implementation, {
+        onEnter: function (args) {
+          // note: the same implementation may already carry a v2 'call' hook;
+          // attaching a second interceptor to one IMP is supported.
+          try {
+            st.n++;
+            var sa = null;
+            try { sa = args[0].toString(); } catch (e0) {}
+            var det = null;
+            try {
+              if (args[2] !== undefined && args[2] !== null && !args[2].isNull()) {
+                det = new ObjC.Object(args[2]).class.toString();
+              }
+            } catch (e1) {}
+            routeEvidence(kind, className + ' ' + selName, sa, det);
+          } catch (e2) {}
+        }
+      });
+      st.attached = true;
+      log('instrumented', { cls: className, sel: selName, mode: 'route', route: kind });
+      return true;
+    } catch (e) {
+      log('instrument_error', { cls: className, sel: selName, error: trunc(e.message || ('' + e), 120) });
+      return false;
+    }
+  }
+
+  // BBPictureInPicture.PlayerView: its +layerClass says whether the PiP view
+  // is SBDL-backed, and the live instance count says whether it was built.
+  function pipPlayerViewProbe(className) {
+    var key = 'pipplayerview ' + className;
+    if (counters[key]) return true;
+    counters[key] = { n: 0, attached: true };
+    try {
+      var cls = findClass(className);
+      if (cls === null) return false;
+      var lcName = null;
+      try {
+        var lc = cls.layerClass();
+        if (lc !== null && lc !== undefined) {
+          try { lcName = lc.toString(); } catch (e0) { lcName = classNameOf(lc); }
+        }
+      } catch (e1) { lcName = 'err'; }
+      var count = 0, addrs = [];
+      try {
+        var insts = ObjC.chooseSync(cls);
+        count = insts.length;
+        for (var i = 0; i < insts.length && i < 4; i++) addrs.push(insts[i].handle.toString());
+      } catch (e2) {}
+      log('pip_playerview', { cls: className, layerClass: lcName, count: count, addrs: addrs });
+      return true;
+    } catch (e) {
+      log('pip_playerview', { cls: className, error: trunc(e.message || ('' + e), 120) });
+      return true;
+    }
+  }
+
+  // mounted hook points, reported by probe_boot / probe_ready
+  function mountedCount() {
+    var n = 0;
+    try {
+      n += Object.keys(instrumented).length;
+      n += Object.keys(instCounters).length;
+      var ks = Object.keys(counters);
+      for (var i = 0; i < ks.length; i++) { if (counters[ks[i]].attached) n++; }
+      if (viewWatchDone) n++;
+      if (lifecycleObserverBlocks.length > 0) n++;
+    } catch (e) {}
+    return n;
+  }
+
   var FX_METHODS = [
     // A. display path: SBDL vs Metal
     { cls: 'IJKSDLSampleBufferView', sel: '- display_pixels:', mode: 'count', opts: { argObjs: [2], selfLayer: true, sampleFirst: 3 } },
@@ -916,7 +1369,28 @@
     { cls: 'AVPictureInPictureControllerContentSource', sel: '- initWithSampleBufferDisplayLayer:playbackDelegate:', mode: 'call' },
     { cls: 'BBPiPController', sel: '- setContentSource:', mode: 'call' },
     // C. danmaku engine carrier (instantiation seen via state snapshots / view watch)
-    { cls: 'BFCChronosRendererWrapper', sel: '- copyPixelBuffer', mode: 'count', opts: { sampleFirst: 1 } }
+    // v3 G4: count (as in v2) + a throttled fourcc read of the returned buffer
+    { cls: 'BFCChronosRendererWrapper', sel: '- copyPixelBuffer', mode: 'pixfmt' },
+    // v3 G1: the visible gate that display_pixels_vtb: branches on
+    { cls: 'IJKSDLSampleBufferView', sel: '- visible', mode: 'gate' },
+    // v3 G2: the ready gate that enqueueSmapleBuffer: branches on (count-only;
+    // the 5s ticker reads status/ready off the live layers). If this class has
+    // no such selector, exactly one hook_miss line names it.
+    { cls: 'AVSampleBufferDisplayLayer', sel: '- isReadyForMoreMediaData', mode: 'count', opts: { byAddr: true, sampleFirst: 0 } },
+    // v3 G3: app-background ⇒ GPU off; no window / empty frame ⇒ display link paused
+    { cls: 'BFCCRONRenderBaseView', sel: '- updateGpuState', mode: 'cron' },
+    { cls: 'BFCCRONRenderBaseView', sel: '- updateDisplayLinkState', mode: 'cron' },
+    { cls: 'BFCCRONRenderBaseView', sel: '- didMoveToWindow', mode: 'cron' },
+    { cls: 'BFCCRONRenderBaseView', sel: '- setGpuAccessAllowed:', mode: 'gpuset' },
+    // v3 G5: which pipeline the PiP is driven by (a second interceptor on an
+    // IMP already covered by a v2 'call' hook is fine — both run)
+    { cls: 'BBPiPController', sel: '- setContentSource:', mode: 'route', route: 'sb' },
+    { cls: 'BFCPlayerControllerV2', sel: '- generateContentSourceWithCompletionHandler:', mode: 'route', route: 'sb' },
+    { cls: 'AVPictureInPictureControllerContentSource', sel: '- initWithSampleBufferDisplayLayer:playbackDelegate:', mode: 'route', route: 'sb' },
+    { cls: 'AVPlayerItem', sel: '- setCustomVideoCompositor:', mode: 'route', route: 'avplayer' },
+    { cls: 'AVPlayerLayer', sel: '- setVideoGravity:', mode: 'route', route: 'avplayer' },
+    // v3 G5: the PiP host view's backing layer class + instance count
+    { cls: 'BBPictureInPicture.PlayerView', sel: '+ layerClass', mode: 'pvp' }
   ];
 
   var fxLastPending = null;
@@ -927,18 +1401,42 @@
     for (var i = 0; i < FX_METHODS.length; i++) {
       var e = FX_METHODS[i];
       var key = e.cls + ' ' + e.sel;
-      if (counters[key] && counters[key].attached) continue;
-      if (instCounters[key]) continue;
-      if (instrumented[key]) continue;
-      if (key === 'IJKSDLSampleBufferView + layerClass' && counters['layerclass IJKSDLSampleBufferView']) continue;
+      // route hooks live alongside (not instead of) a v2 hook on the same IMP,
+      // so they keep a separate bookkeeping key.
+      var dkey = (e.mode === 'route') ? ('route ' + key) : key;
+      if (counters[dkey] && counters[dkey].attached) continue;
+      if (e.mode !== 'route') {
+        if (instCounters[key]) continue;
+        if (instrumented[key]) continue;
+        if (key === 'IJKSDLSampleBufferView + layerClass' && counters['layerclass IJKSDLSampleBufferView']) continue;
+      }
+      if (settled[dkey]) continue;
       var cls = findClass(e.cls);
       if (cls === null) { pending.push(key); continue; }
+      // the class is here but the selector is not: polling cannot make one
+      // appear, so say so once (hook_miss) and stop retrying this key.
+      if (e.mode !== 'layerclass' && e.mode !== 'pvp') {
+        var hasSel = false;
+        try { hasSel = (cls[e.sel] !== null && cls[e.sel] !== undefined); } catch (eh) { hasSel = false; }
+        if (!hasSel) {
+          selMiss[dkey] = (selMiss[dkey] || 0) + 1;
+          if (selMiss[dkey] >= 2) { settled[dkey] = true; hookMiss(key, 'class present, selector absent'); }
+          else pending.push(key);
+          continue;
+        }
+      }
       var ok = false;
       try {
         if (e.mode === 'count') ok = countHook(e.cls, cls, e.sel, e.opts);
         else if (e.mode === 'call') ok = instrumentMethod(e.cls, cls, e.sel, e.opts);
         else if (e.mode === 'inst') ok = instHook(e.cls, cls, e.sel);
         else if (e.mode === 'layerclass') ok = probeLayerClass(e.cls, cls);
+        else if (e.mode === 'gate') ok = gateHook(e.cls, cls, e.sel);
+        else if (e.mode === 'cron') ok = cronHook(e.cls, cls, e.sel);
+        else if (e.mode === 'gpuset') ok = gpusetHook(e.cls, cls, e.sel);
+        else if (e.mode === 'pixfmt') ok = pixfmtHook(e.cls, cls, e.sel);
+        else if (e.mode === 'route') ok = routeHook(e.cls, cls, e.sel, e.route);
+        else if (e.mode === 'pvp') ok = pipPlayerViewProbe(e.cls);
       } catch (err) { ok = false; }
       if (!ok) pending.push(key);
     }
@@ -949,7 +1447,7 @@
   function startForensics() {
     var pending = tryForensicsOnce(); // immediate first pass
     fxLastPending = pending.join(';');
-    if (pending.length === 0) { log('fx_ready', { at: 0 }); return; }
+    if (pending.length === 0) { log('fx_ready', { at: 0, mounted: mountedCount() }); return; }
     if (fxTicks === 0) log('fx_pending', { list: trunc(fxLastPending, 320) });
     fxTimer = setInterval(function () {
       try {
@@ -958,7 +1456,7 @@
         var joined = p.join(';');
         if (joined !== fxLastPending) {
           if (p.length === 0) {
-            log('fx_ready', { at: fxTicks });
+            log('fx_ready', { at: fxTicks, mounted: mountedCount() });
           } else if (fxTicks <= 10) {
             log('fx_pending', { list: trunc(joined, 320) });
           }
@@ -969,6 +1467,7 @@
           if (p.length > 0) {
             for (var j = 0; j < p.length; j++) {
               reportMissing(p[j].split(' ')[0], 'target never appeared: ' + p[j]);
+              hookMiss(p[j], 'target class never appeared');
             }
             log('fx_missing_final', { list: trunc(p.join(';'), 320) });
           }
@@ -1034,8 +1533,25 @@
   }
 
   try {
+    startLayerStateTicker(); // v3 G2: 5s state line per live AVSampleBufferDisplayLayer
+  } catch (e) {
+    log('setup_error', { step: 'layer_state_ticker', error: trunc(e.message || ('' + e), 150) });
+  }
+
+  try {
     dumpState('init');
   } catch (e) {
     log('setup_error', { step: 'init_dump', error: trunc(e.message || ('' + e), 150) });
   }
+
+  // startup line: what this build is, and how much got mounted on the first
+  // pass (lazy classes keep attaching; probe_ready reports the settled count).
+  // Keep it short: the 400-char cap would stub away the numbers otherwise.
+  log('probe_boot', {
+    probe: PROBE_VERSION,
+    mounted: mountedCount(),
+    fxTargets: FX_METHODS.length,
+    targets: Object.keys(TARGETS).length,
+    pending: (fxLastPending === '' ? 0 : fxLastPending.split(';').length)
+  });
 })();
