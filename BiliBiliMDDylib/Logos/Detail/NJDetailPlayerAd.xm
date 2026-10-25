@@ -6442,7 +6442,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     static unsigned long long setLines = 0;
     if (setLines < 24) {
         setLines += 1;
-        NJPiPDiag("pip setDelegate self=%p in=%s", (void *)self,
+        NJPiPDiag("pip setDelegate self=%p in=%s", (__bridge void *)self,
                   delegate ? object_getClassName(delegate) : "-");
     }
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
@@ -6485,7 +6485,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     static unsigned long long getLines = 0;
     if (getLines < 24) {
         getLines += 1;
-        NJPiPDiag("pip getDelegate self=%p real=%s ret=%s", (void *)self,
+        NJPiPDiag("pip getDelegate self=%p real=%s ret=%s", (__bridge void *)self,
                   delegate ? object_getClassName(delegate) : "-",
                   shown ? object_getClassName(shown) : "-");
     }
