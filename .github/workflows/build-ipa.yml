@@ -235,6 +235,8 @@ jobs:
       - name: Publish rolling release asset
         # 制品 zip 是即时生成的流，长连接反复在 ~200MB 处断且不可续传；
         # Release 资产是静态对象，支持 Range 续传。发布到滚动 tag pip-nightly。
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
           gh release create pip-nightly --title 'PIP diagnostics (rolling)' --notes 'Auto-updated by build-ipa workflow; do not edit.' 2>/dev/null || true
