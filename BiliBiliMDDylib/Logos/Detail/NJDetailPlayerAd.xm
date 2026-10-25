@@ -191,6 +191,12 @@
    并换掉 updateRunningState 实现，仅「闸门开且真后台」走恢复分支，其余原样转
    原实现。标志只随闸门动（didStop 与 enqueuer 闸门同步双路清零）。诊断行
    `mx eng calib/resume/keep`。
+  - §15.24 snapshot 取帧路（真机 5e21bce 判决 cpb=97 us=81 全 nil 后新增）：引擎
+    保活+补驱动都执行了，buffer_queue_ 仍不出帧——泵/队列在后台就是死的。改走
+    官方直播 PiP 同构的「按需同步渲染」：wrap 路 copyPixelBuffer 失败后，沿
+    wrapper→renderer→engine 链调第一个响应 snapshot 的对象（-[CRONEngine
+    snapshot]@0x1151b6aa4 直接进 C++ 同步离屏渲染，输出 CGImage→UIImage），blit
+    成 BGRA 后与视频层合成。能力位加进 mx caps（snap=），新失败名 no_snap。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 1
@@ -3284,7 +3290,7 @@ static void NJPiMxRegisterReasons(void) {
     const char *reasons[] = { "no_view", "no_tex", "no_pool", "fmt",
                               "no_metal", "no_img", "no_pb", "no_texref",
                               "no_cb", "no_enc", "no_ivar", "no_dmsrc",
-                              "wrap", "other" };
+                              "no_snap", "wrap", "other" };
     for (NSUInteger index = 0; index < NJP_MX_MAX_REASONS; index++) {
         NJPiMxReasonNames[index] = index < sizeof(reasons) / sizeof(reasons[0])
                                      ? reasons[index] : NULL;
@@ -3803,9 +3809,18 @@ static void NJPiMxIntrospectOnce(id view, const char *why) {
     if (partNumber <= 4 && part.length) {
         NJPiPDiag("mx ivars part%lu names=%s", (unsigned long)partNumber, part.UTF8String);
     }
-    // 能力位：B 路弹幕源与降级顺序的直接判据（wrapper cpb → view getRendererImage）。
+    // 能力位：B 路弹幕源与降级顺序的直接判据（wrapper cpb → snapshot → view getRendererImage）。
     id wrapper = NJPiMxWrapperForView(view);
-    NJPiPDiag("mx caps cls=%s gmi=%d gri=%d rw=%d rwc=%s cpb=%d ust=%d _ust=%d setext=%d",
+    BOOL snapCapable = NO;
+    SEL snapSel = NSSelectorFromString(@"snapshot");
+    if (wrapper && [wrapper respondsToSelector:snapSel]) {
+        snapCapable = YES;
+    } else if (wrapper && [wrapper respondsToSelector:NSSelectorFromString(@"renderer")]) {
+        IMP rendererImp = [wrapper methodForSelector:NSSelectorFromString(@"renderer")];
+        id renderer = rendererImp ? ((id (*)(id, SEL))rendererImp)(wrapper, NSSelectorFromString(@"renderer")) : nil;
+        snapCapable = renderer && [renderer respondsToSelector:snapSel];
+    }
+    NJPiPDiag("mx caps cls=%s gmi=%d gri=%d rw=%d rwc=%s cpb=%d ust=%d _ust=%d setext=%d snap=%d",
               className,
               [view respondsToSelector:@selector(getMixedImage)] ? 1 : 0,
               [view respondsToSelector:NSSelectorFromString(@"getRendererImage")] ? 1 : 0,
@@ -3814,7 +3829,8 @@ static void NJPiMxIntrospectOnce(id view, const char *why) {
               wrapper && [wrapper respondsToSelector:@selector(copyPixelBuffer)] ? 1 : 0,
               wrapper && [wrapper respondsToSelector:NSSelectorFromString(@"updateSyncForTimeStep:")] ? 1 : 0,
               [view respondsToSelector:NSSelectorFromString(@"_updateSyncForTimeStep:")] ? 1 : 0,
-              [view respondsToSelector:NSSelectorFromString(@"setExternalPixelBuffer:")] ? 1 : 0);
+              [view respondsToSelector:NSSelectorFromString(@"setExternalPixelBuffer:")] ? 1 : 0,
+              snapCapable ? 1 : 0);
 }
 
 // 首次捕获 / 换实例 / 取帧失败时各一次：把「ivar 在不在、值是否非空、方法在不在」
@@ -4737,13 +4753,96 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
 //   1) [view rendererWrapper] 缓存 → updateSyncForTimeStep:（§15.23：官方近 0.25s
 //      步进过就让位，否则补 step）→ copyPixelBuffer（无参，+1）。这就是官方
 //      _updateSyncForTimeStep: 内部走的同一条取帧路。
-//   2) 不可用 → [view getRendererImage]（V2 @0x11484e6b8 现做一次 offscreen pass，
-//      不读那两张贴图；代价高，仅作降级）。
-//   3) 都没有 → no_dmsrc，并打一行带能力位的 detail，直接可读。
+//   2) 队列无帧 → §15.24 snapshot 同步渲染：wrapper→renderer→engine 链上第一个
+//      响应 snapshot 的对象现做一次同步离屏渲染出 UIImage（引擎 C++ 直接出 CGImage，
+//      不依赖 buffer_queue_ 与 CADisplayLink——与直播官方 PiP 的按需渲染同构）。
+//   3) 还没有 → [view getRendererImage]（视图级 offscreen pass，代价高，仅作降级）。
+//   4) 都没有 → no_dmsrc，并打一行带能力位的 detail，直接可读。
 // 合成复用 pass 路那套自有 Metal 对象（NJPiMxDevice/Sampler/pipeline 族）：真机视频
 // 层是 420v，走 nj_pip_mx_yuv；再 source-over 叠弹幕层；产出照旧走 WrapProduced
 // （attachments/timing 逐字照抄，不新建第二个 PiP、不改 content source——15.19 原则）。
 static BOOL NJPiMxDmsrcDetailLogged = NO;
+
+// §15.24：CGImage → 自有 BGRA 缓冲（blend 通道只采样 BGRA；snapshot 与
+// getRendererImage 两条路共用）。返回 +1 引用，失败返回 NULL。
+static CVPixelBufferRef NJPiMxPixelBufferFromCGImage(CGImageRef cgImage) {
+    size_t dmWidth = CGImageGetWidth(cgImage);
+    size_t dmHeight = CGImageGetHeight(cgImage);
+    CVPixelBufferRef pixelBuffer = NULL;
+    NSDictionary<NSString *, id> *attributes = @{
+        (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
+        (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
+    };
+    if (dmWidth == 0 || dmHeight == 0
+        || CVPixelBufferCreate(kCFAllocatorDefault, dmWidth, dmHeight,
+                               kCVPixelFormatType_32BGRA,
+                               (__bridge CFDictionaryRef)attributes,
+                               &pixelBuffer) != kCVReturnSuccess
+        || !pixelBuffer) {
+        return NULL;
+    }
+    BOOL drew = NO;
+    if (CVPixelBufferLockBaseAddress(pixelBuffer, 0) == kCVReturnSuccess) {
+        void *base = CVPixelBufferGetBaseAddress(pixelBuffer);
+        size_t bytesPerRow = CVPixelBufferGetBytesPerRow(pixelBuffer);
+        CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
+        CGContextRef context = base && colorSpace
+            ? CGBitmapContextCreate(base, dmWidth, dmHeight, 8, bytesPerRow, colorSpace,
+                                    kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst)
+            : NULL;
+        if (context) {
+            CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)dmWidth, (CGFloat)dmHeight),
+                               cgImage);
+            CGContextRelease(context);
+            drew = YES;
+        }
+        if (colorSpace) {
+            CGColorSpaceRelease(colorSpace);
+        }
+        CVPixelBufferUnlockBaseAddress(pixelBuffer, 0);
+    }
+    if (!drew) {
+        CVPixelBufferRelease(pixelBuffer);
+        return NULL;
+    }
+    return pixelBuffer; // +1
+}
+
+// §15.24 snapshot 取帧路：-[CRONRenderer snapshot] @0x1151b8b08 是纯转发
+// （[[self engine] snapshot]）；-[CRONEngine snapshot] @0x1151b6aa4 直接调 C++
+// （sub_1151AB11C：组请求 → sub_1151B16F4 同步离屏渲染一帧 → 输出 CGImage），
+// 最后包成 UIImage 返回。它不经过 buffer_queue_、不依赖 CADisplayLink——官方
+// 直播弹幕 PiP（BBLiveBCDanmakuVideoComposition newRenderedPixelBufferForRequest:）
+// 就是同构的「按需同步渲染」，而队列泵在后台是死的（5e21bce 判决：cpb=97 us=81
+// 全 nil）。链：wrapper 自己 → renderer → engine，第一个响应 snapshot 者出帧。
+static id NJPiMxSnapshotImage(id wrapper) {
+    SEL selector = NSSelectorFromString(@"snapshot");
+    id candidates[3];
+    NSUInteger count = 0;
+    candidates[count++] = wrapper;
+    id renderer = NJPiMxObjectViaSelector(wrapper, @"renderer");
+    if (renderer) {
+        candidates[count++] = renderer;
+        id engine = NJPiMxObjectViaSelector(renderer, @"engine");
+        if (engine) {
+            candidates[count++] = engine;
+        }
+    }
+    for (NSUInteger index = 0; index < count; index++) {
+        if (![candidates[index] respondsToSelector:selector]) {
+            continue;
+        }
+        IMP implementation = [candidates[index] methodForSelector:selector];
+        if (!implementation) {
+            continue;
+        }
+        id image = ((NJPiMxGetImageIMP)implementation)(candidates[index], selector);
+        if (image) {
+            return image;
+        }
+    }
+    return nil;
+}
 
 static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
                               const char *viewClass) {
@@ -4781,6 +4880,23 @@ static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBuffer
             NJPiMxNoteFailure("no_tex", original);
         }
     }
+    if (!danmakuImage && wrapper) {
+        // §15.24：队列没有帧 → 让引擎同步离屏渲染一帧（snapshot 路）。这是官方
+        // 直播 PiP 的取帧形态；不依赖那条在后台死掉的队列。
+        id snap = NJPiMxSnapshotImage(wrapper);
+        Class snapImageClass = NSClassFromString(@"UIImage");
+        CGImageRef snapCG = (snap && snapImageClass && [snap isKindOfClass:snapImageClass])
+                                ? ((UIImage *)snap).CGImage : NULL;
+        if (snapCG) {
+            danmakuImage = NJPiMxPixelBufferFromCGImage(snapCG);
+            if (danmakuImage) {
+                dmSource = "snapshot";
+            }
+        }
+        if (!danmakuImage) {
+            NJPiMxNoteFailure("no_snap", original);
+        }
+    }
     if (!danmakuImage && [view respondsToSelector:NSSelectorFromString(@"getRendererImage")]) {
         SEL getter = NSSelectorFromString(@"getRendererImage");
         IMP implementation = [view methodForSelector:getter];
@@ -4789,47 +4905,9 @@ static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBuffer
         CGImageRef cgImage = (image && uiImageClass && [image isKindOfClass:uiImageClass])
             ? ((UIImage *)image).CGImage : NULL;
         if (cgImage) {
-            // blit 进一份自有 BGRA 缓冲（blend 通道只采样 BGRA，同 image 路约束）。
-            size_t dmWidth = CGImageGetWidth(cgImage);
-            size_t dmHeight = CGImageGetHeight(cgImage);
-            NSDictionary<NSString *, id> *attributes = @{
-                (NSString *)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA),
-                (NSString *)kCVPixelBufferIOSurfacePropertiesKey: @{},
-            };
-            if (dmWidth > 0 && dmHeight > 0
-                && CVPixelBufferCreate(kCFAllocatorDefault, dmWidth, dmHeight,
-                                       kCVPixelFormatType_32BGRA,
-                                       (__bridge CFDictionaryRef)attributes,
-                                       &danmakuImage) == kCVReturnSuccess
-                && danmakuImage
-                && CVPixelBufferLockBaseAddress(danmakuImage, 0) == kCVReturnSuccess) {
-                void *base = CVPixelBufferGetBaseAddress(danmakuImage);
-                size_t bytesPerRow = CVPixelBufferGetBytesPerRow(danmakuImage);
-                CGColorSpaceRef colorSpace = CGColorSpaceCreateDeviceRGB();
-                CGContextRef context = base && colorSpace
-                    ? CGBitmapContextCreate(base, dmWidth, dmHeight, 8, bytesPerRow, colorSpace,
-                                            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst)
-                    : NULL;
-                BOOL drew = NO;
-                if (context) {
-                    CGContextDrawImage(context, CGRectMake(0, 0, (CGFloat)dmWidth, (CGFloat)dmHeight),
-                                       cgImage);
-                    CGContextRelease(context);
-                    drew = YES;
-                }
-                CVPixelBufferUnlockBaseAddress(danmakuImage, 0);
-                if (colorSpace) {
-                    CGColorSpaceRelease(colorSpace);
-                }
-                if (drew) {
-                    dmSource = "getRendererImage";
-                } else {
-                    CVPixelBufferRelease(danmakuImage);
-                    danmakuImage = NULL;
-                }
-            } else if (danmakuImage) {
-                CVPixelBufferRelease(danmakuImage);
-                danmakuImage = NULL;
+            danmakuImage = NJPiMxPixelBufferFromCGImage(cgImage);
+            if (danmakuImage) {
+                dmSource = "getRendererImage";
             }
         }
     }
