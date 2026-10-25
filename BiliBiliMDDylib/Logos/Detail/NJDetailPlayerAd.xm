@@ -4043,7 +4043,18 @@ static id NJPiMxObjectViaSelector(id target, NSString *selectorName) {
     return implementation ? ((id (*)(id, SEL))implementation)(target, selector) : nil;
 }
 
-typedef void (*NJPiMxCronResumeIMP)(id);
+// 注意：cppEngine 返回的是裸 C++ 指针（EngineDarwin*，ivar 直读 ldr x0,[x0,#8]），
+// 不是 ObjC 对象——取值必须按 void* 走，一旦声明成 id，ARC 会对 C++ vtable 头
+// 插 objc_retain → 野指针崩溃（真机 20261025 16:2x 会话即死于此处）。
+typedef void (*NJPiMxCronResumeIMP)(void *);
+static inline void *NJPiMxRawCppEngine(id engine) {
+    if (!engine) {
+        return NULL;
+    }
+    SEL getter = NSSelectorFromString(@"cppEngine");
+    IMP getterIMP = [engine methodForSelector:getter];
+    return getterIMP ? ((void *(*)(id, SEL))getterIMP)(engine, getter) : NULL;
+}
 static NJPiMxCronResumeIMP NJPiMxCronResume = NULL;          // sub_1152CA44C 换算后的运行时地址
 static IMP NJPiMxOriginalEngineRunningState = NULL;
 static volatile BOOL NJPiMxEngineKeepRunning = NO;           // §15.22 引擎豁免标志（只随闸门动）
@@ -4074,15 +4085,13 @@ static void NJPiMxEngineRunningStateIMP(id self, SEL _cmd) {
     NJPiMxCronResumeIMP resume = NJPiMxCronResume;
     if (NJPiMxEngineKeepRunning && resume &&
         [UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
-        SEL getter = NSSelectorFromString(@"cppEngine");
-        IMP getterIMP = [self methodForSelector:getter];
-        id box = getterIMP ? ((id (*)(id, SEL))getterIMP)(self, getter) : nil;
+        void *box = NJPiMxRawCppEngine(self);
         if (box) {
-            resume(box);
             if (NJPiMxEngineResumeLines < 12) {
                 NJPiMxEngineResumeLines += 1;
                 NJPiPDiag("mx eng resume=notify self=%s", object_getClassName(self));
             }
+            resume(box);
             return;
         }
     }
@@ -4145,12 +4154,7 @@ static void NJPiMxEngineResumeOnce(id wrapper, id view) {
         return;
     }
     resumedWrapper = wrapper;
-    SEL getter = NSSelectorFromString(@"cppEngine");
-    IMP getterIMP = [engine methodForSelector:getter];
-    id box = getterIMP ? ((id (*)(id, SEL))getterIMP)(engine, getter) : nil;
-    if (box) {
-        NJPiMxCronResume(box);
-    }
+    void *box = NJPiMxRawCppEngine(engine);
     // GPU 许可顺带放行（真机静态证明它不在这条取帧路上，属低成本保险；
     // 回前台时官方 updateGpuState 会按真实状态写回）。
     if ([view respondsToSelector:NSSelectorFromString(@"setGpuAccessAllowed:")]) {
@@ -4160,6 +4164,9 @@ static void NJPiMxEngineResumeOnce(id wrapper, id view) {
         }
     }
     NJPiPDiag("mx eng resume=proactive engine=%s box=%d", object_getClassName(engine), box ? 1 : 0);
+    if (box) {
+        NJPiMxCronResume(box);
+    }
 }
 
 #pragma mark - Mixed offscreen: our own Metal fallbacks
