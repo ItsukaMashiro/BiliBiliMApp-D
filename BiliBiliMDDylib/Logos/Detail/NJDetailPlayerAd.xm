@@ -3336,17 +3336,22 @@ static unsigned long long NJPiMxSummaryLastFail = 0;
 static unsigned long long NJPiMxExtChanges = 0;
 static unsigned long long NJPiMxRendChanges = 0;
 // 弹幕层取源与补驱动观测（§15.21）：cpb=我们主动调 wrapper copyPixelBuffer 的次数；
-// us=我们替 wrapper 补驱动 updateSyncForTimeStep: 的次数（只有官方从未驱动过视图时
-// 才会非零，避免双驱动）；ust=视图自己的 _updateSyncForTimeStep: 被调用次数
+// us=我们替 wrapper 补驱动 updateSyncForTimeStep: 的次数（§15.23：官方近 0.25s 内
+// 无步进时才非零，前台让位、后台接管）；ust=视图自己的 _updateSyncForTimeStep: 被调用次数
 // （不含我们 pass 路的自驱——wrap 路不驱视图，这个字段因此只反映官方驱动）。
 static unsigned long long NJPiMxWrapperCpbCalls = 0;
 static unsigned long long NJPiMxWrapperDrives = 0;
 static unsigned long long NJPiMxViewSyncObserved = 0;
 static volatile int NJPiMxSelfDriving = 0;
+// §15.23：最近一次「官方驱动视图 _updateSyncForTimeStep:」的时刻（mach ticks）。
+// 后台 CADisplayLink 停转后官方不再步进引擎，补驱动改按时间窗接管（见 DriveWrapperIfNeeded），
+// 判活窗 = 0.25s。0 = 从未观测。
+static volatile uint64_t NJPiMxLastOfficialSyncTicks = 0;
 
 static void NJPiMxNoteViewSyncObserved(void) {
     if (!NJPiMxSelfDriving) {
         NJPiMxViewSyncObserved += 1;
+        NJPiMxLastOfficialSyncTicks = mach_absolute_time();
     }
 }
 
@@ -3966,14 +3971,25 @@ static CVImageBufferRef NJPiMxCallCopyPixelBuffer(id wrapper) {
     return ((NJPiMxCopyPixelBufferIMP)implementation)(wrapper, selector);
 }
 
-// 只有官方没在驱动时才补驱动：ust 在 hook 里累计（上面的自驱标记把它排除），
-// 非零说明 wrapper 正被视图的时钟驱动，就不再补，避免双驱动跳帧。
+// §15.23 补驱动判活：官方驱动看「近因」而非「历史」——真机判决（ff402e2）是前台
+// onDisplayLink: @0x11484dcc4 →（异步 _cronRenderQueue block @0x11484e0b4）→
+// _updateSyncForTimeStep: 正常步进（ust 一直在涨），入后台 CADisplayLink 停转后
+// 官方步进归零，而旧条件「ust 历史非零就不补」把补驱动永久锁死——引擎没人 step、
+// buffer_queue_ 恒空、copyPixelBuffer 恒 nil（no_tex）。现改为：最近 0.25s 内官方
+// 步进过就让位（避免前台双驱动抢帧），否则由我们按合成帧率补 step。
 // Δt 沿用视图自驱的同一钳制策略（上限 1s，超限按一帧）。
 typedef void (*NJPiMxWrapperSyncIMP)(id, SEL, double);
 
 static void NJPiMxDriveWrapperIfNeeded(id wrapper) {
-    if (NJPiMxViewSyncObserved != 0) {
-        return;
+    if (NJPiMxTimebase.denom == 0) {
+        mach_timebase_info(&NJPiMxTimebase);
+    }
+    uint64_t lastOfficial = NJPiMxLastOfficialSyncTicks;
+    if (lastOfficial != 0) {
+        uint64_t gap = mach_absolute_time() - lastOfficial;
+        if (NJPiMxNanoseconds((unsigned long long)gap) < 250.0 * 1e6) {
+            return; // 官方仍在驱动，让位
+        }
     }
     SEL selector = NSSelectorFromString(@"updateSyncForTimeStep:");
     if (![wrapper respondsToSelector:selector]) {
@@ -3982,9 +3998,6 @@ static void NJPiMxDriveWrapperIfNeeded(id wrapper) {
     IMP implementation = [wrapper methodForSelector:selector];
     if (!implementation) {
         return;
-    }
-    if (NJPiMxTimebase.denom == 0) {
-        mach_timebase_info(&NJPiMxTimebase);
     }
     static __unsafe_unretained id drivenWrapper = nil;
     static uint64_t lastTick = 0;
@@ -4721,8 +4734,9 @@ static id NJPiMxCompositeImage(id view, CMSampleBufferRef original, CVImageBuffe
 // hook），只缺弹幕层。官方把两层在视图里一起烤，但那两张贴图（_externalTexture/
 // _rendererTexture）真机恒 nil（probe ext=0 rend=0），所以这条路不押任何私有 ivar。
 // 弹幕源优先级与降级：
-//   1) [view rendererWrapper] 缓存 → updateSyncForTimeStep:（仅当官方从未驱动，ust=0）
-//      → copyPixelBuffer（无参，+1）。这就是官方 _updateSyncForTimeStep: 内部走的同一条取帧路。
+//   1) [view rendererWrapper] 缓存 → updateSyncForTimeStep:（§15.23：官方近 0.25s
+//      步进过就让位，否则补 step）→ copyPixelBuffer（无参，+1）。这就是官方
+//      _updateSyncForTimeStep: 内部走的同一条取帧路。
 //   2) 不可用 → [view getRendererImage]（V2 @0x11484e6b8 现做一次 offscreen pass，
 //      不读那两张贴图；代价高，仅作降级）。
 //   3) 都没有 → no_dmsrc，并打一行带能力位的 detail，直接可读。
