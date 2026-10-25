@@ -182,6 +182,15 @@
  - mx sum 周期 30s→5s；同 reason 静默上限 5→20；PiP didStop / SBManager /
    PlayerContainer / controller dealloc 时强制摘要+落盘（真机会话只有 ~9s，周期
    等不到）。
+ - §15.22 引擎 PiP 期豁免（真机 b284e67 判决 cpb=553 全 nil 后新增）：反汇编确证
+   -[CRONEngine updateRunningState]@0x1151b6db0 在入后台时挂起 C++ cron 引擎
+   （sub_1152CA47C(cpp,0)），buffer_queue_ 停止进帧——任何驱动都取不到帧。修法是
+   闸门期间保持引擎运行：wrap 路取帧前对 wrapper→renderer(CRONRenderer)→engine→
+   cppEngine(box) 直调官方完整恢复函数 sub_1152CA44C(box)（地址以 updateRunningState
+   的运行时 IMP 对索引锚 0x1151b6db0 自校准，页不对齐即整体放弃、行为回退现状）；
+   并换掉 updateRunningState 实现，仅「闸门开且真后台」走恢复分支，其余原样转
+   原实现。标志只随闸门动（didStop 与 enqueuer 闸门同步双路清零）。诊断行
+   `mx eng calib/resume/keep`。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 1
@@ -252,6 +261,8 @@ static void NJPiMxFlushNow(void);
 // cron 视图实例，避免把已释放实例带进下一次会话。
 static void NJPiMxForgetCapturedViews(const char *why);
 static id NJPiMCapturedView(void);
+// 定义在下面 §15.22 区：PiP didStop 把 CRON 引擎豁免标志清回 NO（标志只随闸门动）。
+static void NJPiMxEngineNoteStop(void);
 #endif
 #if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 // 定义在下面（要用 NJPiPDiag 写失败诊断）。两处调用都是 fire-and-forget，
@@ -1149,6 +1160,9 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_DEFAULT, "[NJPiPDanmaku] didStop");
     NJPiPDiag("danmaku didStop");
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMxEngineNoteStop(); // §15.22 关闸
+#endif
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -1910,6 +1924,7 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
     NJPiMxFlushNow();
     // PiP 停止后主播放器路径可能重建视图：清掉捕获实例，下一段由视图自己的方法重新捕获。
     NJPiMxForgetCapturedViews("didStop");
+    NJPiMxEngineNoteStop(); // §15.22 关闸
 #endif
     [self.state restoreDanmaku];
     if ([self.downstream respondsToSelector:_cmd]) {
@@ -3987,6 +4002,166 @@ static void NJPiMxDriveWrapperIfNeeded(id wrapper) {
     ((NJPiMxWrapperSyncIMP)implementation)(wrapper, selector, seconds);
 }
 
+#pragma mark - Mixed offscreen: keep the CRON engine running during PiP (§15.22)
+
+// 真机 b284e67 的判决行是 mx sum 的 `cpb=553 us=0 ust=367`：补驱动全部执行、
+// 官方视图一次没驱动，而 wrapper.copyPixelBuffer 每次都返回 nil。当时把原因
+// 记作「V2 自驱泵没转」，反汇编把这版解释否证了——真正关帧的地方在更下游：
+//
+//   -[CRONEngine updateRunningState] @0x1151b6db0：读
+//   [UIApplication applicationState]，==Background(2) 时走
+//   sub_1152CA47C(box,0) = sub_1151B1C38(cpp,0,1) —— C++ 引擎挂起；
+//   前台且 !isPaused 时走 sub_1152CA44C(box) = sub_1151B1C38(cpp,1,0) +
+//   sub_1151B1EF0(cpp) —— 完整恢复。-[CRONEngine setPaused:] 只是写 _paused
+//   再 tail-b 同一个 updateRunningState，所以 setPaused:NO 在后台照样挂起。
+//   -[CRONRenderer copyPixelBuffer] @0x1151b8d38 弹的是 buffer_queue_，
+//   引擎挂起后队列不再进帧 → 无论怎么驱动都是 no_tex。
+//
+// 修法不改全局 applicationState（全局谎报副作用不可控），两处配合：
+//   1) wrap 路取帧前，对当前 wrapper 解析 renderer(CRONRenderer)→engine→
+//      cppEngine(box)，直调官方完整恢复函数 sub_1152CA44C(box)——与官方前台
+//      未暂停分支逐字同一条路。函数地址来自 8.89 索引，运行时用锚点自校准：
+//      锚 = -[CRONEngine updateRunningState] 实际 IMP 与索引地址 0x1151b6db0
+//      之差；差值不是页对齐（slide 必为页大小倍数）就整体放弃、回到现状，
+//      绝不拿没对齐的地址盲调。
+//   2) 换掉 -[CRONEngine updateRunningState] 的实现：闸门开着且此刻真是后台
+//      时走恢复分支（否则入后台的通知会立刻把引擎再挂起，1) 的成果作废）；
+//      其余一切情况调原实现——前台路径逐字保持官方行为。
+// 关闸两条路都通：三个 delegate 代理的 didStop 直接清回 NO；即使 delegate 事件
+// 没送到我们（真机 20261025 实测如此），enqueuer 的闸门变化同步也会清。不存在
+// 「PiP 结束后引擎空转」的路径。
+// 零参 id 返回的通用取物（无副作用 getter 专用；nil 安全）。
+static id NJPiMxObjectViaSelector(id target, NSString *selectorName) {
+    if (!target) {
+        return nil;
+    }
+    SEL selector = NSSelectorFromString(selectorName);
+    if (![target respondsToSelector:selector]) {
+        return nil;
+    }
+    IMP implementation = [target methodForSelector:selector];
+    return implementation ? ((id (*)(id, SEL))implementation)(target, selector) : nil;
+}
+
+typedef void (*NJPiMxCronResumeIMP)(id);
+static NJPiMxCronResumeIMP NJPiMxCronResume = NULL;          // sub_1152CA44C 换算后的运行时地址
+static IMP NJPiMxOriginalEngineRunningState = NULL;
+static volatile BOOL NJPiMxEngineKeepRunning = NO;           // §15.22 引擎豁免标志（只随闸门动）
+static unsigned long long NJPiMxEngineResumeLines = 0;
+
+static void NJPiMxEngineNoteKeep(BOOL keep) {
+    static BOOL lastKeep = NO;
+    static BOOL first = YES;
+    if (!first && keep == lastKeep) {
+        return;
+    }
+    first = NO;
+    lastKeep = keep;
+    NJPiPDiag("mx eng keep=%d", (int)keep);
+}
+
+// didStop（任意一个 delegate 代理收到）关闸：标志清回 NO，之后的
+// updateRunningState 恢复官方原行为。failedToStart 不需要单独处理——
+// 那种会话闸门从未开过，标志也从未置起。
+static void NJPiMxEngineNoteStop(void) {
+    NJPiMxEngineKeepRunning = NO;
+    NJPiMxEngineNoteKeep(NO);
+}
+
+// -[CRONEngine updateRunningState] 的替换实现。除「闸门开 && 确实在后台」外
+// 全部原样转原实现；那个唯一分支里调官方前台恢复函数（与官方非暂停分支同路）。
+static void NJPiMxEngineRunningStateIMP(id self, SEL _cmd) {
+    NJPiMxCronResumeIMP resume = NJPiMxCronResume;
+    if (NJPiMxEngineKeepRunning && resume &&
+        [UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
+        SEL getter = NSSelectorFromString(@"cppEngine");
+        IMP getterIMP = [self methodForSelector:getter];
+        id box = getterIMP ? ((id (*)(id, SEL))getterIMP)(self, getter) : nil;
+        if (box) {
+            resume(box);
+            if (NJPiMxEngineResumeLines < 12) {
+                NJPiMxEngineResumeLines += 1;
+                NJPiPDiag("mx eng resume=notify self=%s", object_getClassName(self));
+            }
+            return;
+        }
+    }
+    if (NJPiMxOriginalEngineRunningState) {
+        ((void (*)(id, SEL))NJPiMxOriginalEngineRunningState)(self, _cmd);
+    }
+}
+
+// 锚点自校准：只在第一次需要时做一次。任何一步不满足就放弃整套方案
+// （不装钩、不调裸函数），行为回到 b284e67——失败模式必须是现状而不是崩溃。
+static BOOL NJPiMxEngineCalibrate(void) {
+    static dispatch_once_t onceToken;
+    static BOOL calibrated = NO;
+    dispatch_once(&onceToken, ^{
+        Class engineClass = NSClassFromString(@"CRONEngine");
+        if (!engineClass) {
+            NJPiPDiag("mx eng calib=class-missing");
+            return;
+        }
+        Method method = class_getInstanceMethod(engineClass, NSSelectorFromString(@"updateRunningState"));
+        if (!method) {
+            NJPiPDiag("mx eng calib=method-missing");
+            return;
+        }
+        uintptr_t actual = (uintptr_t)method_getImplementation(method);
+        uintptr_t delta = actual - (uintptr_t)0x1151b6db0;  // 索引地址（含 0x100000000 基）
+        if (delta == 0 || (delta & 0x3FFF) != 0) {
+            NJPiPDiag("mx eng calib=slide-reject delta=0x%llx", (unsigned long long)delta);
+            return;
+        }
+        NJPiMxOriginalEngineRunningState = method_getImplementation(method);
+        NJPiMxCronResume = (NJPiMxCronResumeIMP)((uintptr_t)0x1152ca44c + delta);
+        method_setImplementation(method, (IMP)NJPiMxEngineRunningStateIMP);
+        calibrated = YES;
+        NJPiPDiag("mx eng calib=ok delta=0x%llx hook=on", (unsigned long long)delta);
+    });
+    return calibrated;
+}
+
+// 每 PiP 会话对一个 wrapper 只主动恢复一次（通知路径之外再补一次主动恢复，
+// 覆盖「先入后台、通知早于首帧合成」的时序）。wrapper 换了实例就重新来。
+static void NJPiMxEngineResumeOnce(id wrapper, id view) {
+    if (!NJPiMxEngineCalibrate() || !wrapper) {
+        return;
+    }
+    static __weak id resumedWrapper = nil;
+    if (resumedWrapper == wrapper) {
+        return;
+    }
+    id renderer = NJPiMxObjectViaSelector(wrapper, @"renderer");   // getter 内部已验 CRONRenderer 类
+    id engine = NJPiMxObjectViaSelector(renderer, @"engine");
+    if (!engine || ![engine respondsToSelector:NSSelectorFromString(@"cppEngine")]) {
+        if (NJPiMxEngineResumeLines < 12) {
+            NJPiMxEngineResumeLines += 1;
+            NJPiPDiag("mx eng resume=chain-fail wr=%s renderer=%s engine=%s",
+                      object_getClassName(wrapper),
+                      renderer ? object_getClassName(renderer) : "-",
+                      engine ? object_getClassName(engine) : "-");
+        }
+        return;
+    }
+    resumedWrapper = wrapper;
+    SEL getter = NSSelectorFromString(@"cppEngine");
+    IMP getterIMP = [engine methodForSelector:getter];
+    id box = getterIMP ? ((id (*)(id, SEL))getterIMP)(engine, getter) : nil;
+    if (box) {
+        NJPiMxCronResume(box);
+    }
+    // GPU 许可顺带放行（真机静态证明它不在这条取帧路上，属低成本保险；
+    // 回前台时官方 updateGpuState 会按真实状态写回）。
+    if ([view respondsToSelector:NSSelectorFromString(@"setGpuAccessAllowed:")]) {
+        IMP setter = [view methodForSelector:NSSelectorFromString(@"setGpuAccessAllowed:")];
+        if (setter) {
+            ((void (*)(id, SEL, BOOL))setter)(view, NSSelectorFromString(@"setGpuAccessAllowed:"), YES);
+        }
+    }
+    NJPiPDiag("mx eng resume=proactive engine=%s box=%d", object_getClassName(engine), box ? 1 : 0);
+}
+
 #pragma mark - Mixed offscreen: our own Metal fallbacks
 
 // Compiled at runtime like the GPU path. Used only when the view's own pipeline
@@ -4559,6 +4734,9 @@ static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBuffer
     const char *dmSource = "none";
     id wrapper = NJPiMxWrapperForView(view);
     if (wrapper) {
+        // §15.22：先将引擎保持在运行态（每会话一次），再走取帧路——引擎被官方
+        // 入后台挂起时，后面的驱动与 copyPixelBuffer 才有帧可取。
+        NJPiMxEngineResumeOnce(wrapper, view);
         NJPiMxDriveWrapperIfNeeded(wrapper);
         danmakuImage = NJPiMxCallCopyPixelBuffer(wrapper); // +1
         if (danmakuImage) {
@@ -5089,6 +5267,10 @@ static void NJPiMxTrampoline(id self, SEL _cmd, id sampleBuffer, BOOL primary) {
         lastGateActive = gate.active;
         lastGateSource = @(gate.source);
         NJPiPDiag("mx gate pip=%d src=%s", (int)gate.active, gate.source);
+        // §15.22：引擎豁免标志随闸门同步——开闸后后台的 updateRunningState 走恢复
+        // 分支，关闸立刻回到官方原行为（delegate 事件没送到的会话里，这里就是关闸权威）。
+        NJPiMxEngineKeepRunning = gate.active;
+        NJPiMxEngineNoteKeep(gate.active);
     }
     BOOL composited = NO;
     if (gate.active && (strcmp(role, "pip-layer") == 0 || strcmp(role, "shared") == 0)) {
@@ -5602,6 +5784,9 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
 
 - (void)pictureInPictureControllerDidStopPictureInPicture:(AVPictureInPictureController *)controller {
     NJPiPDiag("mirror didStop");
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+    NJPiMxEngineNoteStop(); // §15.22 关闸
+#endif
     [self.state restoreContent];
     if ([self.downstream respondsToSelector:_cmd]) {
         [self.downstream pictureInPictureControllerDidStopPictureInPicture:controller];
@@ -6252,6 +6437,14 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 }
 
 - (void)setDelegate:(id<AVPictureInPictureControllerDelegate>)delegate {
+    // 真机 20261025：PiP 启停全程没有任何 delegate 事件到达我们的三层代理——先记
+    // 下系统何时、拿什么对象调 setDelegate:，确证关叉号瞬间 delegate 归属。限 24 行。
+    static unsigned long long setLines = 0;
+    if (setLines < 24) {
+        setLines += 1;
+        NJPiPDiag("pip setDelegate self=%p in=%s", (void *)self,
+                  delegate ? object_getClassName(delegate) : "-");
+    }
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
     if (overlayState && delegate != overlayState.delegateProxy) {
         overlayState.delegateProxy.downstream = delegate;
@@ -6275,19 +6468,28 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (id<AVPictureInPictureControllerDelegate>)delegate {
     id<AVPictureInPictureControllerDelegate> delegate = %orig;
+    id<AVPictureInPictureControllerDelegate> shown = delegate;
     NJPiPOverlayState *overlayState = objc_getAssociatedObject(self, NJPiPOverlayStateKey);
     if (overlayState && delegate == overlayState.delegateProxy && overlayState.delegateProxy.downstream) {
-        return overlayState.delegateProxy.downstream;
+        shown = overlayState.delegateProxy.downstream;
     }
     NJPiPMirrorState *mirrorState = objc_getAssociatedObject(self, NJPiPMirrorStateKey);
     if (mirrorState && delegate == mirrorState.delegateProxy && mirrorState.delegateProxy.downstream) {
-        return mirrorState.delegateProxy.downstream;
+        shown = mirrorState.delegateProxy.downstream;
     }
     NJPiPDanmakuState *state = objc_getAssociatedObject(self, NJPiPDanmakuStateKey);
     if (state && delegate == state.delegateProxy && state.delegateProxy.downstream) {
-        return state.delegateProxy.downstream;
+        shown = state.delegateProxy.downstream;
     }
-    return delegate;
+    // 系统若在派发事件前重读 delegate（getter 被调即证据），这里会留下记录。限 24 行。
+    static unsigned long long getLines = 0;
+    if (getLines < 24) {
+        getLines += 1;
+        NJPiPDiag("pip getDelegate self=%p real=%s ret=%s", (void *)self,
+                  delegate ? object_getClassName(delegate) : "-",
+                  shown ? object_getClassName(shown) : "-");
+    }
+    return shown;
 }
 
 - (void)dealloc {
