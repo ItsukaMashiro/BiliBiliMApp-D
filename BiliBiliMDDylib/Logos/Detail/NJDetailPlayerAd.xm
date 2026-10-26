@@ -208,6 +208,10 @@
    恢复永远走自研 resume，官方清 _paused 的前台分支被绕过；若 snapshot 入口
    第一行判 _paused@0x18，即可解释「lie 有效仍秒挡」。wrap 路取帧前读该字并
    清零（仅豁免窗口内），诊断行 `mx snap paused=` + 引擎头部字 dump。
+ * §15.27 真守卫落地：snapshot 的 C++ worker 入口只认一个镜像字节
+ *     ctx=[[engine+8]+8 再 +0x38] 处 +0x88（render 线程从权威 engine+0x44
+ *     经 glFinish 后拷来）。§15.22 resume 写了权威位但后台镜像没翻 =>
+ *     取帧前直接把镜像强写 1（NJPiMxEnginePauseProbe 扩展），dump 见 mx mir。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 1
@@ -4898,11 +4902,16 @@ static CVPixelBufferRef NJPiMxPixelBufferFromCGImage(CGImageRef cgImage) {
     return pixelBuffer; // +1
 }
 
-// §15.26 嫌疑：CRONEngine._paused@0x18 从没人清。官方挂起分支经 setPaused: 置 1
-// 后，§15.22 的 hook 让恢复永远走「自研 resume」（notify+set_running），官方清除
-// _paused 的前台分支被绕过——若 snapshot 的 ObjC 入口第一行判 _paused，就与
-// 9760eec 全部现象吻合（lie 生效仍 no_snap、ms=0.00 秒挡、前台靠官方自己那条
-// 路清标志才通）。取帧前读一次并清零，同时 dump 引擎头部几个字（对照前后台）。
+// §15.26 嫌疑（已证伪）：CRONEngine._paused@0x18——a905d48 真机恒 0。
+// §15.27 真守卫（Ghidra/capstone 静态确证，子代理②）：snapshot 的 C++ worker
+// sub_115061FCC 入口 15 条内读 `ctx=[engine+0x38]` 处 +0x88 单字节镜像，为 0
+// 直接写 {0,0} 早退（微秒级，ms=0.00 吻合）。镜像由 render 线程 SetRunning 任务
+// （sub_1151B3320，glFinish 之后）从权威 engine+0x44 拷来；我们的 §15.22 resume
+// 写了权威位（resume=proactive 有日志）但镜像没翻——队列有序性说明后台执行器
+// 线程没把 SetRunning 任务跑到（或被 glFinish 卡住）。修法：取帧前把镜像字节
+// 直接强写 1（GUARD#1 绕过），并把权威位、宽高（次守卫 +0x198/0x19c）一起 dump。
+// 链（全静态确证）：box=ObjC+0x8；inner=*(box+8)；ctx=*(inner+0x38)；
+// 镜像=ctx+0x88；权威=inner+0x44；宽高 float 在 inner+0x198/0x19c。
 static void NJPiMxEnginePauseProbe(id engine) {
     if (!engine || !NJPiMxEngineKeepRunning) {
         return;
@@ -4922,8 +4931,46 @@ static void NJPiMxEnginePauseProbe(id engine) {
                   (unsigned long long)w0, (unsigned long long)w28, (unsigned long long)w30);
     }
     if (value) {
-        *slot = 0;
+        *slot = 0; // §15.26 遗留清零，无害
     }
+    // §15.27 镜像字节强写
+    void *box = *(void **)((uintptr_t)engine + 0x8);
+    static uint32_t mirShown = 0;
+    if (!box || ((uintptr_t)box & 0x7) != 0) {
+        if (mirShown < 4) {
+            mirShown += 1;
+            NJPiPDiag("mx mir box=bad 0x%llx", (unsigned long long)(uintptr_t)box);
+        }
+        return;
+    }
+    void *inner = *(void **)((uintptr_t)box + 0x8);
+    if (!inner || ((uintptr_t)inner & 0x7) != 0) {
+        if (mirShown < 4) {
+            mirShown += 1;
+            NJPiPDiag("mx mir inner=bad 0x%llx", (unsigned long long)(uintptr_t)inner);
+        }
+        return;
+    }
+    void *ctx = *(void **)((uintptr_t)inner + 0x38);
+    if (!ctx || ((uintptr_t)ctx & 0x7) != 0) {
+        if (mirShown < 4) {
+            mirShown += 1;
+            NJPiPDiag("mx mir ctx=bad 0x%llx", (unsigned long long)(uintptr_t)ctx);
+        }
+        return;
+    }
+    uint8_t *mirror = (uint8_t *)((uintptr_t)ctx + 0x88);
+    uint8_t authoritative = *(uint8_t *)((uintptr_t)inner + 0x44);
+    float width = *(const float *)((uintptr_t)inner + 0x198);
+    float height = *(const float *)((uintptr_t)inner + 0x19c);
+    if (mirShown < 12 || *mirror == 0) {
+        if (mirShown < 12) {
+            mirShown += 1;
+        }
+        NJPiPDiag("mx mir ctx=%p m88=%u e44=%u w=%.0f h=%.0f", ctx,
+                  (unsigned)*mirror, (unsigned)authoritative, width, height);
+    }
+    *mirror = 1; // GUARD#1 绕过：worker 见 1 即走真渲染
 }
 
 // §15.24 snapshot 取帧路：-[CRONRenderer snapshot] @0x1151b8b08 是纯转发
