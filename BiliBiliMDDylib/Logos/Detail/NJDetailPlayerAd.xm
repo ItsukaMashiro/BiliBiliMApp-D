@@ -4963,14 +4963,26 @@ static void NJPiMxEnginePauseProbe(id engine) {
     uint8_t authoritative = *(uint8_t *)((uintptr_t)inner + 0x44);
     float width = *(const float *)((uintptr_t)inner + 0x198);
     float height = *(const float *)((uintptr_t)inner + 0x19c);
-    if (mirShown < 12 || *mirror == 0) {
+    // §15.28：双门解耦（子代理①终报）——0x88=snapshot worker 门，0x89=泵任务体门
+    // （Resume invoker 0x1151b3694 置 1/Pause 0x1151b3808 清 0，官方后台一刀全关；
+    // cpb=0 的门在 0x89 不在 0x88）。两门皆裸字节读、无二次校验 → 都强写。
+    // 0xb8=入队 stopped 旗标（sub_114FFDE28 ldarb 置位即静默丢弃任务）只查不写。
+    uint8_t *pumpGate = (uint8_t *)((uintptr_t)ctx + 0x89);
+    uint8_t *stopped = (uint8_t *)((uintptr_t)ctx + 0xb8);
+    uint32_t state40 = *(const uint32_t *)((uintptr_t)ctx + 0x40); // ==4 引擎 stopped
+    void *renderer = *(void **)((uintptr_t)ctx + 0x130);           // 泵渲染体 renderer
+    uint8_t latch = *(uint8_t *)((uintptr_t)inner + 0x45);         // SGA latch
+    if (mirShown < 12 || *mirror == 0 || *pumpGate == 0) {
         if (mirShown < 12) {
             mirShown += 1;
         }
-        NJPiPDiag("mx mir ctx=%p m88=%u e44=%u w=%.0f h=%.0f", ctx,
-                  (unsigned)*mirror, (unsigned)authoritative, width, height);
+        NJPiPDiag("mx mir ctx=%p m88=%u m89=%u st40=%u b8=%u r130=%p e44=%u i45=%u w=%.0f h=%.0f",
+                  ctx, (unsigned)*mirror, (unsigned)*pumpGate, (unsigned)state40,
+                  (unsigned)*stopped, renderer, (unsigned)authoritative, (unsigned)latch,
+                  width, height);
     }
-    *mirror = 1; // GUARD#1 绕过：worker 见 1 即走真渲染
+    *mirror = 1;   // GUARD#1 绕过：snapshot worker 见 1 即走真渲染
+    *pumpGate = 1; // 泵门绕过：泵任务体见 1 才渲染入队 → buffer_queue_ 复活
 }
 
 // §15.24 snapshot 取帧路：-[CRONRenderer snapshot] @0x1151b8b08 是纯转发
