@@ -204,6 +204,10 @@
    引擎豁免窗口内把 applicationState 的 Background 谎报成 Active（关闸即恢复）；
    出弹幕⇒守卫就是它；不出⇒升级 frida 动态。内部判定/日志一律走
    NJPiMxRealAppState。诊断行 `mx lie hook/active/read`，mx sum 加 lie= 位。
+ - §15.26 清 _paused 位实验（9760eec 判决谎报无效后新增）：§15.22 的 hook 让
+   恢复永远走自研 resume，官方清 _paused 的前台分支被绕过；若 snapshot 入口
+   第一行判 _paused@0x18，即可解释「lie 有效仍秒挡」。wrap 路取帧前读该字并
+   清零（仅豁免窗口内），诊断行 `mx snap paused=` + 引擎头部字 dump。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 1
@@ -4894,6 +4898,34 @@ static CVPixelBufferRef NJPiMxPixelBufferFromCGImage(CGImageRef cgImage) {
     return pixelBuffer; // +1
 }
 
+// §15.26 嫌疑：CRONEngine._paused@0x18 从没人清。官方挂起分支经 setPaused: 置 1
+// 后，§15.22 的 hook 让恢复永远走「自研 resume」（notify+set_running），官方清除
+// _paused 的前台分支被绕过——若 snapshot 的 ObjC 入口第一行判 _paused，就与
+// 9760eec 全部现象吻合（lie 生效仍 no_snap、ms=0.00 秒挡、前台靠官方自己那条
+// 路清标志才通）。取帧前读一次并清零，同时 dump 引擎头部几个字（对照前后台）。
+static void NJPiMxEnginePauseProbe(id engine) {
+    if (!engine || !NJPiMxEngineKeepRunning) {
+        return;
+    }
+    uint32_t *slot = (uint32_t *)((uintptr_t)engine + 0x18);
+    uint32_t value = *slot;
+    static uint32_t shown = 0;
+    static uint32_t last = 0xFFFFFFFF;
+    if (shown < 8 || value != last) {
+        shown += 1;
+        last = value;
+        uint64_t w0 = *(const uint64_t *)((uintptr_t)engine);
+        uint64_t w28 = *(const uint64_t *)((uintptr_t)engine + 0x28);
+        uint64_t w30 = *(const uint64_t *)((uintptr_t)engine + 0x30);
+        NJPiPDiag("mx snap eng=%s paused=%u w0=0x%llx w28=0x%llx w30=0x%llx",
+                  object_getClassName(engine), value,
+                  (unsigned long long)w0, (unsigned long long)w28, (unsigned long long)w30);
+    }
+    if (value) {
+        *slot = 0;
+    }
+}
+
 // §15.24 snapshot 取帧路：-[CRONRenderer snapshot] @0x1151b8b08 是纯转发
 // （[[self engine] snapshot]）；-[CRONEngine snapshot] @0x1151b6aa4 直接调 C++
 // （sub_1151AB11C：组请求 → sub_1151B16F4 同步离屏渲染一帧 → 输出 CGImage），
@@ -4911,6 +4943,7 @@ static id NJPiMxSnapshotImage(id wrapper) {
         candidates[count++] = renderer;
         id engine = NJPiMxObjectViaSelector(renderer, @"engine");
         if (engine) {
+            NJPiMxEnginePauseProbe(engine); // §15.26
             candidates[count++] = engine;
         }
     }
