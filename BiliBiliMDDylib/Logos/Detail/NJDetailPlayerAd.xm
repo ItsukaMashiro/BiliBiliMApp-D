@@ -197,6 +197,13 @@
     wrapper→renderer→engine 链调第一个响应 snapshot 的对象（-[CRONEngine
     snapshot]@0x1151b6aa4 直接进 C++ 同步离屏渲染，输出 CGImage→UIImage），blit
     成 BGRA 后与视频层合成。能力位加进 mx caps（snap=），新失败名 no_snap。
+ - §15.25 限时 applicationState 谎报（真机 98856bc 判决 snapshot 前台通、后台
+   入口 ms=0.00 秒挡后新增的判决实验）：官方全部已知后台门都是读
+   [UIApplication applicationState]==Background（§15.22 引擎挂起、updateGpuState
+   的 GPU 放行、updateDisplayLinkState 皆然），C++ 渲染守卫静态追到 vtable 为止。
+   引擎豁免窗口内把 applicationState 的 Background 谎报成 Active（关闸即恢复）；
+   出弹幕⇒守卫就是它；不出⇒升级 frida 动态。内部判定/日志一律走
+   NJPiMxRealAppState。诊断行 `mx lie hook/active/read`，mx sum 加 lie= 位。
  */
 #ifndef NJ_PIP_MIXED_OFFSCREEN_ENABLED
 #define NJ_PIP_MIXED_OFFSCREEN_ENABLED 1
@@ -269,6 +276,10 @@ static void NJPiMxForgetCapturedViews(const char *why);
 static id NJPiMCapturedView(void);
 // 定义在下面 §15.22 区：PiP didStop 把 CRON 引擎豁免标志清回 NO（标志只随闸门动）。
 static void NJPiMxEngineNoteStop(void);
+// 定义在下面 §15.25 区：谎报钩当前是否生效中（进 mx sum 的 lie= 字段）。
+static BOOL NJPiMxAppStateLieActive(void);
+// 定义在下面 §15.25 区：绕过谎报钩读真实 applicationState（心跳诊断用）。
+static NSInteger NJPiMxRealAppState(void);
 #endif
 #if NJ_PIP_LAN_LOG_UPLOAD_ENABLED
 // 定义在下面（要用 NJPiPDiag 写失败诊断）。两处调用都是 fire-and-forget，
@@ -3409,13 +3420,13 @@ static void NJPiMxSummaryTick(void) {
     // 方法捕获到实例）与 plq=（上一帧选用的 pipeline）。
     NJPiPDiag("mx sum win=%llu out=%llu fail=%llu ms=%.2f msmax=%.2f route=%s "
               "dmsrc=%s cpb=%llu us=%llu ust=%llu "
-              "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s fails=%s",
+              "exchg=%llu rendchg=%llu setup=%s view=%d plq=%s lie=%d fails=%s",
               inDelta, okDelta, failTotal, avgMilliseconds, maxMilliseconds, routeName,
               NJPiMxDmSourceName,
               NJPiMxWrapperCpbCalls, NJPiMxWrapperDrives, NJPiMxViewSyncObserved,
               NJPiMxExtChanges, NJPiMxRendChanges,
               NJPiMxSetupFailure ?: "ok",
-              NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ,
+              NJPiMCapturedView() ? 1 : 0, NJPiMxLastPLQ, NJPiMxAppStateLieActive(),
               counts.UTF8String ?: "-");
     NJPiMxMaxDurationNs = 0;
     NJPiMxDurationNs = 0;
@@ -4088,6 +4099,7 @@ static NJPiMxCronResumeIMP NJPiMxCronResume = NULL;          // sub_1152CA44C �
 static IMP NJPiMxOriginalEngineRunningState = NULL;
 static volatile BOOL NJPiMxEngineKeepRunning = NO;           // §15.22 引擎豁免标志（只随闸门动）
 static unsigned long long NJPiMxEngineResumeLines = 0;
+static void NJPiMxAppStateLieSet(BOOL on);                   // §15.25（定义在下方）
 
 static void NJPiMxEngineNoteKeep(BOOL keep) {
     static BOOL lastKeep = NO;
@@ -4098,6 +4110,7 @@ static void NJPiMxEngineNoteKeep(BOOL keep) {
     first = NO;
     lastKeep = keep;
     NJPiPDiag("mx eng keep=%d", (int)keep);
+    NJPiMxAppStateLieSet(keep); // §15.25 引擎豁免窗口 = 谎报窗口（关闸即恢复真实状态）
 }
 
 // didStop（任意一个 delegate 代理收到）关闸：标志清回 NO，之后的
@@ -4108,12 +4121,16 @@ static void NJPiMxEngineNoteStop(void) {
     NJPiMxEngineNoteKeep(NO);
 }
 
+// §15.25 真状态读取（定义在下方；这里先用后声明，谎报钩在场时内部绕回原 IMP）。
+static NSInteger NJPiMxRealAppState(void);
+
 // -[CRONEngine updateRunningState] 的替换实现。除「闸门开 && 确实在后台」外
 // 全部原样转原实现；那个唯一分支里调官方前台恢复函数（与官方非暂停分支同路）。
+// 判定必须走 NJPiMxRealAppState——§15.25 谎报钩在场时直读 applicationState 恒 Active。
 static void NJPiMxEngineRunningStateIMP(id self, SEL _cmd) {
     NJPiMxCronResumeIMP resume = NJPiMxCronResume;
     if (NJPiMxEngineKeepRunning && resume &&
-        [UIApplication sharedApplication].applicationState == UIApplicationStateBackground) {
+        NJPiMxRealAppState() == UIApplicationStateBackground) {
         void *box = NJPiMxRawCppEngine(self);
         if (box) {
             if (NJPiMxEngineResumeLines < 12) {
@@ -4196,6 +4213,75 @@ static void NJPiMxEngineResumeOnce(id wrapper, id view) {
     if (box) {
         NJPiMxCronResume(box);
     }
+}
+
+#pragma mark - Mixed offscreen: time-boxed applicationState lie (§15.25)
+
+// 真机 98856bc 判决（§15.24 判读表第三分支）：snapshot=1、前台路完全通
+// （out=28 dmsrc=snapshot，~36ms/帧），后台入口 ms=0.00 秒返 nil——渲染入口
+// 有一个后台守卫，而它在 C++ 虚方法里（vtable 被 chained fixups 遮住，静态到
+// 头）。官方代码里已确证的后台门只有一种花样：读 [UIApplication
+// applicationState]==Background——§15.22 的引擎挂起、updateGpuState 的 GPU
+// 放行、updateDisplayLinkState 全是这一种。本节是判决实验：引擎豁免期
+// （§15.22 标志为 YES 的窗口）把 -[UIApplication applicationState] 的
+// Background 谎报成 Active；关闸即恢复真实值。
+//   弹幕出现   ⇒ 守卫就是 applicationState（官方代码或 C++ 侧间接受其驱动），
+//              实验轮先整体谎报，后续再谈收窄；
+//   弹幕仍无   ⇒ 守卫与 applicationState 无关（C++ 内部 running 标志或 Metal
+//              后台资源限制），升级 frida gadget 动态断点，不再猜。
+// 副作用已知且限时：谎报窗口内整个进程自认前台（官方播放器不暂停——PiP 本来
+// 就要它活着；各统计/定时器回活——测试构建可接受，关闸立即恢复）。
+// 我方一切内部判定与日志必须用 NJPiMxRealAppState，否则诊断字段失真、且
+// §15.22 的 notify 分支会因恒见 Active 而失效。
+static IMP NJPiMxOriginalAppState = NULL;
+static volatile BOOL NJPiMxAppStateLie = NO;
+static unsigned long long NJPiMxAppStateLieLines = 0;
+
+static NSInteger NJPiMxAppStateIMP(id self, SEL _cmd) {
+    if (NJPiMxAppStateLie) {
+        if (NJPiMxAppStateLieLines < 24) {
+            NJPiMxAppStateLieLines += 1;
+            NJPiPDiag("mx lie read self=%s", object_getClassName(self));
+        }
+        return UIApplicationStateActive;
+    }
+    return ((NSInteger (*)(id, SEL))NJPiMxOriginalAppState)(self, _cmd);
+}
+
+static NSInteger NJPiMxRealAppState(void) {
+    UIApplication *application = [UIApplication sharedApplication];
+    if (NJPiMxAppStateLie && NJPiMxOriginalAppState) {
+        return ((NSInteger (*)(id, SEL))NJPiMxOriginalAppState)(application, @selector(applicationState));
+    }
+    return application.applicationState;
+}
+
+static void NJPiMxAppStateLieSet(BOOL on) {
+    if (on == NJPiMxAppStateLie) {
+        return;
+    }
+    if (on) {
+        static dispatch_once_t lieOnce;
+        dispatch_once(&lieOnce, ^{
+            Method method = class_getInstanceMethod([UIApplication class], @selector(applicationState));
+            if (!method) {
+                NJPiPDiag("mx lie hook=method-missing");
+                return;
+            }
+            NJPiMxOriginalAppState = method_getImplementation(method);
+            method_setImplementation(method, (IMP)NJPiMxAppStateIMP);
+            NJPiPDiag("mx lie hook=on");
+        });
+        if (!NJPiMxOriginalAppState) {
+            return;   // 钩没装上就绝不启谎报
+        }
+    }
+    NJPiMxAppStateLie = on;
+    NJPiPDiag("mx lie active=%d", (int)on);
+}
+
+static BOOL NJPiMxAppStateLieActive(void) {
+    return NJPiMxAppStateLie ? YES : NO;
 }
 
 #pragma mark - Mixed offscreen: our own Metal fallbacks
@@ -5486,7 +5572,11 @@ static void NJPiPDiagHeartbeat(void) {
     int applicationState = 0;
     UIApplication *application = UIApplication.sharedApplication;
     if (application) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+        applicationState = (int)NJPiMxRealAppState(); // 谎报窗口内仍报真实状态
+#else
         applicationState = (int)application.applicationState;
+#endif
     }
     NSArray<NJPiPOverlayState *> *states;
     @synchronized (NJPiPOverlayStates()) {
@@ -5541,7 +5631,11 @@ static void NJPiPDiagBackgroundProbe(void) {
     int applicationState = 0;
     UIApplication *application = UIApplication.sharedApplication;
     if (application) {
+#if NJ_PIP_MIXED_OFFSCREEN_ENABLED
+        applicationState = (int)NJPiMxRealAppState(); // 谎报窗口内仍报真实状态
+#else
         applicationState = (int)application.applicationState;
+#endif
     }
     NSArray<NJPiPMirrorState *> *states;
     @synchronized (NJPiPMirrorStates()) {
