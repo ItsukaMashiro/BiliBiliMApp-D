@@ -4105,6 +4105,7 @@ static inline void *NJPiMxRawCppEngine(id engine) {
 }
 static NJPiMxCronResumeIMP NJPiMxCronResume = NULL;          // sub_1152CA44C 换算后的运行时地址
 static IMP NJPiMxOriginalEngineRunningState = NULL;
+static uintptr_t NJPiMxSlideDelta = 0;                       // §15.29：校准后的 slide（运行时地址 = 静态地址 + 此值）
 static volatile BOOL NJPiMxEngineKeepRunning = NO;           // §15.22 引擎豁免标志（只随闸门动）
 static unsigned long long NJPiMxEngineResumeLines = 0;
 static void NJPiMxAppStateLieSet(BOOL on);                   // §15.25（定义在下方）
@@ -4178,6 +4179,7 @@ static BOOL NJPiMxEngineCalibrate(void) {
         }
         NJPiMxOriginalEngineRunningState = method_getImplementation(method);
         NJPiMxCronResume = (NJPiMxCronResumeIMP)((uintptr_t)0x1152ca44c + delta);
+        NJPiMxSlideDelta = delta; // §15.29：供直调 worker（sub_115061F3C）与 __release_weak 换算
         method_setImplementation(method, (IMP)NJPiMxEngineRunningStateIMP);
         calibrated = YES;
         NJPiPDiag("mx eng calib=ok delta=0x%llx hook=on", (unsigned long long)delta);
@@ -4903,15 +4905,13 @@ static CVPixelBufferRef NJPiMxPixelBufferFromCGImage(CGImageRef cgImage) {
 }
 
 // §15.26 嫌疑（已证伪）：CRONEngine._paused@0x18——a905d48 真机恒 0。
-// §15.27 真守卫（Ghidra/capstone 静态确证，子代理②）：snapshot 的 C++ worker
-// sub_115061FCC 入口 15 条内读 `ctx=[engine+0x38]` 处 +0x88 单字节镜像，为 0
-// 直接写 {0,0} 早退（微秒级，ms=0.00 吻合）。镜像由 render 线程 SetRunning 任务
-// （sub_1151B3320，glFinish 之后）从权威 engine+0x44 拷来；我们的 §15.22 resume
-// 写了权威位（resume=proactive 有日志）但镜像没翻——队列有序性说明后台执行器
-// 线程没把 SetRunning 任务跑到（或被 glFinish 卡住）。修法：取帧前把镜像字节
-// 直接强写 1（GUARD#1 绕过），并把权威位、宽高（次守卫 +0x198/0x19c）一起 dump。
-// 链（全静态确证）：box=ObjC+0x8；inner=*(box+8)；ctx=*(inner+0x38)；
-// 镜像=ctx+0x88；权威=inner+0x44；宽高 float 在 inner+0x198/0x19c。
+// §15.27/§15.29 真守卫（functor sub_1151AE19C 反汇编实证，2026-11-18 复核）：
+// snapshot 链 = ObjC snapshot → sub_1151AB11C（取 [box+0x100] poster、投 functor、
+// condvar 等待）→ functor op（sub_1151AE19C）→ F3C(sub_115061F3C)(rendesc,flag=1,sret)
+// → FCC(sub_115061FCC)：读 ctx=[rendesc+0x38] 的 +0x88 镜像，为 0 直接写 {0,0} 早退
+// （微秒级，ms=0.00 吻合）。链：box=*(engine+8)；rendesc=*(box+0x18)；ctx=*(rendesc+0x38)；
+// 镜像=ctx+0x88；宽高在 rendesc+0x198/0x19c；core=*(box+8) 上的 +0x40/+0x44/+0x45
+// 属 SGA/SetRunning 链（§15.23 实证），旧探针曾把 core 误当 rendesc。
 static void NJPiMxEnginePauseProbe(id engine) {
     if (!engine || !NJPiMxEngineKeepRunning) {
         return;
@@ -4933,53 +4933,59 @@ static void NJPiMxEnginePauseProbe(id engine) {
     if (value) {
         *slot = 0; // §15.26 遗留清零，无害
     }
-    // §15.27 镜像字节强写
-    void *box = *(void **)((uintptr_t)engine + 0x8);
+    // §15.29 链修正（functor sub_1151AE19C 反汇编实证；旧链若两成员恰好同值则行为不变）：
+    //   box    = *(engine+8)        cppEngine（cron::shell::Engine）
+    //   rendesc= *(box+0x18)        worker sub_115061F3C 的真参数：+0x38=ctx、+0x198/0x19c=宽高
+    //   ctx    = *(rendesc+0x38)    ViewCoordinator GPU-state：+0x88 镜像、+0x89 泵门
+    //   core   = *(box+8)           SGA/SetRunning 链（§15.23 实证）：+0x40 state、+0x44 权威位、+0x45 latch
+    //   旧探针误把 core 当 rendesc（ctx 取自 core+0x38）——两成员若非同一对象，
+    //   旧写法写错对象（内存损坏风险）。新写法按 functor 链强写，并 dump 两链
+    //   各自字节供真机判「[box+8] 是否等于 [box+0x18]」。
+    void *nbox = *(void **)((uintptr_t)engine + 8);
     static uint32_t mirShown = 0;
-    if (!box || ((uintptr_t)box & 0x7) != 0) {
+    if (!nbox || ((uintptr_t)nbox & 0x7) != 0) {
         if (mirShown < 4) {
             mirShown += 1;
-            NJPiPDiag("mx mir box=bad 0x%llx", (unsigned long long)(uintptr_t)box);
+            NJPiPDiag("mx mir box=bad 0x%llx", (unsigned long long)(uintptr_t)nbox);
         }
         return;
     }
-    void *inner = *(void **)((uintptr_t)box + 0x8);
-    if (!inner || ((uintptr_t)inner & 0x7) != 0) {
+    void *rendesc = *(void **)((uintptr_t)nbox + 0x18);
+    void *core = *(void **)((uintptr_t)nbox + 8);
+    if (!rendesc || ((uintptr_t)rendesc & 0x7) != 0) {
         if (mirShown < 4) {
             mirShown += 1;
-            NJPiPDiag("mx mir inner=bad 0x%llx", (unsigned long long)(uintptr_t)inner);
+            NJPiPDiag("mx mir rendesc=bad 0x%llx box=%p", (unsigned long long)(uintptr_t)rendesc, nbox);
         }
         return;
     }
-    void *ctx = *(void **)((uintptr_t)inner + 0x38);
+    void *ctx = *(void **)((uintptr_t)rendesc + 0x38);
     if (!ctx || ((uintptr_t)ctx & 0x7) != 0) {
         if (mirShown < 4) {
             mirShown += 1;
-            NJPiPDiag("mx mir ctx=bad 0x%llx", (unsigned long long)(uintptr_t)ctx);
+            NJPiPDiag("mx mir ctx=bad 0x%llx rendesc=%p", (unsigned long long)(uintptr_t)ctx, rendesc);
         }
         return;
     }
+    void *oldctx = *(void **)((uintptr_t)core + 0x38); // 旧探针链（仅对照，不写）
     uint8_t *mirror = (uint8_t *)((uintptr_t)ctx + 0x88);
-    uint8_t authoritative = *(uint8_t *)((uintptr_t)inner + 0x44);
-    float width = *(const float *)((uintptr_t)inner + 0x198);
-    float height = *(const float *)((uintptr_t)inner + 0x19c);
-    // §15.28：双门解耦（子代理①终报）——0x88=snapshot worker 门，0x89=泵任务体门
-    // （Resume invoker 0x1151b3694 置 1/Pause 0x1151b3808 清 0，官方后台一刀全关；
-    // cpb=0 的门在 0x89 不在 0x88）。两门皆裸字节读、无二次校验 → 都强写。
-    // 0xb8=入队 stopped 旗标（sub_114FFDE28 ldarb 置位即静默丢弃任务）只查不写。
     uint8_t *pumpGate = (uint8_t *)((uintptr_t)ctx + 0x89);
     uint8_t *stopped = (uint8_t *)((uintptr_t)ctx + 0xb8);
-    uint32_t state40 = *(const uint32_t *)((uintptr_t)ctx + 0x40); // ==4 引擎 stopped
+    uint32_t state40 = *(const uint32_t *)((uintptr_t)core + 0x40); // §15.29：SGA 读的是 core+0x40（旧误读 ctx+0x40）
     void *renderer = *(void **)((uintptr_t)ctx + 0x130);           // 泵渲染体 renderer
-    uint8_t latch = *(uint8_t *)((uintptr_t)inner + 0x45);         // SGA latch
+    uint8_t authoritative = *(uint8_t *)((uintptr_t)core + 0x44);  // §15.29：core+0x44（SGA/SetRunning 写者）
+    uint8_t latch = *(uint8_t *)((uintptr_t)core + 0x45);          // §15.29：core+0x45
+    float width = *(const float *)((uintptr_t)rendesc + 0x198);
+    float height = *(const float *)((uintptr_t)rendesc + 0x19c);
+    uint8_t old88 = (oldctx && ((uintptr_t)oldctx & 0x7) == 0) ? *(const uint8_t *)((uintptr_t)oldctx + 0x88) : 0xFF;
     if (mirShown < 12 || *mirror == 0 || *pumpGate == 0) {
         if (mirShown < 12) {
             mirShown += 1;
         }
-        NJPiPDiag("mx mir ctx=%p m88=%u m89=%u st40=%u b8=%u r130=%p e44=%u i45=%u w=%.0f h=%.0f",
-                  ctx, (unsigned)*mirror, (unsigned)*pumpGate, (unsigned)state40,
-                  (unsigned)*stopped, renderer, (unsigned)authoritative, (unsigned)latch,
-                  width, height);
+        NJPiPDiag("mx mir ctx=%p oldctx=%p same=%u m88=%u old88=%u m89=%u st40=%u b8=%u r130=%p e44=%u i45=%u w=%.0f h=%.0f",
+                  ctx, oldctx, (unsigned)(ctx == oldctx), (unsigned)*mirror, (unsigned)old88,
+                  (unsigned)*pumpGate, (unsigned)state40, (unsigned)*stopped, renderer,
+                  (unsigned)authoritative, (unsigned)latch, width, height);
     }
     *mirror = 1;   // GUARD#1 绕过：snapshot worker 见 1 即走真渲染
     *pumpGate = 1; // 泵门绕过：泵任务体见 1 才渲染入队 → buffer_queue_ 复活
@@ -5020,6 +5026,135 @@ static id NJPiMxSnapshotImage(id wrapper) {
         }
     }
     return nil;
+}
+
+#pragma mark - §15.29 direct worker call（绕开 poster/队列/等待，本线程同步渲染）
+
+// functor sub_1151AE19C（cron::shell::Engine::Snapshot::$_0 op）实证的调用形态：
+//   F3C(sub_115061F3C)(rendesc=*(box+0x18), flag=1, sret) → FCC(sub_115061FCC) 现场渲染
+//   → sub_1151240C8 把结果写进 sret。sret 布局 = {结果对象, shared_ptr 控制块}，
+//   结果对象 +0x18 = CGImageRef（-[CRONEngine snapshot] @0x1151b6aa4 的消费逻辑）。
+// 返回类型是非平凡 C++ 对象（memory class → x8 sret），C 侧用 32 字节 POD 强制
+// memory class；只读前 16 字节（{obj, ctrl}），与官方调用方 ldp x8,x19 一致。
+typedef struct {
+    uintptr_t w[4]; // 32B → 强制 memory-class 返回（x8 = sret）
+} NJPiMxSnapOut;
+
+// 照抄 -[CRONEngine snapshot] 0x1151b6b30-0x1151b6b60 的释放舞步：
+// 原子递减 ctrl+8；归零则 vtable+0x10(ctrl) 析构 + __release_weak(ctrl)（0x11711c940+slide）。
+static void NJPiMxReleaseCppShared(void *ctrl) {
+    if (!ctrl || ((uintptr_t)ctrl & 0x7) != 0) {
+        return;
+    }
+    uint64_t newVal = __sync_sub_and_fetch((unsigned long long *)((uintptr_t)ctrl + 8), 1ULL);
+    if (newVal == 0) {
+        void *vtable = *(void **)(uintptr_t)ctrl;
+        void (*dtor)(void *) = (void (*)(void *))*(void **)((uintptr_t)vtable + 0x10);
+        if (dtor) {
+            dtor(ctrl);
+        }
+        if (NJPiMxSlideDelta) {
+            void (*releaseWeak)(void *) = (void (*)(void *))((uintptr_t)0x11711c940 + NJPiMxSlideDelta);
+            releaseWeak(ctrl);
+        }
+    }
+}
+
+static CGImageRef NJPiMxSnapshotDirectCG(id wrapper) { // 返回 +1（CFRetain），调用方用完 CFRelease
+    static uint32_t dcallLines = 0;
+    if (!wrapper || !NJPiMxEngineKeepRunning) {
+        return NULL;
+    }
+    if (!NJPiMxEngineCalibrate() || NJPiMxSlideDelta == 0) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall skip reason=calib");
+        }
+        return NULL;
+    }
+    id renderer = NJPiMxObjectViaSelector(wrapper, @"renderer");
+    id engine = renderer ? NJPiMxObjectViaSelector(renderer, @"engine") : nil;
+    if (!engine) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall skip reason=no-engine");
+        }
+        return NULL;
+    }
+    void *box = NJPiMxRawCppEngine(engine);
+    if (!box || ((uintptr_t)box & 0x7) != 0) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=box box=%p", box);
+        }
+        return NULL;
+    }
+    void *rendesc = *(void **)((uintptr_t)box + 0x18);
+    if (!rendesc || ((uintptr_t)rendesc & 0x7) != 0) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=rendesc rendesc=%p", rendesc);
+        }
+        return NULL;
+    }
+    // 守卫字节（GUARD#1 = ctx+0x88）：与探针同链强写后直调。探针可能因
+    // NJPiMxEngineKeepRunning 之外的路径没跑过，这里幂等补写。
+    NJPiMxEnginePauseProbe(engine);
+    float width = *(const float *)((uintptr_t)rendesc + 0x198);
+    float height = *(const float *)((uintptr_t)rendesc + 0x19c);
+    if (width == 0.0f || height == 0.0f) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=wh0 w=%.0f h=%.0f", width, height);
+        }
+        return NULL;
+    }
+    uintptr_t worker = (uintptr_t)0x115061f3c + NJPiMxSlideDelta;
+    if ((worker & 0x3) != 0) {
+        if (dcallLines < 4) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=align worker=0x%llx", (unsigned long long)worker);
+        }
+        return NULL;
+    }
+    if (dcallLines < 8) {
+        dcallLines += 1;
+        NJPiPDiag("mx dcall try rendesc=%p w=%.0f h=%.0f worker=0x%llx",
+                  rendesc, width, height, (unsigned long long)worker);
+    }
+    NJPiMxSnapOut out;
+    memset(&out, 0, sizeof(out));
+    out = ((NJPiMxSnapOut(*)(void *, int))worker)(rendesc, 1); // flag=1（官方 snapshot 传 w1=1）
+    void *obj = (void *)out.w[0];
+    void *ctrl = (void *)out.w[1];
+    if (dcallLines < 12) {
+        dcallLines += 1;
+        NJPiPDiag("mx dcall out obj=%p ctrl=%p", obj, ctrl);
+    }
+    if (!obj || ((uintptr_t)obj & 0x7) != 0) {
+        if (dcallLines < 12) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=nil-out"); // 守卫仍拦或渲染失败
+        }
+        return NULL;
+    }
+    CGImageRef cg = (CGImageRef)(*(void **)((uintptr_t)obj + 0x18));
+    if (cg) {
+        CFRetain(cg); // 先留自己的引用，再释放结果对（CGImage 存活）
+    }
+    NJPiMxReleaseCppShared(ctrl);
+    if (!cg) {
+        if (dcallLines < 12) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall fail reason=no-cg obj=%p", obj);
+        }
+        return NULL;
+    }
+    if (dcallLines < 12) {
+        dcallLines += 1;
+        NJPiPDiag("mx dcall ok cg=%p", cg);
+    }
+    return cg;
 }
 
 static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
@@ -5073,6 +5208,23 @@ static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBuffer
         }
         if (!danmakuImage) {
             NJPiMxNoteFailure("no_snap", original);
+        }
+    }
+    if (!danmakuImage && wrapper) {
+        // §15.29：官方 snapshot 走「poster 投递 → 渲染线程 worker → condvar 等待」，
+        // 后台受 GUARD#1 拦截（ms=0.00 秒返）。这里绕开线程跳转，在本线程直调
+        // worker sub_115061F3C（functor 实证链 rendesc=*(box+0x18)，flag=1），
+        // 逐分支诊断：rendesc/宽高/守卫/结果对象/CGImage 各步独立记日志。
+        CGImageRef directCG = NJPiMxSnapshotDirectCG(wrapper); // +1
+        if (directCG) {
+            danmakuImage = NJPiMxPixelBufferFromCGImage(directCG);
+            CFRelease(directCG);
+            if (danmakuImage) {
+                dmSource = "dcall";
+            }
+        }
+        if (!danmakuImage) {
+            NJPiMxNoteFailure("no_dcall", original);
         }
     }
     if (!danmakuImage && [view respondsToSelector:NSSelectorFromString(@"getRendererImage")]) {
