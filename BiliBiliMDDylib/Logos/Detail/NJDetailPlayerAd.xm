@@ -5293,6 +5293,27 @@ static void NJPiCPUParseDanmaku(NSData *data) {
 }
 
 static void NJPiCPUEnsureData(void) {
+    // 兜底：即使 setCurrentTime hook 没触发，也从缓存的 service 现取 cid/time。
+    if (NJPiCPUCid == 0) {
+        NSArray *services;
+        @synchronized (NJPiMxDanmakuServices()) {
+            services = [NJPiMxDanmakuServices() allObjects];
+        }
+        for (id svc in services) {
+            id model = NJPiMxObjectGetter(svc, @selector(viewAPIModel));
+            NSNumber *cid = model ? NJPiMxObjectGetter(model, @selector(cid)) : nil;
+            if (cid && cid.longLongValue != 0) {
+                NJPiCPUCid = cid.longLongValue;
+                SEL sel = NSSelectorFromString(@"currentTime");
+                IMP imp = [svc methodForSelector:sel];
+                if (imp) {
+                    NJPiCpuDanmakuTime = ((double (*)(id, SEL))imp)(svc, sel);
+                }
+                NJPiPDiag("mx cpu lazy cid=%lld t=%.3f", NJPiCPUCid, NJPiCpuDanmakuTime);
+                break;
+            }
+        }
+    }
     if (NJPiCPUCid == 0 || NJPiCPUFetching) {
         return;
     }
