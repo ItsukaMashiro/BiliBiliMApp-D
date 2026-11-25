@@ -5205,6 +5205,120 @@ static id NJPiMxWrapProduced(CVPixelBufferRef targetImage, CVImageBufferRef sour
 
 static NSMutableArray<NSDictionary *> *NJPiCpuDanmakuItems = nil;
 static double NJPiCpuDanmakuTime = 0.0;
+static long long NJPiCPUCid = 0;
+static NSUInteger NJPiCPUFetchedSegment = 0;
+static BOOL NJPiCPUFetching = NO;
+
+static uint64_t NJPiCPUReadVarint(const uint8_t **cursor, const uint8_t *end) {
+    uint64_t value = 0;
+    unsigned shift = 0;
+    while (*cursor < end && shift < 64) {
+        uint8_t byte = *(*cursor)++;
+        value |= (uint64_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80)) {
+            return value;
+        }
+        shift += 7;
+    }
+    return 0;
+}
+
+// DmSegMobileReply field 1 = repeated DanmakuElem; DanmakuElem:
+// field 2 progress(ms), 3 mode, 4 fontsize, 5 color(uint32), 7 content(string).
+static void NJPiCPUParseDanmaku(NSData *data) {
+    const uint8_t *cursor = data.bytes;
+    const uint8_t *end = cursor + data.length;
+    NSMutableArray *items = [NSMutableArray array];
+    while (cursor < end) {
+        uint64_t tag = NJPiCPUReadVarint(&cursor, end);
+        unsigned field = tag >> 3, wire = tag & 7;
+        if (field == 0) {
+            break;
+        }
+        if (wire == 2) {
+            uint64_t length = NJPiCPUReadVarint(&cursor, end);
+            if (length == 0 || cursor + length > end) {
+                break;
+            }
+            const uint8_t *sub = cursor;
+            const uint8_t *subEnd = cursor + length;
+            cursor += length;
+            if (field != 1) {
+                continue;
+            }
+            uint64_t progress = 0, mode = 1, fontSize = 25, color = 0xFFFFFF;
+            NSString *content = nil;
+            while (sub < subEnd) {
+                uint64_t stag = NJPiCPUReadVarint(&sub, subEnd);
+                unsigned sfield = stag >> 3, swire = stag & 7;
+                if (sfield == 0) {
+                    break;
+                }
+                if (swire == 0) {
+                    uint64_t v = NJPiCPUReadVarint(&sub, subEnd);
+                    if (sfield == 2) progress = v;
+                    else if (sfield == 3) mode = v;
+                    else if (sfield == 4) fontSize = v;
+                    else if (sfield == 5) color = v;
+                } else if (swire == 2) {
+                    uint64_t len = NJPiCPUReadVarint(&sub, subEnd);
+                    if (len == 0 || sub + len > subEnd) {
+                        break;
+                    }
+                    if (sfield == 7) {
+                        content = [[NSString alloc] initWithBytes:sub length:len encoding:NSUTF8StringEncoding];
+                    }
+                    sub += len;
+                } else {
+                    break;
+                }
+            }
+            if (content.length > 0) {
+                [items addObject:@{@"content": content,
+                    @"progress": @(progress), @"mode": @(mode),
+                    @"fontsize": @(fontSize), @"color": @(color)}];
+            }
+        } else if (wire == 0) {
+            (void)NJPiCPUReadVarint(&cursor, end);
+        } else {
+            break;
+        }
+    }
+    NJPiCpuEnsureStore();
+    @synchronized (NJPiCpuDanmakuItems) {
+        [NJPiCpuDanmakuItems removeAllObjects];
+        [NJPiCpuDanmakuItems addObjectsFromArray:items];
+    }
+    NJPiPDiag("mx cpu parse elems=%lu", (unsigned long)items.count);
+}
+
+static void NJPiCPUEnsureData(void) {
+    if (NJPiCPUCid == 0 || NJPiCPUFetching) {
+        return;
+    }
+    NSUInteger segment = (NSUInteger)(NJPiCpuDanmakuTime / 360.0) + 1;
+    if (segment == NJPiCPUFetchedSegment && NJPiCpuDanmakuItems.count > 0) {
+        return;
+    }
+    NJPiCPUFetching = YES;
+    NSString *urlString = [NSString stringWithFormat:
+        @"https://api.bilibili.com/x/v2/dm/web/seg.so?type=1&oid=%lld&segment_index=%lu",
+        NJPiCPUCid, (unsigned long)segment];
+    NSURLSessionDataTask *task = [[NSURLSession sharedSession]
+        dataTaskWithURL:[NSURL URLWithString:urlString]
+        completionHandler:^(NSData *data, NSURLResponse *response, NSError *error) {
+            if (data.length > 0 && !error) {
+                NJPiCPUParseDanmaku(data);
+                NJPiCPUFetchedSegment = segment;
+            } else {
+                NJPiPDiag("mx cpu fetch fail seg=%lu err=%ld",
+                          (unsigned long)segment, (long)error.code);
+            }
+            NJPiCPUFetching = NO;
+        }];
+    [task resume];
+    NJPiPDiag("mx cpu fetch seg=%lu cid=%lld", (unsigned long)segment, NJPiCPUCid);
+}
 static void NJPiCpuEnsureStore(void) {
     static dispatch_once_t once;
     dispatch_once(&once, ^{ NJPiCpuDanmakuItems = [NSMutableArray array]; });
@@ -5293,6 +5407,7 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
 
 static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBufferRef sourceImage,
                                              NSUInteger width, NSUInteger height) {
+    NJPiCPUEnsureData(); // 首次进入 PiP / 换 segment 时异步拉弹幕
     CVPixelBufferRef target = NJPiMxTargetBuffer(width, height);
     if (!target) return NULL;
     CVPixelBufferLockBaseAddress(target, 0);
@@ -6625,6 +6740,14 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (void)setCurrentTime:(id)time {
     NJPiCpuEnsureStore();
+    if (NJPiCPUCid == 0) {
+        id model = [self valueForKey:@"viewAPIModel"];
+        NSNumber *cid = model ? [model valueForKey:@"cid"] : nil;
+        if (cid) {
+            NJPiCPUCid = cid.longLongValue;
+            NJPiPDiag("mx cpu cid=%lld", NJPiCPUCid);
+        }
+    }
     // 官方 arg 不是 NSNumber（真机异常：+[dynamic doubleValue] unrecognized selector），
     // 必须先 respondsToSelector 再取值；否则退回用 currentTime getter。
     if (time && [time respondsToSelector:@selector(doubleValue)]) {
