@@ -208,6 +208,14 @@ jobs:
           otool -l "$APP_PATH/$APP_EXECUTABLE" | grep -A2 'cmd LC_LOAD_DYLIB' \
             | grep -F 'libBiliBiliMDDylib.dylib'
 
+      - name: Upload dylib only (small artifact for local assembly)
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IPA_ARTIFACT_NAME }}-dylib
+          path: ${{ runner.temp }}/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app/Frameworks/libBiliBiliMDDylib.dylib
+          if-no-files-found: error
+          retention-days: 7
+
       - name: Package unsigned IPA
         run: |
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
