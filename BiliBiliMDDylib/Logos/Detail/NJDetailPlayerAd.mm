@@ -6584,7 +6584,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 
-@class BBPlayerDanmakuService; @class BBPlayerDanmakuVoutView; @class _TtC18BBPictureInPicture15PlayerContainer; @class BAPIAppViewuniteV1ViewProgressReply; @class BFCCRONRenderView; @class BBPlayerBizGotoStoryWidget; @class BFCCRONRenderViewV2; @class BBPlayerFlexContainerWidget; @class BAPICommunityServiceDmV1Command; @class BBPlayerPortraitScreenBottomWidget; @class BBSBPiPManager; @class BAPICommunityServiceDmV1DM; @class BBPlayerOperationTagService; @class BAPICommunityServiceDmV1DmViewReply; @class BFCCRONRenderBaseView; @class AVSampleBufferVideoRenderer; @class BBPlayerGotoStoryWidget; @class BBPlayerUpTagWidget; @class BAPICommunityServiceDmV1DmSegMobileReply; @class AVPictureInPictureController; @class AVSampleBufferDisplayLayer; 
+@class BAPICommunityServiceDmV1DmSegMobileReply; @class BBPlayerUpTagWidget; @class BFCCRONRenderBaseView; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBPlayerFlexContainerWidget; @class AVPictureInPictureController; @class BBPlayerBizGotoStoryWidget; @class BAPICommunityServiceDmV1DmViewReply; @class BAPICommunityServiceDmV1DM; @class AVSampleBufferVideoRenderer; @class BBPlayerDanmakuService; @class BBPlayerGotoStoryWidget; @class BBPlayerPortraitScreenBottomWidget; @class AVSampleBufferDisplayLayer; @class BFCCRONRenderViewV2; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerOperationTagService; @class BFCCRONRenderView; @class BAPICommunityServiceDmV1Command; @class BBSBPiPManager; @class BBPlayerDanmakuVoutView; 
 
 
 #line 6563 ".mixed-worktree/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
@@ -6606,9 +6606,6 @@ static void (*_logos_orig$App$BAPICommunityServiceDmV1DM$dmSegMobileWithRequest$
 @end
 @interface BAPICommunityServiceDmV1DmSegMobileReply : NSObject
 - (void)setElemsArray:(id)elems;
-@end
-@interface BAPICommunityServiceDmV1DmViewReply : NSObject
-- (void)setSpecialDmsArray:(id)elems;
 @end
 
 
@@ -7423,7 +7420,7 @@ static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1
  
 
 
-static __attribute__((constructor)) void _logosLocalCtor_a32babc5(int __unused argc, char __unused **argv, char __unused **envp) {
+static __attribute__((constructor)) void _logosLocalCtor_de46ceb1(int __unused argc, char __unused **argv, char __unused **envp) {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] module loaded master=%d pip=%d",
                      NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);

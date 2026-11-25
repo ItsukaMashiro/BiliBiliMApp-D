@@ -6579,9 +6579,6 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 @interface BAPICommunityServiceDmV1DmSegMobileReply : NSObject
 - (void)setElemsArray:(id)elems;
 @end
-@interface BAPICommunityServiceDmV1DmViewReply : NSObject
-- (void)setSpecialDmsArray:(id)elems;
-@end
 
 %hook BAPICommunityServiceDmV1DM
 - (void)dmSegMobileWithRequest:(id)request handler:(id)handler {
