@@ -4959,6 +4959,15 @@ static void NJPiMxEnginePauseProbe(id engine) {
         }
         return;
     }
+    // §15.29 审计：core=*(box+8) 必须先验可用性再读 +0x40/+0x44/+0x45/+0x38，
+    // 否则 core 为空/未对齐时下面五查 dump 会直接空指针崩溃（旧版没有这一步）。
+    if (!core || ((uintptr_t)core & 0x7) != 0) {
+        if (mirShown < 4) {
+            mirShown += 1;
+            NJPiPDiag("mx mir core=bad 0x%llx box=%p", (unsigned long long)(uintptr_t)core, nbox);
+        }
+        return;
+    }
     void *ctx = *(void **)((uintptr_t)rendesc + 0x38);
     if (!ctx || ((uintptr_t)ctx & 0x7) != 0) {
         if (mirShown < 4) {
