@@ -5353,15 +5353,26 @@ static void NJPiCpuCaptureElems(id elems) {
     NJPiCpuEnsureStore();
     @synchronized (NJPiCpuDanmakuItems) {
         for (id e in (NSArray *)elems) {
-            NSString *content = [e valueForKey:@"content"];
+            NSString *content = nil;
+            id progress = nil, mode = nil, fontSize = nil, color = nil;
+            @try {
+                content = [e valueForKey:@"content"];
+                progress = [e valueForKey:@"progress"];
+                mode = [e valueForKey:@"mode"];
+                fontSize = [e valueForKey:@"fontsize"];
+                color = [e valueForKey:@"color"];
+            } @catch (NSException *exception) {
+                // 真实 reply 对象的 KVC key 可能与 protobuf 字段名不同，不能让它抛异常崩掉 PiP。
+                NJPiPDiag("mx cpu kv fail cls=%s", NJPiPClassName(e));
+            }
             if (![content isKindOfClass:NSString.class] || content.length == 0) {
                 continue;
             }
             [NJPiCpuDanmakuItems addObject:@{@"content": content,
-                @"progress": [e valueForKey:@"progress"] ?: @0,
-                @"mode": [e valueForKey:@"mode"] ?: @1,
-                @"fontsize": [e valueForKey:@"fontsize"] ?: @25,
-                @"color": [e valueForKey:@"color"] ?: @16777215}];
+                @"progress": progress ?: @0,
+                @"mode": mode ?: @1,
+                @"fontsize": fontSize ?: @25,
+                @"color": color ?: @16777215}];
         }
     }
     NJPiPDiag("mx cpu dms elems=%lu total=%lu",
@@ -5394,7 +5405,9 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGFloat scale = width / kLogicalW;
     if (scale < 0.25) scale = 0.25;
     if (scale > 2.0) scale = 2.0;
-    CGFloat font = [[item objectForKey:@"fontsize"] doubleValue] * scale / kOriginFactor;
+    id fontVal = [item objectForKey:@"fontsize"];
+    CGFloat font = [fontVal respondsToSelector:@selector(doubleValue)] ? [fontVal doubleValue] : kBaseFont;
+    font = font * scale / kOriginFactor;
     if (font < 9.0) font = 9.0;
     if (font > 40.0) font = 40.0;
 
@@ -5420,7 +5433,8 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
         framesetter, CFRangeMake(0, attr.length), NULL,
         CGSizeMake(CGFLOAT_MAX, font * 1.4), NULL);
 
-    double startMs = [[item objectForKey:@"progress"] doubleValue];
+    id progressVal = [item objectForKey:@"progress"];
+    double startMs = [progressVal respondsToSelector:@selector(doubleValue)] ? [progressVal doubleValue] : 0.0;
     double elapsed = (NJPiCpuDanmakuTime * 1000.0 - startMs) / 1000.0;
     NSInteger mode = [[item objectForKey:@"mode"] integerValue];
 
@@ -6776,9 +6790,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)setCurrentTime:(id)time {
     NJPiCpuEnsureStore();
     if (NJPiCPUCid == 0) {
-        id model = [self valueForKey:@"viewAPIModel"];
-        NSNumber *cid = model ? [model valueForKey:@"cid"] : nil;
-        if (cid) {
+        id model = NJPiMxObjectGetter(self, @selector(viewAPIModel));
+        NSNumber *cid = model ? NJPiMxObjectGetter(model, NSSelectorFromString(@"cid")) : nil;
+        if ([cid isKindOfClass:NSNumber.class] && cid.longLongValue != 0) {
             NJPiCPUCid = cid.longLongValue;
             NJPiPDiag("mx cpu cid=%lld", NJPiCPUCid);
         }
