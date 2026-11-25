@@ -6753,28 +6753,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 %hook BAPICommunityServiceDmV1DM
 - (void)dmSegMobileWithRequest:(id)request handler:(id)handler {
-    NJPiDmHandler orig = (NJPiDmHandler)handler;
-    NJPiDmHandler wrapped = ^(id reply, NSError *error) {
-        if (reply) {
-            NJPiCpuCaptureElems([reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"]);
-        }
-        if (orig) {
-            orig(reply, error);
-        }
-    };
-    %orig(request, wrapped);
-}
-- (void)dmViewWithRequest:(id)request handler:(id)handler {
-    NJPiDmHandler orig = (NJPiDmHandler)handler;
-    NJPiDmHandler wrapped = ^(id reply, NSError *error) {
-        if (reply) {
-            NJPiCpuCaptureElems([reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"] ?: [reply valueForKey:@"specialDmsArray"]);
-        }
-        if (orig) {
-            orig(reply, error);
-        }
-    };
-    %orig(request, wrapped);
+    %orig; // 只透传，避免包装 block 签名不符导致崩溃；数据靠 reply setter + 自主 fetch 捕获
 }
 %end
 
