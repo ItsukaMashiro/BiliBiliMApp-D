@@ -6769,7 +6769,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 
-@class BBPlayerPortraitScreenBottomWidget; @class BFCCRONRenderViewV2; @class BAPICommunityServiceDmV1DmSegMobileReply; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBSBPiPManager; @class BBPlayerDanmakuVoutView; @class BBPlayerOperationTagService; @class BBPlayerFlexContainerWidget; @class BFCCRONRenderView; @class AVSampleBufferDisplayLayer; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerGotoStoryWidget; @class BAPICommunityServiceDmV1DmViewReply; @class BAPICommunityServiceDmV1DM; @class BBPlayerUpTagWidget; @class BBPlayerDanmakuService; @class AVPictureInPictureController; @class BAPICommunityServiceDmV1Command; @class AVSampleBufferVideoRenderer; @class BFCCRONRenderBaseView; @class BBPlayerBizGotoStoryWidget; 
+@class BBPlayerFlexContainerWidget; @class BBPlayerGotoStoryWidget; @class BBPlayerDanmakuVoutView; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerOperationTagService; @class BBPlayerBizGotoStoryWidget; @class BFCCRONRenderBaseView; @class BBSBPiPManager; @class _TtC18BBPictureInPicture15PlayerContainer; @class BAPICommunityServiceDmV1Command; @class BAPICommunityServiceDmV1DmSegMobileReply; @class BFCCRONRenderViewV2; @class BAPICommunityServiceDmV1DmViewReply; @class AVSampleBufferVideoRenderer; @class AVPictureInPictureController; @class BBPlayerUpTagWidget; @class AVSampleBufferDisplayLayer; @class BAPICommunityServiceDmV1DM; @class BBPlayerPortraitScreenBottomWidget; @class BBPlayerDanmakuService; @class BFCCRONRenderView; 
 
 
 #line 6748 ".mixed-worktree/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
@@ -6808,7 +6808,7 @@ static void _logos_method$App$BAPICommunityServiceDmV1DmSegMobileReply$setElemsA
 
 
 static void _logos_method$App$BAPICommunityServiceDmV1DmViewReply$setSpecialDmsArray$(_LOGOS_SELF_TYPE_NORMAL BAPICommunityServiceDmV1DmViewReply* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, id elems) {
-    NJPiCpuCaptureElems(elems);
+    
     _logos_orig$App$BAPICommunityServiceDmV1DmViewReply$setSpecialDmsArray$(self, _cmd, elems);
 }
 

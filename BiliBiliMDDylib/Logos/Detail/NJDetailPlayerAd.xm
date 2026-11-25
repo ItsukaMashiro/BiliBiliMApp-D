@@ -6780,7 +6780,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 %hook BAPICommunityServiceDmV1DmViewReply
 - (void)setSpecialDmsArray:(id)elems {
-    NJPiCpuCaptureElems(elems);
+    // 该类并没有 specialDmsArray 属性；官方 reply 字段需以 class-dump 为准，避免 KVC 抛异常。
     %orig;
 }
 %end
