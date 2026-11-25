@@ -5210,6 +5210,29 @@ static void NJPiCpuEnsureStore(void) {
     dispatch_once(&once, ^{ NJPiCpuDanmakuItems = [NSMutableArray array]; });
 }
 
+static void NJPiCpuCaptureElems(id elems) {
+    if (![elems isKindOfClass:NSArray.class]) {
+        return;
+    }
+    NJPiCpuEnsureStore();
+    @synchronized (NJPiCpuDanmakuItems) {
+        for (id e in (NSArray *)elems) {
+            NSString *content = [e valueForKey:@"content"];
+            if (![content isKindOfClass:NSString.class] || content.length == 0) {
+                continue;
+            }
+            [NJPiCpuDanmakuItems addObject:@{@"content": content,
+                @"progress": [e valueForKey:@"progress"] ?: @0,
+                @"mode": [e valueForKey:@"mode"] ?: @1,
+                @"fontsize": [e valueForKey:@"fontsize"] ?: @25,
+                @"color": [e valueForKey:@"color"] ?: @16777215}];
+        }
+    }
+    NJPiPDiag("mx cpu dms elems=%lu total=%lu",
+              (unsigned long)((NSArray *)elems).count,
+              (unsigned long)NJPiCpuDanmakuItems.count);
+}
+
 typedef void (^NJPiDmHandler)(id reply, NSError *error);
 
 // 软件 CIContext 从源视频像素缓冲生成 CGImage（不经 Metal）
@@ -6549,34 +6572,55 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (double)playbackRate;
 @end
 
+@interface BAPICommunityServiceDmV1DM : NSObject
+- (void)dmSegMobileWithRequest:(id)request handler:(id)handler;
+- (void)dmViewWithRequest:(id)request handler:(id)handler;
+@end
+@interface BAPICommunityServiceDmV1DmSegMobileReply : NSObject
+- (void)setElemsArray:(id)elems;
+@end
+@interface BAPICommunityServiceDmV1DmViewReply : NSObject
+- (void)setSpecialDmsArray:(id)elems;
+@end
+
 %hook BAPICommunityServiceDmV1DM
 - (void)dmSegMobileWithRequest:(id)request handler:(id)handler {
     NJPiDmHandler orig = (NJPiDmHandler)handler;
     NJPiDmHandler wrapped = ^(id reply, NSError *error) {
         if (reply) {
-            NSArray *elems = [reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"];
-            if ([elems isKindOfClass:NSArray.class]) {
-                @synchronized (NJPiCpuDanmakuItems) {
-                    for (id e in elems) {
-                        NSString *content = [e valueForKey:@"content"];
-                        if (![content isKindOfClass:NSString.class] || content.length == 0) continue;
-                        [NJPiCpuDanmakuItems addObject:@{@"content": content,
-                            @"progress": [e valueForKey:@"progress"] ?: @0,
-                            @"mode": [e valueForKey:@"mode"] ?: @1,
-                            @"fontsize": [e valueForKey:@"fontsize"] ?: @25,
-                            @"color": [e valueForKey:@"color"] ?: @16777215}];
-                    }
-                }
-                NJPiPDiag("mx cpu dms elems=%lu total=%lu",
-                          (unsigned long)elems.count,
-                          (unsigned long)NJPiCpuDanmakuItems.count);
-            }
+            NJPiCpuCaptureElems([reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"]);
         }
         if (orig) {
             orig(reply, error);
         }
     };
     %orig(request, wrapped);
+}
+- (void)dmViewWithRequest:(id)request handler:(id)handler {
+    NJPiDmHandler orig = (NJPiDmHandler)handler;
+    NJPiDmHandler wrapped = ^(id reply, NSError *error) {
+        if (reply) {
+            NJPiCpuCaptureElems([reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"] ?: [reply valueForKey:@"specialDmsArray"]);
+        }
+        if (orig) {
+            orig(reply, error);
+        }
+    };
+    %orig(request, wrapped);
+}
+%end
+
+%hook BAPICommunityServiceDmV1DmSegMobileReply
+- (void)setElemsArray:(id)elems {
+    NJPiCpuCaptureElems(elems);
+    %orig;
+}
+%end
+
+%hook BAPICommunityServiceDmV1DmViewReply
+- (void)setSpecialDmsArray:(id)elems {
+    NJPiCpuCaptureElems(elems);
+    %orig;
 }
 %end
 
