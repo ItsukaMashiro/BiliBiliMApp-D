@@ -5069,7 +5069,7 @@ static void NJPiMxReleaseCppShared(void *ctrl) {
     }
 }
 
-static CGImageRef NJPiMxSnapshotDirectCG(id wrapper) { // 返回 +1（CFRetain），调用方用完 CFRelease
+static CGImageRef NJPiMxSnapshotDirectCG(id wrapper, NSUInteger fallbackWidth, NSUInteger fallbackHeight) { // 返回 +1（CFRetain），调用方用完 CFRelease
     static uint32_t dcallLines = 0;
     if (!wrapper || !NJPiMxEngineKeepRunning) {
         return NULL;
@@ -5111,6 +5111,22 @@ static CGImageRef NJPiMxSnapshotDirectCG(id wrapper) { // 返回 +1（CFRetain�
     NJPiMxEnginePauseProbe(engine);
     float width = *(const float *)((uintptr_t)rendesc + 0x198);
     float height = *(const float *)((uintptr_t)rendesc + 0x19c);
+    // §15.30：真机判决后台 rendesc+0x198/0x19c 宽高为 0（视图 detach/未布局），
+    // worker FCC 次守卫直接早退。直调前用正在入队的视频帧尺寸补写这两个 float；
+    // 这是官方自己 WriteSize 时用的同一对字段，不改其它状态。
+    if ((width == 0.0f || height == 0.0f) && fallbackWidth && fallbackHeight) {
+        float *sizeSlot = (float *)((uintptr_t)rendesc + 0x198);
+        sizeSlot[0] = (float)fallbackWidth;
+        sizeSlot[1] = (float)fallbackHeight;
+        width = sizeSlot[0];
+        height = sizeSlot[1];
+        if (dcallLines < 8) {
+            dcallLines += 1;
+            NJPiPDiag("mx dcall whfix w=%.0f h=%.0f src=%lux%lu",
+                      width, height,
+                      (unsigned long)fallbackWidth, (unsigned long)fallbackHeight);
+        }
+    }
     if (width == 0.0f || height == 0.0f) {
         if (dcallLines < 4) {
             dcallLines += 1;
@@ -5224,7 +5240,7 @@ static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBuffer
         // 后台受 GUARD#1 拦截（ms=0.00 秒返）。这里绕开线程跳转，在本线程直调
         // worker sub_115061F3C（functor 实证链 rendesc=*(box+0x18)，flag=1），
         // 逐分支诊断：rendesc/宽高/守卫/结果对象/CGImage 各步独立记日志。
-        CGImageRef directCG = NJPiMxSnapshotDirectCG(wrapper); // +1
+        CGImageRef directCG = NJPiMxSnapshotDirectCG(wrapper, width, height); // +1
         if (directCG) {
             danmakuImage = NJPiMxPixelBufferFromCGImage(directCG);
             CFRelease(directCG);
