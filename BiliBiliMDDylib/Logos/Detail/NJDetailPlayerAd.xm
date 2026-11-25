@@ -5379,40 +5379,69 @@ static CGImageRef NJPiMxCpuVideoCG(CVImageBufferRef sourceImage, NSUInteger widt
 }
 
 static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height) {
+    // 官方常量（service_danmaku.cron/index_main.js）：667×375 逻辑画布、ORIGIN_FACTOR=3、
+    // FONT_SIZE=25、STROKE_WIDTH=2、DURATION=7s、SPEED=30(cap 90)、OCCUPANCY=0.75。
+    static const CGFloat kLogicalW = 667.0, kLogicalH = 375.0;
+    static const CGFloat kOriginFactor = 3.0, kBaseFont = 25.0, kStroke = 2.0;
+    static const CGFloat kDuration = 7.0, kBaseSpeed = 30.0, kSpeedCap = 90.0;
+    static const CGFloat kOccupancy = 0.75;
+
     NSString *text = item[@"content"];
-    if (![text isKindOfClass:NSString.class] || text.length == 0) return;
-    CGFloat size = [[item objectForKey:@"fontsize"] doubleValue];
-    if (size < 12) size = 25;
-    if (size > 48) size = 48;
+    if (![text isKindOfClass:NSString.class] || text.length == 0) {
+        return;
+    }
+    // PiP 只是等比缩小画面；排版规则不变，按画布宽度做等比缩放。
+    CGFloat scale = width / kLogicalW;
+    if (scale < 0.25) scale = 0.25;
+    if (scale > 2.0) scale = 2.0;
+    CGFloat font = [[item objectForKey:@"fontsize"] doubleValue] * scale / kOriginFactor;
+    if (font < 9.0) font = 9.0;
+    if (font > 40.0) font = 40.0;
+
     uint32_t rgb = [item[@"color"] unsignedIntValue];
     UIColor *color = [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
-                                     green:((rgb >> 8) & 0xFF) / 255.0
-                                      blue:(rgb & 0xFF) / 255.0 alpha:1.0];
+                                      green:((rgb >> 8) & 0xFF) / 255.0
+                                       blue:(rgb & 0xFF) / 255.0 alpha:1.0];
     NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
-    [attr addAttribute:NSFontAttributeName value:[UIFont systemFontOfSize:size]
+    [attr addAttribute:NSFontAttributeName value:[UIFont systemFontOfSize:font]
                 range:NSMakeRange(0, attr.length)];
     [attr addAttribute:NSForegroundColorAttributeName value:color
                 range:NSMakeRange(0, attr.length)];
     [attr addAttribute:NSStrokeColorAttributeName value:[UIColor blackColor]
                 range:NSMakeRange(0, attr.length)];
-    [attr addAttribute:NSStrokeWidthAttributeName value:@(-2.0)
+    [attr addAttribute:NSStrokeWidthAttributeName value:@(-kStroke)
                 range:NSMakeRange(0, attr.length)];
 
     CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attr);
-    if (!framesetter) return;
+    if (!framesetter) {
+        return;
+    }
     CGSize textSize = CTFramesetterSuggestFrameSizeWithConstraints(
         framesetter, CFRangeMake(0, attr.length), NULL,
-        CGSizeMake(CGFLOAT_MAX, size * 1.4), NULL);
+        CGSizeMake(CGFLOAT_MAX, font * 1.4), NULL);
+
     double startMs = [[item objectForKey:@"progress"] doubleValue];
     double elapsed = (NJPiCpuDanmakuTime * 1000.0 - startMs) / 1000.0;
     NSInteger mode = [[item objectForKey:@"mode"] integerValue];
-    CGFloat y = (mode == 4) ? height - size * 1.6 : size * 0.4;
-    CGFloat x = (width - textSize.width) / 2.0;
-    if (mode == 1 || mode == 2 || mode == 3 || mode == 6) {
-        x = width - elapsed / 7.0 * (width + textSize.width);
-        y = fmod((CGFloat)startMs * 0.017, height - size * 2) + size * 0.5;
+
+    // 官方速度公式：t = hScale/ORIGIN_FACTOR；t>0.5||t<=0 ? 30 : min(30/t,90)。
+    CGFloat hScale = width / kLogicalW;
+    CGFloat speed = kBaseSpeed;
+    if (hScale > 0 && hScale < kOriginFactor) {
+        speed = MIN(kBaseSpeed / (hScale / kOriginFactor), kSpeedCap);
     }
-    if (elapsed < 0 || elapsed > 7.0 || x + textSize.width < 0 || x > width) {
+    // 轨道：按官方 screenOccupancy=0.75，再用 meta id hash 分轨。
+    CGFloat usableH = height * kOccupancy;
+    NSUInteger lanes = MAX(1, (NSUInteger)(usableH / MAX(1, font * 1.35)));
+    NSUInteger lane = (NSUInteger)startMs % lanes;
+    CGFloat y = height - usableH + lane * font * 1.35 + font * 0.3;
+    BOOL fixed = (mode == 4 || mode == 5);
+    if (fixed) {
+        y = (mode == 4) ? height - font * 1.4 : font * 0.35;
+        lanes = 1;
+    }
+    CGFloat x = fixed ? (width - textSize.width) / 2.0 : (width - elapsed * speed);
+    if (elapsed < 0 || elapsed > kDuration || x + textSize.width < 0 || x > width) {
         CFRelease(framesetter);
         return;
     }
@@ -5420,7 +5449,12 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGPathAddRect(path, NULL, CGRectMake(x, height - (y + textSize.height), width, height));
     CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attr.length), path, NULL);
     if (frame) {
+        CGContextSaveGState(ctx);
+        CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
+        CGContextTranslateCTM(ctx, 0, height);
+        CGContextScaleCTM(ctx, 1, -1);
         CTFrameDraw(frame, ctx);
+        CGContextRestoreGState(ctx);
         CFRelease(frame);
     }
     CGPathRelease(path);
