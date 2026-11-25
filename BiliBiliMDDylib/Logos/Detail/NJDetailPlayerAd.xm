@@ -5205,6 +5205,7 @@ static id NJPiMxWrapProduced(CVPixelBufferRef targetImage, CVImageBufferRef sour
 
 static NSMutableArray<NSDictionary *> *NJPiCpuDanmakuItems = nil;
 static double NJPiCpuDanmakuTime = 0.0;
+static void NJPiCpuEnsureStore(void); // 前置声明
 static long long NJPiCPUCid = 0;
 static NSUInteger NJPiCPUFetchedSegment = 0;
 static BOOL NJPiCPUFetching = NO;
@@ -5226,7 +5227,7 @@ static uint64_t NJPiCPUReadVarint(const uint8_t **cursor, const uint8_t *end) {
 // DmSegMobileReply field 1 = repeated DanmakuElem; DanmakuElem:
 // field 2 progress(ms), 3 mode, 4 fontsize, 5 color(uint32), 7 content(string).
 static void NJPiCPUParseDanmaku(NSData *data) {
-    const uint8_t *cursor = data.bytes;
+    const uint8_t *cursor = (const uint8_t *)data.bytes;
     const uint8_t *end = cursor + data.length;
     NSMutableArray *items = [NSMutableArray array];
     while (cursor < end) {
