@@ -231,6 +231,15 @@
 #define NJ_PIP_LAN_LOG_UPLOAD_ENABLED 1
 #endif
 
+/*
+  §15.25 applicationState 谎报：真机 9760eec 已证明「谎报生效但无效」（守卫与
+  applicationState 无关），副作用却是 UIKit 在 PiP/后台的 idiom/appearance 更新
+  卡死（scene-update watchdog）。默认关闭；引擎豁免/双门强写/直调 worker 均不依赖它。
+*/
+#ifndef NJ_PIP_APPSTATE_LIE_ENABLED
+#define NJ_PIP_APPSTATE_LIE_ENABLED 0
+#endif
+
 // MARK: - Picture in Picture danmaku
 
 static const void *NJPiPDanmakuStateKey = &NJPiPDanmakuStateKey;
@@ -4267,6 +4276,10 @@ static NSInteger NJPiMxRealAppState(void) {
 }
 
 static void NJPiMxAppStateLieSet(BOOL on) {
+#if !NJ_PIP_APPSTATE_LIE_ENABLED
+    (void)on;
+    return; // §15.30：默认关闭谎报（已证伪且会引发 UIKit appearance watchdog）
+#else
     if (on == NJPiMxAppStateLie) {
         return;
     }
@@ -4288,6 +4301,7 @@ static void NJPiMxAppStateLieSet(BOOL on) {
     }
     NJPiMxAppStateLie = on;
     NJPiPDiag("mx lie active=%d", (int)on);
+#endif
 }
 
 static BOOL NJPiMxAppStateLieActive(void) {
