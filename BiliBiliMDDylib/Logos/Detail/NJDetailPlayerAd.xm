@@ -126,6 +126,8 @@
 #import <objc/runtime.h>
 #import <os/log.h>
 #import <CoreMedia/CoreMedia.h>
+#import <CoreText/CoreText.h>
+#import <CoreImage/CoreImage.h>
 #import "NJCommonDefine.h"
 
 #if __has_include("NJBuildStamp.h")
@@ -5196,8 +5198,120 @@ static CGImageRef NJPiMxSnapshotDirectCG(id wrapper, NSUInteger fallbackWidth, N
     return cg;
 }
 
+#pragma mark - §15.31 CPU danmaku path（不依赖 Metal / 官方引擎）
+
+static id NJPiMxWrapProduced(CVPixelBufferRef targetImage, CVImageBufferRef sourceImage,
+                             CMSampleBufferRef original); // 前置声明（实现在文件后方）
+
+static NSMutableArray<NSDictionary *> *NJPiCpuDanmakuItems = nil;
+static double NJPiCpuDanmakuTime = 0.0;
+static void NJPiCpuEnsureStore(void) {
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ NJPiCpuDanmakuItems = [NSMutableArray array]; });
+}
+
+typedef void (^NJPiDmHandler)(id reply, NSError *error);
+
+// 软件 CIContext 从源视频像素缓冲生成 CGImage（不经 Metal）
+static CGImageRef NJPiMxCpuVideoCG(CVImageBufferRef sourceImage, NSUInteger width, NSUInteger height) {
+    CIImage *ci = [CIImage imageWithCVPixelBuffer:sourceImage];
+    CIContext *software = [CIContext contextWithOptions:@{kCIContextUseSoftwareRenderer: @YES}];
+    return software ? [software createCGImage:ci fromRect:CGRectMake(0, 0, width, height)] : NULL;
+}
+
+static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height) {
+    NSString *text = item[@"content"];
+    if (![text isKindOfClass:NSString.class] || text.length == 0) return;
+    CGFloat size = [[item objectForKey:@"fontsize"] doubleValue];
+    if (size < 12) size = 25;
+    if (size > 48) size = 48;
+    uint32_t rgb = [item[@"color"] unsignedIntValue];
+    UIColor *color = [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
+                                     green:((rgb >> 8) & 0xFF) / 255.0
+                                      blue:(rgb & 0xFF) / 255.0 alpha:1.0];
+    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
+    [attr addAttribute:NSFontAttributeName value:[UIFont systemFontOfSize:size]
+                range:NSMakeRange(0, attr.length)];
+    [attr addAttribute:NSForegroundColorAttributeName value:color
+                range:NSMakeRange(0, attr.length)];
+    [attr addAttribute:NSStrokeColorAttributeName value:[UIColor blackColor]
+                range:NSMakeRange(0, attr.length)];
+    [attr addAttribute:NSStrokeWidthAttributeName value:@(-2.0)
+                range:NSMakeRange(0, attr.length)];
+
+    CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attr);
+    if (!framesetter) return;
+    CGSize textSize = CTFramesetterSuggestFrameSizeWithConstraints(
+        framesetter, CFRangeMake(0, attr.length), NULL,
+        CGSizeMake(CGFLOAT_MAX, size * 1.4), NULL);
+    double startMs = [[item objectForKey:@"progress"] doubleValue];
+    double elapsed = (NJPiCpuDanmakuTime * 1000.0 - startMs) / 1000.0;
+    NSInteger mode = [[item objectForKey:@"mode"] integerValue];
+    CGFloat y = (mode == 4) ? height - size * 1.6 : size * 0.4;
+    CGFloat x = (width - textSize.width) / 2.0;
+    if (mode == 1 || mode == 2 || mode == 3 || mode == 6) {
+        x = width - elapsed / 7.0 * (width + textSize.width);
+        y = fmod((CGFloat)startMs * 0.017, height - size * 2) + size * 0.5;
+    }
+    if (elapsed < 0 || elapsed > 7.0 || x + textSize.width < 0 || x > width) {
+        CFRelease(framesetter);
+        return;
+    }
+    CGMutablePathRef path = CGPathCreateMutable();
+    CGPathAddRect(path, NULL, CGRectMake(x, height - (y + textSize.height), width, height));
+    CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attr.length), path, NULL);
+    if (frame) {
+        CTFrameDraw(frame, ctx);
+        CFRelease(frame);
+    }
+    CGPathRelease(path);
+    CFRelease(framesetter);
+}
+
+static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBufferRef sourceImage,
+                                             NSUInteger width, NSUInteger height) {
+    CVPixelBufferRef target = NJPiMxTargetBuffer(width, height);
+    if (!target) return NULL;
+    CVPixelBufferLockBaseAddress(target, 0);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    void *base = CVPixelBufferGetBaseAddress(target);
+    size_t bpr = CVPixelBufferGetBytesPerRow(target);
+    CGContextRef ctx = (base && cs) ? CGBitmapContextCreate(base, width, height, 8, bpr, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst) : NULL;
+    if (ctx) {
+        CGImageRef videoCG = NJPiMxCpuVideoCG(sourceImage, width, height);
+        if (videoCG) {
+            CGContextDrawImage(ctx, CGRectMake(0, 0, width, height), videoCG);
+            CGImageRelease(videoCG);
+        }
+        @synchronized (NJPiCpuDanmakuItems ?: (NJPiCpuEnsureStore(), NJPiCpuDanmakuItems)) {
+            for (NSDictionary *item in NJPiCpuDanmakuItems) {
+                NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height);
+            }
+        }
+        CGContextRelease(ctx);
+    }
+    if (cs) {
+        CGColorSpaceRelease(cs);
+    }
+    CVPixelBufferUnlockBaseAddress(target, 0);
+    return target; // +1
+}
+
 static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
                               const char *viewClass) {
+    // §15.31：先走纯 CPU 合成（绕开后台 Metal 禁令）；失败才退回原 GPU 路。
+    NSUInteger cpuWidth = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger cpuHeight = CVPixelBufferGetHeight(sourceImage);
+    CVPixelBufferRef cpuTarget = NJPiMxCpuComposite(original, sourceImage, cpuWidth, cpuHeight);
+    if (cpuTarget) {
+        id cpuWrapped = NJPiMxWrapProduced(cpuTarget, sourceImage, original);
+        CVPixelBufferRelease(cpuTarget);
+        if (cpuWrapped) {
+            NJPiPDiag("mx cpu composite ok %lux%lu", (unsigned long)cpuWidth, (unsigned long)cpuHeight);
+            return cpuWrapped;
+        }
+    }
     OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
     NSUInteger width = CVPixelBufferGetWidth(sourceImage);
     NSUInteger height = CVPixelBufferGetHeight(sourceImage);
@@ -6435,7 +6549,44 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (double)playbackRate;
 @end
 
+%hook BAPICommunityServiceDmV1DM
+- (void)dmSegMobileWithRequest:(id)request handler:(id)handler {
+    NJPiDmHandler orig = (NJPiDmHandler)handler;
+    NJPiDmHandler wrapped = ^(id reply, NSError *error) {
+        if (reply) {
+            NSArray *elems = [reply valueForKey:@"elemsArray"] ?: [reply valueForKey:@"dms"];
+            if ([elems isKindOfClass:NSArray.class]) {
+                @synchronized (NJPiCpuDanmakuItems) {
+                    for (id e in elems) {
+                        NSString *content = [e valueForKey:@"content"];
+                        if (![content isKindOfClass:NSString.class] || content.length == 0) continue;
+                        [NJPiCpuDanmakuItems addObject:@{@"content": content,
+                            @"progress": [e valueForKey:@"progress"] ?: @0,
+                            @"mode": [e valueForKey:@"mode"] ?: @1,
+                            @"fontsize": [e valueForKey:@"fontsize"] ?: @25,
+                            @"color": [e valueForKey:@"color"] ?: @16777215}];
+                    }
+                }
+                NJPiPDiag("mx cpu dms elems=%lu total=%lu",
+                          (unsigned long)elems.count,
+                          (unsigned long)NJPiCpuDanmakuItems.count);
+            }
+        }
+        if (orig) {
+            orig(reply, error);
+        }
+    };
+    %orig(request, wrapped);
+}
+%end
+
 %hook BBPlayerDanmakuService
+
+- (void)setCurrentTime:(id)time {
+    NJPiCpuEnsureStore();
+    NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
+    %orig;
+}
 
 - (instancetype)initWithContext:(id)context {
     id result = %orig;
