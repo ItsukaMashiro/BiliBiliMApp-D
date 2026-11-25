@@ -183,7 +183,7 @@ jobs:
           lipo -archs "$APP_PATH/Frameworks/FridaGadget.dylib" | grep -qw arm64
 
           cat > "$APP_PATH/Frameworks/FridaGadget.config" <<'GADGETCFG'
-          {"interaction": {"type": "script", "path": "NJPipProbe.js"}}
+          {"interaction": {"type": "listen", "address": "0.0.0.0", "port": 27042, "on_change": "resume"}}
           GADGETCFG
           test -s Tools/frida/NJPipProbe.js
           install -m 0644 Tools/frida/NJPipProbe.js "$APP_PATH/Frameworks/NJPipProbe.js"
