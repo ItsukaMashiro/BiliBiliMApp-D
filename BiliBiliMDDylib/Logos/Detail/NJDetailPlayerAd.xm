@@ -6584,7 +6584,18 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 - (void)setCurrentTime:(id)time {
     NJPiCpuEnsureStore();
-    NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
+    // 官方 arg 不是 NSNumber（真机异常：+[dynamic doubleValue] unrecognized selector），
+    // 必须先 respondsToSelector 再取值；否则退回用 currentTime getter。
+    if (time && [time respondsToSelector:@selector(doubleValue)]) {
+        NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
+    } else {
+        SEL sel = NSSelectorFromString(@"currentTime");
+        if ([self respondsToSelector:sel]) {
+            IMP imp = [self methodForSelector:sel];
+            NJPiCpuDanmakuTime = ((double (*)(id, SEL))imp)(self, sel);
+        }
+        NJPiPDiag("mx cpu time via getter t=%.3f", NJPiCpuDanmakuTime);
+    }
     %orig;
 }
 

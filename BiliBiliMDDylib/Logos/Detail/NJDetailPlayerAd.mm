@@ -6561,7 +6561,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 __asm__(".linker_option \"-framework\", \"CydiaSubstrate\"");
 
-@class BFCCRONRenderViewV2; @class BBPlayerOperationTagService; @class BBPlayerDanmakuVoutView; @class BBPlayerUpTagWidget; @class BAPICommunityServiceDmV1DmViewReply; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerBizGotoStoryWidget; @class BFCCRONRenderBaseView; @class AVSampleBufferVideoRenderer; @class BBPlayerGotoStoryWidget; @class AVPictureInPictureController; @class BAPICommunityServiceDmV1DM; @class BBPlayerFlexContainerWidget; @class BBPlayerPortraitScreenBottomWidget; @class BBSBPiPManager; @class AVSampleBufferDisplayLayer; @class BAPICommunityServiceDmV1Command; @class BFCCRONRenderView; @class _TtC18BBPictureInPicture15PlayerContainer; @class BBPlayerDanmakuService; 
+@class BAPICommunityServiceDmV1DM; @class BBPlayerFlexContainerWidget; @class BBSBPiPManager; @class BAPIAppViewuniteV1ViewProgressReply; @class BBPlayerUpTagWidget; @class BFCCRONRenderBaseView; @class AVSampleBufferDisplayLayer; @class BBPlayerGotoStoryWidget; @class BBPlayerOperationTagService; @class BFCCRONRenderViewV2; @class BBPlayerPortraitScreenBottomWidget; @class BBPlayerDanmakuService; @class AVSampleBufferVideoRenderer; @class BFCCRONRenderView; @class BBPlayerDanmakuVoutView; @class BAPICommunityServiceDmV1Command; @class AVPictureInPictureController; @class BBPlayerBizGotoStoryWidget; @class BAPICommunityServiceDmV1DmViewReply; @class _TtC18BBPictureInPicture15PlayerContainer; 
 
 
 #line 6540 ".mixed-worktree/BiliBiliMDDylib/Logos/Detail/NJDetailPlayerAd.xm"
@@ -6612,7 +6612,18 @@ static void _logos_method$App$BAPICommunityServiceDmV1DM$dmSegMobileWithRequest$
 
 static void _logos_method$App$BBPlayerDanmakuService$setCurrentTime$(_LOGOS_SELF_TYPE_NORMAL BBPlayerDanmakuService* _LOGOS_SELF_CONST __unused self, SEL __unused _cmd, id time) {
     NJPiCpuEnsureStore();
-    NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
+    
+    
+    if (time && [time respondsToSelector:@selector(doubleValue)]) {
+        NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
+    } else {
+        SEL sel = NSSelectorFromString(@"currentTime");
+        if ([self respondsToSelector:sel]) {
+            IMP imp = [self methodForSelector:sel];
+            NJPiCpuDanmakuTime = ((double (*)(id, SEL))imp)(self, sel);
+        }
+        NJPiPDiag("mx cpu time via getter t=%.3f", NJPiCpuDanmakuTime);
+    }
     _logos_orig$App$BBPlayerDanmakuService$setCurrentTime$(self, _cmd, time);
 }
 
@@ -7368,7 +7379,7 @@ static BAPIAppViewuniteV1ViewProgressReply* _logos_method$App$BAPIAppViewuniteV1
  
 
 
-static __attribute__((constructor)) void _logosLocalCtor_b05b9c3f(int __unused argc, char __unused **argv, char __unused **envp) {
+static __attribute__((constructor)) void _logosLocalCtor_7f48c318(int __unused argc, char __unused **argv, char __unused **envp) {
     os_log_with_type(NJPiPDanmakuLog(), OS_LOG_TYPE_ERROR,
                      "[NJPiPDanmaku] module loaded master=%d pip=%d",
                      NJ_MASTER_SWITCH_VALUE, NJ_PIP_DANMAKU_VALUE);
