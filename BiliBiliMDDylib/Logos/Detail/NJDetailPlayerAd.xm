@@ -5680,13 +5680,29 @@ static void NJPiNeonBlendBGRAOntoNV12(const uint8_t *bgra, size_t bgraBpr,
 
 static CVPixelBufferRef NJPiMxCpuDanmakuBuffer(NSUInteger width, NSUInteger height) {
     CFTimeInterval nowHost = CACurrentMediaTime();
+    double dt = 0.0;
     if (NJPiCpuLastFrameHostTime > 0.0) {
-        double dt = nowHost - NJPiCpuLastFrameHostTime;
+        dt = nowHost - NJPiCpuLastFrameHostTime;
         if (dt > 0.0 && dt < 0.25) {
             NJPiCpuDanmakuTime += dt;
         }
     }
     NJPiCpuLastFrameHostTime = nowHost;
+    static double lastOrigPtsSec = -1.0;
+    double ptsSec = original ? CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(original)) : -1.0;
+    if (isfinite(ptsSec) && ptsSec >= 0.0) {
+        if (lastOrigPtsSec >= 0.0) {
+            double ptsDelta = ptsSec - lastOrigPtsSec;
+            if (fabs(ptsDelta - dt) > 1.5 && fabs(ptsDelta) < 86400.0) {
+                double nextT = NJPiCpuDanmakuTime + ptsDelta;
+                if (nextT < 0.0) nextT = 0.0;
+                NJPiCpuDanmakuTime = nextT;
+                NJPiPDiag("mx cpu pts-seek delta=%.1f t=%.2f", ptsDelta, NJPiCpuDanmakuTime);
+                NJPiCPUEnsureData();
+            }
+        }
+        lastOrigPtsSec = ptsSec;
+    }
     NJPiCPUEnsureData();
     CVPixelBufferRef target = NULL;
     NSDictionary *attrs = @{
@@ -5777,13 +5793,29 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
         }
     }
     CFTimeInterval nowHost = CACurrentMediaTime();
+    double dt = 0.0;
     if (NJPiCpuLastFrameHostTime > 0.0) {
-        double dt = nowHost - NJPiCpuLastFrameHostTime;
+        dt = nowHost - NJPiCpuLastFrameHostTime;
         if (dt > 0.0 && dt < 0.25) {
             NJPiCpuDanmakuTime += dt;
         }
     }
     NJPiCpuLastFrameHostTime = nowHost;
+    static double lastOrigPtsSec = -1.0;
+    double ptsSec = original ? CMTimeGetSeconds(CMSampleBufferGetPresentationTimeStamp(original)) : -1.0;
+    if (isfinite(ptsSec) && ptsSec >= 0.0) {
+        if (lastOrigPtsSec >= 0.0) {
+            double ptsDelta = ptsSec - lastOrigPtsSec;
+            if (fabs(ptsDelta - dt) > 1.5 && fabs(ptsDelta) < 86400.0) {
+                double nextT = NJPiCpuDanmakuTime + ptsDelta;
+                if (nextT < 0.0) nextT = 0.0;
+                NJPiCpuDanmakuTime = nextT;
+                NJPiPDiag("mx cpu pts-seek delta=%.1f t=%.2f", ptsDelta, NJPiCpuDanmakuTime);
+                NJPiCPUEnsureData();
+            }
+        }
+        lastOrigPtsSec = ptsSec;
+    }
     NJPiCPUEnsureData(); // 首次进入 PiP / 换 segment 时异步拉弹幕
     CVPixelBufferRef target = NJPiMxTargetBuffer(width, height);
     if (!target) return NULL;
@@ -6411,8 +6443,8 @@ static void NJPiMxTrampoline(id self, SEL _cmd, id sampleBuffer, BOOL primary) {
             interpQueue = dispatch_queue_create("com.njbilibili.pip.interp90", DISPATCH_QUEUE_SERIAL);
         });
         __weak id weakSelf = self;
-        for (int step = 1; step <= 3; step++) {
-            int64_t delayMs = step * 8;
+        for (int step = 1; step <= 1; step++) {
+            int64_t delayMs = step * 16;
             dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delayMs * NSEC_PER_MSEC)), interpQueue, ^{
                 id strongSelf = weakSelf;
                 if (!strongSelf || interpSeq != mySeq || !NJPiMxEngineKeepRunning) {
