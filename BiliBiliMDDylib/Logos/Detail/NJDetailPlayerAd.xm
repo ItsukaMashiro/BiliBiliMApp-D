@@ -5434,13 +5434,19 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
                                       green:((rgb >> 8) & 0xFF) / 255.0
                                        blue:(rgb & 0xFF) / 255.0 alpha:1.0];
     NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
-    [attr addAttribute:NSFontAttributeName value:[UIFont systemFontOfSize:font]
+    [attr addAttribute:NSFontAttributeName value:[UIFont boldSystemFontOfSize:font]
                 range:NSMakeRange(0, attr.length)];
     [attr addAttribute:NSForegroundColorAttributeName value:color
                 range:NSMakeRange(0, attr.length)];
     [attr addAttribute:NSStrokeColorAttributeName value:[UIColor blackColor]
                 range:NSMakeRange(0, attr.length)];
-    [attr addAttribute:NSStrokeWidthAttributeName value:@(-kStroke)
+    [attr addAttribute:NSStrokeWidthAttributeName value:@(-3.0)
+                range:NSMakeRange(0, attr.length)];
+    NSShadow *shadow = [[NSShadow alloc] init];
+    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.85];
+    shadow.shadowOffset = CGSizeMake(0.0, 1.0);
+    shadow.shadowBlurRadius = 1.5;
+    [attr addAttribute:NSShadowAttributeName value:shadow
                 range:NSMakeRange(0, attr.length)];
 
     CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attr);
@@ -5456,17 +5462,12 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     double elapsed = (NJPiCpuDanmakuTime * 1000.0 - startMs) / 1000.0;
     NSInteger mode = [[item objectForKey:@"mode"] integerValue];
 
-    // 官方速度公式：t = hScale/ORIGIN_FACTOR；t>0.5||t<=0 ? 30 : min(30/t,90)。
-    CGFloat hScale = width / kLogicalW;
-    CGFloat speed = kBaseSpeed;
-    if (hScale > 0 && hScale < kOriginFactor) {
-        speed = MIN(kBaseSpeed / (hScale / kOriginFactor), kSpeedCap);
-    }
-    // 轨道：按官方 screenOccupancy=0.75，再用 meta id hash 分轨。
+    // 滚动弹幕必须完整穿过屏幕（width + textSize.width），不能在 kDuration 到期时半路消失。
+    CGFloat speed = (width + textSize.width) / kDuration;
     CGFloat usableH = height * kOccupancy;
     NSUInteger lanes = MAX(1, (NSUInteger)(usableH / MAX(1, font * 1.35)));
     NSUInteger lane = (NSUInteger)startMs % lanes;
-    CGFloat y = height - usableH + lane * font * 1.35 + font * 0.3;
+    CGFloat y = lane * font * 1.35 + font * 0.3;
     BOOL fixed = (mode == 4 || mode == 5);
     if (fixed) {
         NSUInteger fixedLanes = MAX(1, lanes / 2);
@@ -5474,7 +5475,8 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
         y = (mode == 4) ? (height - (fixedLane + 1) * font * 1.35) : (fixedLane * font * 1.35 + font * 0.35);
     }
     CGFloat x = fixed ? (width - textSize.width) / 2.0 : (width - elapsed * speed);
-    if (elapsed < 0 || elapsed > kDuration || x + textSize.width < 0 || x > width) {
+    CGFloat maxElapsed = fixed ? 4.0 : kDuration;
+    if (elapsed < 0 || elapsed > maxElapsed || x + textSize.width < 0 || x > width) {
         CFRelease(framesetter);
         return;
     }
