@@ -5470,8 +5470,8 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
                                       green:((rgb >> 8) & 0xFF) / 255.0
                                        blue:(rgb & 0xFF) / 255.0 alpha:1.0];
     NSString *cacheKey = [NSString stringWithFormat:@"%@|%u|%.1f", text, (unsigned)rgb, font];
-    id cachedObj = [NJPiCpuDanmakuImageCache() objectForKey:cacheKey];
-    CGImageRef textCG = cachedObj ? (__bridge CGImageRef)cachedObj : NULL;
+    UIImage *cachedImg = (UIImage *)[NJPiCpuDanmakuImageCache() objectForKey:cacheKey];
+    CGImageRef textCG = cachedImg ? cachedImg.CGImage : NULL;
     CGSize textSize = textCG ? CGSizeMake((CGFloat)CGImageGetWidth(textCG), (CGFloat)CGImageGetHeight(textCG)) : CGSizeZero;
     if (!textCG) {
         NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
@@ -5513,10 +5513,14 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
             CGImageRef created = CGBitmapContextCreateImage(tctx);
             CGContextRelease(tctx);
             if (created) {
-                [NJPiCpuDanmakuImageCache() setObject:(__bridge id)created forKey:cacheKey];
-                textCG = created;
-                textSize = CGSizeMake((CGFloat)iw, (CGFloat)ih);
+                UIImage *uiImg = [UIImage imageWithCGImage:created];
                 CFRelease(created);
+                if (uiImg) {
+                    [NJPiCpuDanmakuImageCache() setObject:uiImg forKey:cacheKey];
+                    cachedImg = uiImg;
+                    textCG = uiImg.CGImage;
+                    textSize = CGSizeMake((CGFloat)iw, (CGFloat)ih);
+                }
             }
         }
         CFRelease(framesetter);
