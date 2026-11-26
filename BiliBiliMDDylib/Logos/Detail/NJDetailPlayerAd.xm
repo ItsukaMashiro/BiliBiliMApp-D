@@ -5518,6 +5518,60 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
 
 static CFTimeInterval NJPiCpuLastFrameHostTime = 0.0;
 
+static CVPixelBufferRef NJPiMxCpuDanmakuBuffer(NSUInteger width, NSUInteger height) {
+    CFTimeInterval nowHost = CACurrentMediaTime();
+    if (NJPiCpuLastFrameHostTime > 0.0) {
+        double dt = nowHost - NJPiCpuLastFrameHostTime;
+        if (dt > 0.0 && dt < 0.25) {
+            NJPiCpuDanmakuTime += dt;
+        }
+    }
+    NJPiCpuLastFrameHostTime = nowHost;
+    NJPiCPUEnsureData();
+    CVPixelBufferRef target = NULL;
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferCGImageCompatibilityKey: @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey: @YES,
+        (id)kCVPixelBufferMetalCompatibilityKey: @YES,
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    if (CVPixelBufferCreate(kCFAllocatorDefault, width, height, kCVPixelFormatType_32BGRA,
+                            (__bridge CFDictionaryRef)attrs, &target) != kCVReturnSuccess || !target) {
+        return NULL;
+    }
+    CVPixelBufferLockBaseAddress(target, 0);
+    CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+    void *base = CVPixelBufferGetBaseAddress(target);
+    size_t bpr = CVPixelBufferGetBytesPerRow(target);
+    CGContextRef ctx = (base && cs) ? CGBitmapContextCreate(base, width, height, 8, bpr, cs,
+        kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst) : NULL;
+    if (ctx) {
+        CGContextClearRect(ctx, CGRectMake(0, 0, (CGFloat)width, (CGFloat)height));
+        double nowMs = NJPiCpuDanmakuTime * 1000.0;
+        NSMutableArray<NSDictionary *> *visible = [NSMutableArray array];
+        @synchronized (NJPiCpuDanmakuItems ?: (NJPiCpuEnsureStore(), NJPiCpuDanmakuItems)) {
+            for (NSDictionary *item in NJPiCpuDanmakuItems) {
+                id pv = [item objectForKey:@"progress"];
+                double sMs = [pv respondsToSelector:@selector(doubleValue)] ? [pv doubleValue] : 0.0;
+                double el = (nowMs - sMs) / 1000.0;
+                if (el >= 0.0 && el <= 7.0) {
+                    [visible addObject:item];
+                }
+            }
+        }
+        for (NSDictionary *item in visible) {
+            NSUInteger lane = [[item objectForKey:@"lane"] unsignedIntegerValue];
+            NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height, lane);
+        }
+        CGContextRelease(ctx);
+    }
+    if (cs) {
+        CGColorSpaceRelease(cs);
+    }
+    CVPixelBufferUnlockBaseAddress(target, 0);
+    return target; // +1
+}
+
 static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBufferRef sourceImage,
                                              NSUInteger width, NSUInteger height) {
     CFTimeInterval nowHost = CACurrentMediaTime();
@@ -5570,24 +5624,12 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
 
 static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
                               const char *viewClass) {
-    // §15.31：先走纯 CPU 合成（绕开后台 Metal 禁令）；失败才退回原 GPU 路。
-    NSUInteger cpuWidth = CVPixelBufferGetWidth(sourceImage);
-    NSUInteger cpuHeight = CVPixelBufferGetHeight(sourceImage);
-    CVPixelBufferRef cpuTarget = NJPiMxCpuComposite(original, sourceImage, cpuWidth, cpuHeight);
-    if (cpuTarget) {
-        id cpuWrapped = NJPiMxWrapProduced(cpuTarget, sourceImage, original);
-        CVPixelBufferRelease(cpuTarget);
-        if (cpuWrapped) {
-            NJPiPDiag("mx cpu composite ok %lux%lu", (unsigned long)cpuWidth, (unsigned long)cpuHeight);
-            return cpuWrapped;
-        }
-    }
     OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
     NSUInteger width = CVPixelBufferGetWidth(sourceImage);
     NSUInteger height = CVPixelBufferGetHeight(sourceImage);
-    // ── 弹幕层 ──
-    CVPixelBufferRef danmakuImage = NULL;
-    const char *dmSource = "none";
+    // ── 弹幕层：优先走 CPU 透明弹幕层 + GPU Metal 合成（免去 CPU YUV->RGB 转换），失败再退回纯 CPU ──
+    CVPixelBufferRef danmakuImage = NJPiMxCpuDanmakuBuffer(width, height); // +1
+    const char *dmSource = danmakuImage ? "cpu-gpu" : "none";
     id wrapper = NJPiMxWrapperForView(view);
     if (wrapper) {
         // §15.22：先将引擎保持在运行态（每会话一次），再走取帧路——引擎被官方
