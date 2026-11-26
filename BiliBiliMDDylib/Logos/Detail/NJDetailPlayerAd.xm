@@ -5556,6 +5556,87 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
 
 static CFTimeInterval NJPiCpuLastFrameHostTime = 0.0;
 
+#if defined(__aarch64__)
+#include <arm_neon.h>
+#endif
+
+static CVPixelBufferPoolRef NJPiMxNv12Pool(NSUInteger width, NSUInteger height) {
+    static CVPixelBufferPoolRef pool = NULL;
+    static NSUInteger poolW = 0, poolH = 0;
+    if (pool && poolW == width && poolH == height) {
+        return pool;
+    }
+    if (pool) {
+        CVPixelBufferPoolRelease(pool);
+        pool = NULL;
+    }
+    NSDictionary *pixAttrs = @{
+        (id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange),
+        (id)kCVPixelBufferWidthKey: @(width),
+        (id)kCVPixelBufferHeightKey: @(height),
+        (id)kCVPixelBufferIOSurfacePropertiesKey: @{}
+    };
+    if (CVPixelBufferPoolCreate(kCFAllocatorDefault, NULL, (__bridge CFDictionaryRef)pixAttrs, &pool) == kCVReturnSuccess && pool) {
+        poolW = width;
+        poolH = height;
+    }
+    return pool;
+}
+
+static void NJPiNeonBlendBGRAOntoNV12(const uint8_t *bgra, size_t bgraBpr,
+                                      uint8_t *dstY, size_t yBpr,
+                                      uint8_t *dstUV, size_t uvBpr,
+                                      NSUInteger width, NSUInteger height) {
+    for (NSUInteger y = 0; y < height; y++) {
+        const uint8_t *row = bgra + y * bgraBpr;
+        uint8_t *yRow = dstY + y * yBpr;
+        uint8_t *uvRow = dstUV + (y >> 1) * uvBpr;
+        NSUInteger x = 0;
+#if defined(__aarch64__)
+        for (; x + 8 <= width; x += 8) {
+            uint8x8x4_t px = vld4_u8(row + x * 4);
+            if (vmaxv_u8(px.val[3]) == 0) {
+                continue; // 整块 8 像素全透明，直接跳过
+            }
+            for (NSUInteger k = 0; k < 8; k++) {
+                uint8_t a = row[(x + k) * 4 + 3];
+                if (a == 0) continue;
+                uint16_t b = row[(x + k) * 4 + 0];
+                uint16_t g = row[(x + k) * 4 + 1];
+                uint16_t r = row[(x + k) * 4 + 2];
+                // BT.601 video range Y = (66*R + 129*G + 25*B + 128) >> 8 + 16
+                uint16_t yDm = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+                uint16_t invA = 255 - a;
+                yRow[x + k] = (uint8_t)((a * yDm + invA * yRow[x + k] + 127) / 255);
+                if ((y & 1) == 0 && ((x + k) & 1) == 0) {
+                    int16_t uDm = ((-38 * (int16_t)r - 74 * (int16_t)g + 112 * (int16_t)b + 128) >> 8) + 128;
+                    int16_t vDm = ((112 * (int16_t)r - 94 * (int16_t)g - 18 * (int16_t)b + 128) >> 8) + 128;
+                    size_t uvIdx = (x + k);
+                    uvRow[uvIdx]     = (uint8_t)((a * uDm + invA * uvRow[uvIdx] + 127) / 255);
+                    uvRow[uvIdx + 1] = (uint8_t)((a * vDm + invA * uvRow[uvIdx + 1] + 127) / 255);
+                }
+            }
+        }
+#endif
+        for (; x < width; x++) {
+            uint8_t a = row[x * 4 + 3];
+            if (a == 0) continue;
+            uint16_t b = row[x * 4 + 0];
+            uint16_t g = row[x * 4 + 1];
+            uint16_t r = row[x * 4 + 2];
+            uint16_t yDm = ((66 * r + 129 * g + 25 * b + 128) >> 8) + 16;
+            uint16_t invA = 255 - a;
+            yRow[x] = (uint8_t)((a * yDm + invA * yRow[x] + 127) / 255);
+            if ((y & 1) == 0 && (x & 1) == 0) {
+                int16_t uDm = ((-38 * (int16_t)r - 74 * (int16_t)g + 112 * (int16_t)b + 128) >> 8) + 128;
+                int16_t vDm = ((112 * (int16_t)r - 94 * (int16_t)g - 18 * (int16_t)b + 128) >> 8) + 128;
+                uvRow[x]     = (uint8_t)((a * uDm + invA * uvRow[x] + 127) / 255);
+                uvRow[x + 1] = (uint8_t)((a * vDm + invA * uvRow[x + 1] + 127) / 255);
+            }
+        }
+    }
+}
+
 static CVPixelBufferRef NJPiMxCpuDanmakuBuffer(NSUInteger width, NSUInteger height) {
     CFTimeInterval nowHost = CACurrentMediaTime();
     if (NJPiCpuLastFrameHostTime > 0.0) {
@@ -5612,6 +5693,48 @@ static CVPixelBufferRef NJPiMxCpuDanmakuBuffer(NSUInteger width, NSUInteger heig
 
 static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBufferRef sourceImage,
                                              NSUInteger width, NSUInteger height) {
+    OSType fmt = CVPixelBufferGetPixelFormatType(sourceImage);
+    if (fmt == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+        fmt == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange) {
+        CVPixelBufferPoolRef pool = NJPiMxNv12Pool(width, height);
+        CVPixelBufferRef nv12Target = NULL;
+        if (pool && CVPixelBufferPoolCreatePixelBuffer(kCFAllocatorDefault, pool, &nv12Target) == kCVReturnSuccess && nv12Target) {
+            CVPixelBufferRef dmBuf = NJPiMxCpuDanmakuBuffer(width, height);
+            if (dmBuf) {
+                CVPixelBufferLockBaseAddress(sourceImage, kCVPixelBufferLock_ReadOnly);
+                CVPixelBufferLockBaseAddress(nv12Target, 0);
+                CVPixelBufferLockBaseAddress(dmBuf, kCVPixelBufferLock_ReadOnly);
+                const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sourceImage, 0);
+                size_t srcYBpr = CVPixelBufferGetBytesPerRowOfPlane(sourceImage, 0);
+                uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(nv12Target, 0);
+                size_t dstYBpr = CVPixelBufferGetBytesPerRowOfPlane(nv12Target, 0);
+                size_t copyY = MIN(srcYBpr, dstYBpr);
+                for (NSUInteger r = 0; r < height; r++) {
+                    memcpy(dstY + r * dstYBpr, srcY + r * srcYBpr, copyY);
+                }
+                const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(sourceImage, 1);
+                size_t srcUVBpr = CVPixelBufferGetBytesPerRowOfPlane(sourceImage, 1);
+                uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(nv12Target, 1);
+                size_t dstUVBpr = CVPixelBufferGetBytesPerRowOfPlane(nv12Target, 1);
+                size_t copyUV = MIN(srcUVBpr, dstUVBpr);
+                NSUInteger uvH = height >> 1;
+                for (NSUInteger r = 0; r < uvH; r++) {
+                    memcpy(dstUV + r * dstUVBpr, srcUV + r * srcUVBpr, copyUV);
+                }
+                const uint8_t *dmBase = (const uint8_t *)CVPixelBufferGetBaseAddress(dmBuf);
+                size_t dmBpr = CVPixelBufferGetBytesPerRow(dmBuf);
+                if (dmBase && dstY && dstUV) {
+                    NJPiNeonBlendBGRAOntoNV12(dmBase, dmBpr, dstY, dstYBpr, dstUV, dstUVBpr, width, height);
+                }
+                CVPixelBufferUnlockBaseAddress(dmBuf, kCVPixelBufferLock_ReadOnly);
+                CVPixelBufferUnlockBaseAddress(nv12Target, 0);
+                CVPixelBufferUnlockBaseAddress(sourceImage, kCVPixelBufferLock_ReadOnly);
+                CVPixelBufferRelease(dmBuf);
+                return nv12Target; // +1
+            }
+            CVPixelBufferRelease(nv12Target);
+        }
+    }
     CFTimeInterval nowHost = CACurrentMediaTime();
     if (NJPiCpuLastFrameHostTime > 0.0) {
         double dt = nowHost - NJPiCpuLastFrameHostTime;
