@@ -5433,6 +5433,16 @@ static CGImageRef NJPiMxCpuVideoCG(CVImageBufferRef sourceImage, NSUInteger widt
     return software ? [software createCGImage:ci fromRect:CGRectMake(0, 0, width, height)] : NULL;
 }
 
+static NSCache<NSString *, id> *NJPiCpuDanmakuImageCache(void) {
+    static NSCache<NSString *, id> *cache = nil;
+    static dispatch_once_t onceToken;
+    dispatch_once(&onceToken, ^{
+        cache = [[NSCache alloc] init];
+        cache.countLimit = 256;
+    });
+    return cache;
+}
+
 static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height, NSUInteger assignedLane) {
     // 官方常量（service_danmaku.cron/index_main.js）：667×375 逻辑画布、ORIGIN_FACTOR=3、
     // FONT_SIZE=25、STROKE_WIDTH=2、DURATION=7s、SPEED=30(cap 90)、OCCUPANCY=0.75。
@@ -5459,25 +5469,61 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     UIColor *color = [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
                                       green:((rgb >> 8) & 0xFF) / 255.0
                                        blue:(rgb & 0xFF) / 255.0 alpha:1.0];
-    NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
-    [attr addAttribute:NSFontAttributeName value:[UIFont boldSystemFontOfSize:font]
-                range:NSMakeRange(0, attr.length)];
-    [attr addAttribute:NSForegroundColorAttributeName value:color
-                range:NSMakeRange(0, attr.length)];
-    NSShadow *shadow = [[NSShadow alloc] init];
-    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.95];
-    shadow.shadowOffset = CGSizeMake(0.0, 0.0);
-    shadow.shadowBlurRadius = 2.5;
-    [attr addAttribute:NSShadowAttributeName value:shadow
-                range:NSMakeRange(0, attr.length)];
+    NSString *cacheKey = [NSString stringWithFormat:@"%@|%u|%.1f", text, (unsigned)rgb, font];
+    id cachedObj = [NJPiCpuDanmakuImageCache() objectForKey:cacheKey];
+    CGImageRef textCG = cachedObj ? (__bridge CGImageRef)cachedObj : NULL;
+    CGSize textSize = textCG ? CGSizeMake((CGFloat)CGImageGetWidth(textCG), (CGFloat)CGImageGetHeight(textCG)) : CGSizeZero;
+    if (!textCG) {
+        NSMutableAttributedString *attr = [[NSMutableAttributedString alloc] initWithString:text];
+        [attr addAttribute:NSFontAttributeName value:[UIFont boldSystemFontOfSize:font]
+                    range:NSMakeRange(0, attr.length)];
+        [attr addAttribute:NSForegroundColorAttributeName value:color
+                    range:NSMakeRange(0, attr.length)];
+        NSShadow *shadow = [[NSShadow alloc] init];
+        shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.95];
+        shadow.shadowOffset = CGSizeMake(0.0, 0.0);
+        shadow.shadowBlurRadius = 2.5;
+        [attr addAttribute:NSShadowAttributeName value:shadow
+                    range:NSMakeRange(0, attr.length)];
 
-    CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attr);
-    if (!framesetter) {
-        return;
+        CTFramesetterRef framesetter = CTFramesetterCreateWithAttributedString((__bridge CFAttributedStringRef)attr);
+        if (!framesetter) {
+            return;
+        }
+        textSize = CTFramesetterSuggestFrameSizeWithConstraints(
+            framesetter, CFRangeMake(0, attr.length), NULL,
+            CGSizeMake(CGFLOAT_MAX, font * 1.4), NULL);
+        size_t iw = (size_t)ceil(textSize.width + 6.0);
+        size_t ih = (size_t)ceil(textSize.height + 6.0);
+        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
+        CGContextRef tctx = (iw > 0 && ih > 0 && cs) ? CGBitmapContextCreate(NULL, iw, ih, 8, iw * 4, cs,
+            kCGBitmapByteOrder32Little | kCGImageAlphaPremultipliedFirst) : NULL;
+        if (cs) CGColorSpaceRelease(cs);
+        if (tctx) {
+            CGContextClearRect(tctx, CGRectMake(0, 0, iw, ih));
+            CGMutablePathRef path = CGPathCreateMutable();
+            CGPathAddRect(path, NULL, CGRectMake(3.0, 3.0, textSize.width + 2.0, textSize.height + 2.0));
+            CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attr.length), path, NULL);
+            if (frame) {
+                CGContextSetTextMatrix(tctx, CGAffineTransformIdentity);
+                CTFrameDraw(frame, tctx);
+                CFRelease(frame);
+            }
+            CGPathRelease(path);
+            CGImageRef created = CGBitmapContextCreateImage(tctx);
+            CGContextRelease(tctx);
+            if (created) {
+                [NJPiCpuDanmakuImageCache() setObject:(__bridge id)created forKey:cacheKey];
+                textCG = created;
+                textSize = CGSizeMake((CGFloat)iw, (CGFloat)ih);
+                CFRelease(created);
+            }
+        }
+        CFRelease(framesetter);
+        if (!textCG) {
+            return;
+        }
     }
-    CGSize textSize = CTFramesetterSuggestFrameSizeWithConstraints(
-        framesetter, CFRangeMake(0, attr.length), NULL,
-        CGSizeMake(CGFLOAT_MAX, font * 1.4), NULL);
 
     id progressVal = [item objectForKey:@"progress"];
     double startMs = [progressVal respondsToSelector:@selector(doubleValue)] ? [progressVal doubleValue] : 0.0;
@@ -5499,21 +5545,9 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGFloat x = fixed ? (width - textSize.width) / 2.0 : (width - elapsed * speed);
     CGFloat maxElapsed = fixed ? 4.0 : kDuration;
     if (elapsed < 0 || elapsed > maxElapsed || x + textSize.width < 0 || x > width) {
-        CFRelease(framesetter);
         return;
     }
-    CGMutablePathRef path = CGPathCreateMutable();
-    CGPathAddRect(path, NULL, CGRectMake(x, height - (y + textSize.height), textSize.width + 4.0, textSize.height + 4.0));
-    CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attr.length), path, NULL);
-    if (frame) {
-        CGContextSaveGState(ctx);
-        CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
-        CTFrameDraw(frame, ctx);
-        CGContextRestoreGState(ctx);
-        CFRelease(frame);
-    }
-    CGPathRelease(path);
-    CFRelease(framesetter);
+    CGContextDrawImage(ctx, CGRectMake(x, height - (y + textSize.height), textSize.width, textSize.height), textCG);
 }
 
 static CFTimeInterval NJPiCpuLastFrameHostTime = 0.0;
