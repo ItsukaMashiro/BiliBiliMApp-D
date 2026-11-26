@@ -5478,13 +5478,11 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
         return;
     }
     CGMutablePathRef path = CGPathCreateMutable();
-    CGPathAddRect(path, NULL, CGRectMake(x, height - (y + textSize.height), width, height));
+    CGPathAddRect(path, NULL, CGRectMake(x, height - (y + textSize.height), textSize.width + 4.0, textSize.height + 4.0));
     CTFrameRef frame = CTFramesetterCreateFrame(framesetter, CFRangeMake(0, attr.length), path, NULL);
     if (frame) {
         CGContextSaveGState(ctx);
         CGContextSetTextMatrix(ctx, CGAffineTransformIdentity);
-        CGContextTranslateCTM(ctx, 0, height);
-        CGContextScaleCTM(ctx, 1, -1);
         CTFrameDraw(frame, ctx);
         CGContextRestoreGState(ctx);
         CFRelease(frame);
