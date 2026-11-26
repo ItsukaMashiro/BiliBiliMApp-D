@@ -5407,7 +5407,7 @@ static CGImageRef NJPiMxCpuVideoCG(CVImageBufferRef sourceImage, NSUInteger widt
     return software ? [software createCGImage:ci fromRect:CGRectMake(0, 0, width, height)] : NULL;
 }
 
-static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height) {
+static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height, NSUInteger assignedLane) {
     // 官方常量（service_danmaku.cron/index_main.js）：667×375 逻辑画布、ORIGIN_FACTOR=3、
     // FONT_SIZE=25、STROKE_WIDTH=2、DURATION=7s、SPEED=30(cap 90)、OCCUPANCY=0.75。
     static const CGFloat kLogicalW = 667.0, kLogicalH = 375.0;
@@ -5438,14 +5438,10 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
                 range:NSMakeRange(0, attr.length)];
     [attr addAttribute:NSForegroundColorAttributeName value:color
                 range:NSMakeRange(0, attr.length)];
-    [attr addAttribute:NSStrokeColorAttributeName value:[UIColor blackColor]
-                range:NSMakeRange(0, attr.length)];
-    [attr addAttribute:NSStrokeWidthAttributeName value:@(-3.0)
-                range:NSMakeRange(0, attr.length)];
     NSShadow *shadow = [[NSShadow alloc] init];
-    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.85];
-    shadow.shadowOffset = CGSizeMake(0.0, 1.0);
-    shadow.shadowBlurRadius = 1.5;
+    shadow.shadowColor = [UIColor colorWithWhite:0.0 alpha:0.95];
+    shadow.shadowOffset = CGSizeMake(0.0, 0.0);
+    shadow.shadowBlurRadius = 2.5;
     [attr addAttribute:NSShadowAttributeName value:shadow
                 range:NSMakeRange(0, attr.length)];
 
@@ -5466,12 +5462,12 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGFloat speed = (width + textSize.width) / kDuration;
     CGFloat usableH = height * kOccupancy;
     NSUInteger lanes = MAX(1, (NSUInteger)(usableH / MAX(1, font * 1.35)));
-    NSUInteger lane = (NSUInteger)startMs % lanes;
+    NSUInteger lane = assignedLane % lanes;
     CGFloat y = lane * font * 1.35 + font * 0.3;
     BOOL fixed = (mode == 4 || mode == 5);
     if (fixed) {
         NSUInteger fixedLanes = MAX(1, lanes / 2);
-        NSUInteger fixedLane = (NSUInteger)startMs % fixedLanes;
+        NSUInteger fixedLane = assignedLane % fixedLanes;
         y = (mode == 4) ? (height - (fixedLane + 1) * font * 1.35) : (fixedLane * font * 1.35 + font * 0.35);
     }
     CGFloat x = fixed ? (width - textSize.width) / 2.0 : (width - elapsed * speed);
@@ -5521,10 +5517,41 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
             CGContextDrawImage(ctx, CGRectMake(0, 0, width, height), videoCG);
             CGImageRelease(videoCG);
         }
+        NSMutableArray<NSDictionary *> *visible = [NSMutableArray array];
+        double nowMs = NJPiCpuDanmakuTime * 1000.0;
         @synchronized (NJPiCpuDanmakuItems ?: (NJPiCpuEnsureStore(), NJPiCpuDanmakuItems)) {
             for (NSDictionary *item in NJPiCpuDanmakuItems) {
-                NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height);
+                id pv = [item objectForKey:@"progress"];
+                double sMs = [pv respondsToSelector:@selector(doubleValue)] ? [pv doubleValue] : 0.0;
+                double el = (nowMs - sMs) / 1000.0;
+                if (el >= 0.0 && el <= 7.0) {
+                    [visible addObject:item];
+                }
             }
+        }
+        [visible sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            double pa = [[a objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[a objectForKey:@"progress"] doubleValue] : 0.0;
+            double pb = [[b objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[b objectForKey:@"progress"] doubleValue] : 0.0;
+            if (pa < pb) return NSOrderedAscending;
+            if (pa > pb) return NSOrderedDescending;
+            return NSOrderedSame;
+        }];
+        double scrollEnd[64], topEnd[64], botEnd[64];
+        for (int i = 0; i < 64; i++) { scrollEnd[i] = topEnd[i] = botEnd[i] = -1e9; }
+        NSUInteger maxLanes = 12;
+        for (NSDictionary *item in visible) {
+            double sMs = [[item objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[item objectForKey:@"progress"] doubleValue] : 0.0;
+            NSInteger mode = [[item objectForKey:@"mode"] integerValue];
+            double *arr = (mode == 5) ? topEnd : ((mode == 4) ? botEnd : scrollEnd);
+            double durMs = (mode == 4 || mode == 5) ? 4000.0 : 2200.0;
+            NSUInteger cap = (mode == 4 || mode == 5) ? 6 : maxLanes;
+            NSUInteger chosen = 0;
+            for (NSUInteger l = 0; l < cap; l++) {
+                if (arr[l] <= sMs) { chosen = l; break; }
+                if (arr[l] < arr[chosen]) { chosen = l; }
+            }
+            arr[chosen] = sMs + durMs;
+            NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height, chosen);
         }
         CGContextRelease(ctx);
     }
