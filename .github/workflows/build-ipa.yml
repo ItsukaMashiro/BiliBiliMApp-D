@@ -7,6 +7,10 @@ on:
         description: 'Diagnostic build: embed frida-gadget 17.24.3 + NJPipProbe.js and patch the main executable with an LC_LOAD_DYLIB for it'
         type: boolean
         default: false
+      dylib_only:
+        description: 'Only upload libBiliBiliMDDylib.dylib (skip packaging/uploading full IPA)'
+        type: boolean
+        default: false
   push:
     branches:
       - main
@@ -39,6 +43,12 @@ jobs:
         run: |
           sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
           xcodebuild -version
+
+      - name: Cache TargetApp
+        uses: actions/cache@v4
+        with:
+          path: BiliBiliMD/TargetApp
+          key: target-app-${{ hashFiles('.github/workflows/build-ipa.yml') }}
 
       - name: Install build dependencies
         run: |
@@ -217,6 +227,7 @@ jobs:
           retention-days: 7
 
       - name: Package unsigned IPA
+        if: github.event.inputs.dylib_only != 'true'
         run: |
           APP_PATH="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/BiliBiliMD.app"
           test -d "$APP_PATH"
@@ -233,6 +244,7 @@ jobs:
           cp "$RUNNER_TEMP/${IPA_ARTIFACT_NAME}.ipa" "artifacts/${IPA_ARTIFACT_NAME}.ipa"
 
       - name: Upload IPA
+        if: github.event.inputs.dylib_only != 'true'
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.IPA_ARTIFACT_NAME }}
@@ -241,6 +253,7 @@ jobs:
           retention-days: 7
 
       - name: Publish rolling release asset
+        if: github.event.inputs.dylib_only != 'true'
         # 制品 zip 是即时生成的流，长连接反复在 ~200MB 处断且不可续传；
         # Release 资产是静态对象，支持 Range 续传。发布到滚动 tag pip-nightly。
         env:
