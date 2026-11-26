@@ -1144,6 +1144,20 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
     return [super forwardingTargetForSelector:selector];
 }
 
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+                    skipByInterval:(CMTime)skipInterval
+                 completionHandler:(void (^)(void))completionHandler {
+    double sec = CMTimeGetSeconds(skipInterval);
+    if (isfinite(sec)) {
+        NJPiCpuOnSeekSkip(sec);
+    }
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [(id)self.downstream pictureInPictureController:controller skipByInterval:skipInterval completionHandler:completionHandler];
+    } else if (completionHandler) {
+        completionHandler();
+    }
+}
+
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
     [self.state moveContentIntoPictureInPicture];
     NJPiPDiag("danmaku willStart");
@@ -1897,6 +1911,8 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
 
 @end
 
+static void NJPiCpuOnSeekSkip(double deltaSec);
+
 @implementation NJPiPOverlayDelegateProxy
 
 - (BOOL)respondsToSelector:(SEL)selector {
@@ -1908,6 +1924,20 @@ static void NJPiPDiagDanmakuRenderer(UIView *danmakuView,
         return self.downstream;
     }
     return [super forwardingTargetForSelector:selector];
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+                    skipByInterval:(CMTime)skipInterval
+                 completionHandler:(void (^)(void))completionHandler {
+    double sec = CMTimeGetSeconds(skipInterval);
+    if (isfinite(sec)) {
+        NJPiCpuOnSeekSkip(sec);
+    }
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [(id)self.downstream pictureInPictureController:controller skipByInterval:skipInterval completionHandler:completionHandler];
+    } else if (completionHandler) {
+        completionHandler();
+    }
 }
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
@@ -5443,6 +5473,15 @@ static NSCache<NSString *, id> *NJPiCpuDanmakuImageCache(void) {
     return cache;
 }
 
+static void NJPiCpuOnSeekSkip(double deltaSec) {
+    double nextT = NJPiCpuDanmakuTime + deltaSec;
+    if (nextT < 0.0) nextT = 0.0;
+    NJPiCpuDanmakuTime = nextT;
+    NJPiCpuLastFrameHostTime = CACurrentMediaTime();
+    NJPiPDiag("mx cpu seek delta=%.1f t=%.2f", deltaSec, NJPiCpuDanmakuTime);
+    NJPiCPUEnsureData();
+}
+
 static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width, CGFloat height, NSUInteger assignedLane) {
     // 官方常量（service_danmaku.cron/index_main.js）：667×375 逻辑画布、ORIGIN_FACTOR=3、
     // FONT_SIZE=25、STROKE_WIDTH=2、DURATION=7s、SPEED=30(cap 90)、OCCUPANCY=0.75。
@@ -6356,10 +6395,30 @@ static void NJPiMxTrampoline(id self, SEL _cmd, id sampleBuffer, BOOL primary) {
                   (int)gate.active, gate.source, role,
                   object_getClassName(self), destination);
     }
+    static uint64_t interpSeq = 0;
+    uint64_t mySeq = ++interpSeq;
     NJPiMxEnqueueIMP *storage = primary ? &NJPiMxOriginalEnqueueSmapleBuffer
                                         : &NJPiMxOriginalEnqueueSampleBuffer;
     if (*storage) {
         (*storage)(self, _cmd, enqueued);
+    }
+    if (composited && *storage && sampleBuffer) {
+        static dispatch_queue_t interpQueue = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{
+            interpQueue = dispatch_queue_create("com.njbilibili.pip.interp60", DISPATCH_QUEUE_SERIAL);
+        });
+        __weak id weakSelf = self;
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(16 * NSEC_PER_MSEC)), interpQueue, ^{
+            id strongSelf = weakSelf;
+            if (!strongSelf || interpSeq != mySeq || !NJPiMxEngineKeepRunning) {
+                return;
+            }
+            id midEnqueued = NJPiMxComposite(sampleBuffer);
+            if (midEnqueued && *storage) {
+                (*storage)(strongSelf, _cmd, midEnqueued);
+            }
+        });
     }
 }
 
@@ -6811,6 +6870,20 @@ static void NJRemovePiPMirrorAssociation(id object, NJPiPMirrorState *state) {
         return self.downstream;
     }
     return [super forwardingTargetForSelector:selector];
+}
+
+- (void)pictureInPictureController:(AVPictureInPictureController *)controller
+                    skipByInterval:(CMTime)skipInterval
+                 completionHandler:(void (^)(void))completionHandler {
+    double sec = CMTimeGetSeconds(skipInterval);
+    if (isfinite(sec)) {
+        NJPiCpuOnSeekSkip(sec);
+    }
+    if ([self.downstream respondsToSelector:_cmd]) {
+        [(id)self.downstream pictureInPictureController:controller skipByInterval:skipInterval completionHandler:completionHandler];
+    } else if (completionHandler) {
+        completionHandler();
+    }
 }
 
 - (void)pictureInPictureControllerWillStartPictureInPicture:(AVPictureInPictureController *)controller {
