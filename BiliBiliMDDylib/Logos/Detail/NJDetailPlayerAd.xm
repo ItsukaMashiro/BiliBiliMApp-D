@@ -5286,9 +5286,35 @@ static void NJPiCPUParseDanmaku(NSData *data) {
         }
     }
     NJPiCpuEnsureStore();
+    [items sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+        double pa = [[a objectForKey:@"progress"] doubleValue];
+        double pb = [[b objectForKey:@"progress"] doubleValue];
+        if (pa < pb) return NSOrderedAscending;
+        if (pa > pb) return NSOrderedDescending;
+        return NSOrderedSame;
+    }];
+    double scrollEnd[64], topEnd[64], botEnd[64];
+    for (int i = 0; i < 64; i++) { scrollEnd[i] = topEnd[i] = botEnd[i] = -1e9; }
+    NSMutableArray *assigned = [NSMutableArray arrayWithCapacity:items.count];
+    for (NSDictionary *item in items) {
+        double sMs = [[item objectForKey:@"progress"] doubleValue];
+        NSInteger mode = [[item objectForKey:@"mode"] integerValue];
+        double *arr = (mode == 5) ? topEnd : ((mode == 4) ? botEnd : scrollEnd);
+        double durMs = (mode == 4 || mode == 5) ? 4000.0 : 2200.0;
+        NSUInteger cap = (mode == 4 || mode == 5) ? 6 : 12;
+        NSUInteger chosen = 0;
+        for (NSUInteger l = 0; l < cap; l++) {
+            if (arr[l] <= sMs) { chosen = l; break; }
+            if (arr[l] < arr[chosen]) { chosen = l; }
+        }
+        arr[chosen] = sMs + durMs;
+        NSMutableDictionary *m = [item mutableCopy];
+        m[@"lane"] = @(chosen);
+        [assigned addObject:m];
+    }
     @synchronized (NJPiCpuDanmakuItems) {
         [NJPiCpuDanmakuItems removeAllObjects];
-        [NJPiCpuDanmakuItems addObjectsFromArray:items];
+        [NJPiCpuDanmakuItems addObjectsFromArray:assigned];
     }
     NJPiPDiag("mx cpu parse elems=%lu", (unsigned long)items.count);
 }
@@ -5517,8 +5543,8 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
             CGContextDrawImage(ctx, CGRectMake(0, 0, width, height), videoCG);
             CGImageRelease(videoCG);
         }
-        NSMutableArray<NSDictionary *> *visible = [NSMutableArray array];
         double nowMs = NJPiCpuDanmakuTime * 1000.0;
+        NSMutableArray<NSDictionary *> *visible = [NSMutableArray array];
         @synchronized (NJPiCpuDanmakuItems ?: (NJPiCpuEnsureStore(), NJPiCpuDanmakuItems)) {
             for (NSDictionary *item in NJPiCpuDanmakuItems) {
                 id pv = [item objectForKey:@"progress"];
@@ -5529,29 +5555,9 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
                 }
             }
         }
-        [visible sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
-            double pa = [[a objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[a objectForKey:@"progress"] doubleValue] : 0.0;
-            double pb = [[b objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[b objectForKey:@"progress"] doubleValue] : 0.0;
-            if (pa < pb) return NSOrderedAscending;
-            if (pa > pb) return NSOrderedDescending;
-            return NSOrderedSame;
-        }];
-        double scrollEnd[64], topEnd[64], botEnd[64];
-        for (int i = 0; i < 64; i++) { scrollEnd[i] = topEnd[i] = botEnd[i] = -1e9; }
-        NSUInteger maxLanes = 12;
         for (NSDictionary *item in visible) {
-            double sMs = [[item objectForKey:@"progress"] respondsToSelector:@selector(doubleValue)] ? [[item objectForKey:@"progress"] doubleValue] : 0.0;
-            NSInteger mode = [[item objectForKey:@"mode"] integerValue];
-            double *arr = (mode == 5) ? topEnd : ((mode == 4) ? botEnd : scrollEnd);
-            double durMs = (mode == 4 || mode == 5) ? 4000.0 : 2200.0;
-            NSUInteger cap = (mode == 4 || mode == 5) ? 6 : maxLanes;
-            NSUInteger chosen = 0;
-            for (NSUInteger l = 0; l < cap; l++) {
-                if (arr[l] <= sMs) { chosen = l; break; }
-                if (arr[l] < arr[chosen]) { chosen = l; }
-            }
-            arr[chosen] = sMs + durMs;
-            NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height, chosen);
+            NSUInteger lane = [[item objectForKey:@"lane"] unsignedIntegerValue];
+            NJPiCpuDrawItem(ctx, item, (CGFloat)width, (CGFloat)height, lane);
         }
         CGContextRelease(ctx);
     }
