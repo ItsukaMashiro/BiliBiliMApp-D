@@ -6805,7 +6805,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 %hook BBPlayerDanmakuService
 
-- (void)setCurrentTime:(id)time {
+- (void)setCurrentTime:(double)time {
     NJPiCpuEnsureStore();
     if (NJPiCPUCid == 0) {
         id model = NJPiMxObjectGetter(self, @selector(viewAPIModel));
@@ -6815,17 +6815,8 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
             NJPiPDiag("mx cpu cid=%lld", NJPiCPUCid);
         }
     }
-    // 官方 arg 不是 NSNumber（真机异常：+[dynamic doubleValue] unrecognized selector），
-    // 必须先 respondsToSelector 再取值；否则退回用 currentTime getter。
-    if (time && [time respondsToSelector:@selector(doubleValue)]) {
-        NJPiCpuDanmakuTime = [(NSNumber *)time doubleValue];
-    } else {
-        SEL sel = NSSelectorFromString(@"currentTime");
-        if ([self respondsToSelector:sel]) {
-            IMP imp = [self methodForSelector:sel];
-            NJPiCpuDanmakuTime = ((double (*)(id, SEL))imp)(self, sel);
-        }
-        NJPiPDiag("mx cpu time via getter t=%.3f", NJPiCpuDanmakuTime);
+    if (time >= 0.0 && time < 86400.0) {
+        NJPiCpuDanmakuTime = time;
     }
     %orig;
 }
