@@ -5293,6 +5293,24 @@ static void NJPiCPUParseDanmaku(NSData *data) {
     NJPiPDiag("mx cpu parse elems=%lu", (unsigned long)items.count);
 }
 
+static long long NJPiCpuReadCid(id model) {
+    if (!model) {
+        return 0;
+    }
+    SEL sel = NSSelectorFromString(@"cid");
+    if (![model respondsToSelector:sel]) {
+        return 0;
+    }
+    NSMethodSignature *sig = [model methodSignatureForSelector:sel];
+    const char *ret = sig ? sig.methodReturnType : NULL;
+    if (ret && ret[0] == '@') {
+        id val = NJPiMxObjectGetter(model, sel);
+        return (val && [val respondsToSelector:@selector(longLongValue)]) ? [val longLongValue] : 0;
+    }
+    IMP imp = [model methodForSelector:sel];
+    return imp ? ((long long (*)(id, SEL))imp)(model, sel) : 0;
+}
+
 static void NJPiCPUEnsureData(void) {
     // 兜底：即使 setCurrentTime hook 没触发，也从缓存的 service 现取 cid/time。
     if (NJPiCPUCid == 0) {
@@ -5302,9 +5320,9 @@ static void NJPiCPUEnsureData(void) {
         }
         for (id svc in services) {
             id model = NJPiMxObjectGetter(svc, @selector(viewAPIModel));
-            NSNumber *cid = model ? NJPiMxObjectGetter(model, @selector(cid)) : nil;
-            if (cid && cid.longLongValue != 0) {
-                NJPiCPUCid = cid.longLongValue;
+            long long cidVal = NJPiCpuReadCid(model);
+            if (cidVal != 0) {
+                NJPiCPUCid = cidVal;
                 SEL sel = NSSelectorFromString(@"currentTime");
                 IMP imp = [svc methodForSelector:sel];
                 if (imp) {
@@ -6791,9 +6809,9 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     NJPiCpuEnsureStore();
     if (NJPiCPUCid == 0) {
         id model = NJPiMxObjectGetter(self, @selector(viewAPIModel));
-        NSNumber *cid = model ? NJPiMxObjectGetter(model, NSSelectorFromString(@"cid")) : nil;
-        if ([cid isKindOfClass:NSNumber.class] && cid.longLongValue != 0) {
-            NJPiCPUCid = cid.longLongValue;
+        long long cidVal = NJPiCpuReadCid(model);
+        if (cidVal != 0) {
+            NJPiCPUCid = cidVal;
             NJPiPDiag("mx cpu cid=%lld", NJPiCPUCid);
         }
     }
