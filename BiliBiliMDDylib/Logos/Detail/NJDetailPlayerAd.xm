@@ -5597,8 +5597,6 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGContextDrawImage(ctx, CGRectMake(x, height - (y + textSize.height), textSize.width, textSize.height), textCG);
 }
 
-static CFTimeInterval NJPiCpuLastFrameHostTime = 0.0;
-
 #if defined(__aarch64__)
 #include <arm_neon.h>
 #endif
