@@ -5420,14 +5420,14 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
         return;
     }
     // PiP 只是等比缩小画面；排版规则不变，按画布宽度做等比缩放。
-    CGFloat scale = width / kLogicalW;
+    CGFloat scale = height / kLogicalH;
     if (scale < 0.25) scale = 0.25;
-    if (scale > 2.0) scale = 2.0;
+    if (scale > 2.5) scale = 2.5;
     id fontVal = [item objectForKey:@"fontsize"];
     CGFloat font = [fontVal respondsToSelector:@selector(doubleValue)] ? [fontVal doubleValue] : kBaseFont;
-    font = font * scale / kOriginFactor;
-    if (font < 16.0) font = 16.0;
-    if (font > 36.0) font = 36.0;
+    font = font * scale;
+    if (font < 14.0) font = 14.0;
+    if (font > 48.0) font = 48.0;
 
     uint32_t rgb = [item[@"color"] unsignedIntValue];
     UIColor *color = [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
@@ -5469,8 +5469,9 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CGFloat y = height - usableH + lane * font * 1.35 + font * 0.3;
     BOOL fixed = (mode == 4 || mode == 5);
     if (fixed) {
-        y = (mode == 4) ? height - font * 1.4 : font * 0.35;
-        lanes = 1;
+        NSUInteger fixedLanes = MAX(1, lanes / 2);
+        NSUInteger fixedLane = (NSUInteger)startMs % fixedLanes;
+        y = (mode == 4) ? (height - (fixedLane + 1) * font * 1.35) : (fixedLane * font * 1.35 + font * 0.35);
     }
     CGFloat x = fixed ? (width - textSize.width) / 2.0 : (width - elapsed * speed);
     if (elapsed < 0 || elapsed > kDuration || x + textSize.width < 0 || x > width) {
