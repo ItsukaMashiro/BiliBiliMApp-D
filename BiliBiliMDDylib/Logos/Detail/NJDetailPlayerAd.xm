@@ -7571,6 +7571,41 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 
 %end
 
+static void (*NJPiOrigSkipByInterval)(id, SEL, id, CMTime, id) = NULL;
+static void NJPiHookedSkipByInterval(id self, SEL _cmd, id controller, CMTime skipInterval, id completionHandler) {
+    double sec = CMTimeGetSeconds(skipInterval);
+    if (isfinite(sec)) {
+        NJPiCpuOnSeekSkip(sec);
+    }
+    if (NJPiOrigSkipByInterval) {
+        NJPiOrigSkipByInterval(self, _cmd, controller, skipInterval, completionHandler);
+    }
+}
+
+%hook AVPictureInPictureControllerContentSource
+
+- (instancetype)initWithSampleBufferDisplayLayer:(AVSampleBufferDisplayLayer *)sampleBufferDisplayLayer
+                                playbackDelegate:(id<AVPictureInPictureSampleBufferPlaybackDelegate>)playbackDelegate {
+    if (playbackDelegate) {
+        static NSMutableSet<NSString *> *hookedClasses = nil;
+        static dispatch_once_t onceToken;
+        dispatch_once(&onceToken, ^{ hookedClasses = [NSMutableSet set]; });
+        Class cls = object_getClass(playbackDelegate);
+        NSString *name = cls ? NSStringFromClass(cls) : nil;
+        if (name && ![hookedClasses containsObject:name]) {
+            [hookedClasses addObject:name];
+            SEL sel = @selector(pictureInPictureController:skipByInterval:completionHandler:);
+            if ([cls instancesRespondToSelector:sel]) {
+                MSHookMessageEx(cls, sel, (IMP)NJPiHookedSkipByInterval, (IMP *)&NJPiOrigSkipByInterval);
+                NJPiPDiag("mx cpu hooked skipByInterval on %s", name.UTF8String);
+            }
+        }
+    }
+    return %orig;
+}
+
+%end
+
 %hook AVPictureInPictureController
 
 - (instancetype)initWithPlayerLayer:(AVPlayerLayer *)playerLayer {
