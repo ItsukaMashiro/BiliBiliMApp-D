@@ -7267,20 +7267,6 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)bindGraftData:(id)graftData ugcDataSourceAdapter:(id)adapter completion:(id)completion;
 @end
 
-%hook BFCPlayerControllerV2
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)controller
-                    skipByInterval:(CMTime)skipInterval
-                 completionHandler:(void (^)(void))completionHandler {
-    double sec = CMTimeGetSeconds(skipInterval);
-    if (isfinite(sec)) {
-        NJPiCpuOnSeekSkip(sec);
-    }
-    %orig;
-}
-
-%end
-
 %hook BBSBPiPManager
 
 - (instancetype)init {
@@ -7471,20 +7457,6 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
 - (void)setExternalPixelBuffer:(id)arg0;
 - (void)_updateSyncForTimeStep:(double)seconds;
 @end
-
-%hook BFCPlayerControllerV2
-
-- (void)pictureInPictureController:(AVPictureInPictureController *)controller
-                    skipByInterval:(CMTime)skipInterval
-                 completionHandler:(void (^)(void))completionHandler {
-    double sec = CMTimeGetSeconds(skipInterval);
-    if (isfinite(sec)) {
-        NJPiCpuOnSeekSkip(sec);
-    }
-    %orig;
-}
-
-%end
 
 %hook BBSBPiPManager
 
