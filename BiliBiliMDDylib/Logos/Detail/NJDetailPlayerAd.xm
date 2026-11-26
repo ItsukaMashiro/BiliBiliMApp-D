@@ -5662,6 +5662,21 @@ static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBu
 
 static id NJPiMxCompositeWrap(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
                               const char *viewClass) {
+    NSUInteger width = CVPixelBufferGetWidth(sourceImage);
+    NSUInteger height = CVPixelBufferGetHeight(sourceImage);
+    CVPixelBufferRef cpuTarget = NJPiMxCpuComposite(original, sourceImage, width, height);
+    if (cpuTarget) {
+        id cpuWrapped = NJPiMxWrapProduced(cpuTarget, sourceImage, original);
+        CVPixelBufferRelease(cpuTarget);
+        if (cpuWrapped) {
+            return cpuWrapped;
+        }
+    }
+    return nil;
+}
+
+static id NJPiMxCompositeWrap_UNUSED(id view, CMSampleBufferRef original, CVImageBufferRef sourceImage,
+                              const char *viewClass) {
     OSType sourceFormat = CVPixelBufferGetPixelFormatType(sourceImage);
     NSUInteger width = CVPixelBufferGetWidth(sourceImage);
     NSUInteger height = CVPixelBufferGetHeight(sourceImage);
