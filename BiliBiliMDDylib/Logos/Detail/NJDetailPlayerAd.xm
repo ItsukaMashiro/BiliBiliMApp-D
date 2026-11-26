@@ -1131,6 +1131,8 @@ static NSArray<NSLayoutConstraint *> *NJConstraintsForView(UIView *view, UIView 
 
 @end
 
+static void NJPiCpuOnSeekSkip(double deltaSec);
+
 @implementation NJPiPDanmakuDelegateProxy
 
 - (BOOL)respondsToSelector:(SEL)selector {
@@ -5472,6 +5474,8 @@ static NSCache<NSString *, id> *NJPiCpuDanmakuImageCache(void) {
     });
     return cache;
 }
+
+static CFTimeInterval NJPiCpuLastFrameHostTime;
 
 static void NJPiCpuOnSeekSkip(double deltaSec) {
     double nextT = NJPiCpuDanmakuTime + deltaSec;
