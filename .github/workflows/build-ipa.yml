@@ -44,12 +44,6 @@ jobs:
           sudo xcode-select --switch /Applications/Xcode_16.4.app/Contents/Developer
           xcodebuild -version
 
-      - name: Cache TargetApp
-        uses: actions/cache@v4
-        with:
-          path: BiliBiliMD/TargetApp
-          key: target-app-${{ hashFiles('.github/workflows/build-ipa.yml') }}
-
       - name: Install build dependencies
         run: |
           brew install ldid
