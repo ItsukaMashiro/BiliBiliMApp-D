@@ -5426,8 +5426,8 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     id fontVal = [item objectForKey:@"fontsize"];
     CGFloat font = [fontVal respondsToSelector:@selector(doubleValue)] ? [fontVal doubleValue] : kBaseFont;
     font = font * scale / kOriginFactor;
-    if (font < 9.0) font = 9.0;
-    if (font > 40.0) font = 40.0;
+    if (font < 16.0) font = 16.0;
+    if (font > 36.0) font = 36.0;
 
     uint32_t rgb = [item[@"color"] unsignedIntValue];
     UIColor *color = [UIColor colorWithRed:((rgb >> 16) & 0xFF) / 255.0
@@ -5491,8 +5491,18 @@ static void NJPiCpuDrawItem(CGContextRef ctx, NSDictionary *item, CGFloat width,
     CFRelease(framesetter);
 }
 
+static CFTimeInterval NJPiCpuLastFrameHostTime = 0.0;
+
 static CVPixelBufferRef NJPiMxCpuComposite(CMSampleBufferRef original, CVImageBufferRef sourceImage,
                                              NSUInteger width, NSUInteger height) {
+    CFTimeInterval nowHost = CACurrentMediaTime();
+    if (NJPiCpuLastFrameHostTime > 0.0) {
+        double dt = nowHost - NJPiCpuLastFrameHostTime;
+        if (dt > 0.0 && dt < 0.25) {
+            NJPiCpuDanmakuTime += dt;
+        }
+    }
+    NJPiCpuLastFrameHostTime = nowHost;
     NJPiCPUEnsureData(); // 首次进入 PiP / 换 segment 时异步拉弹幕
     CVPixelBufferRef target = NJPiMxTargetBuffer(width, height);
     if (!target) return NULL;
@@ -6815,6 +6825,7 @@ static NJPiPMirrorState *NJMakePiPMirrorState(
     }
     if (time >= 0.0 && time < 86400.0) {
         NJPiCpuDanmakuTime = time;
+        NJPiCpuLastFrameHostTime = CACurrentMediaTime();
     }
     %orig;
 }
